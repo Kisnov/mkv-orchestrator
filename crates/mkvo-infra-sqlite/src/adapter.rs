@@ -230,6 +230,21 @@ impl JobRepository for SqliteRepositories {
         .await
     }
 
+    async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError> {
+        self.blocking(|store| {
+            let connection = store.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT result_json FROM jobs
+                 WHERE state IN ('\"Queued\"', '\"WaitingForResources\"', '\"Running\"', '\"Canceling\"')
+                 ORDER BY updated_at_ms",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| serde_json::from_str(&row?).map_err(StoreError::from))
+                .collect()
+        })
+        .await
+    }
+
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
         let event = event.clone();
         self.blocking(move |store| {
@@ -610,6 +625,62 @@ mod tests {
             .await
             .expect_err("create-only save conflicts");
         assert!(matches!(error, PortError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn unfinished_jobs_exclude_terminal_ones() {
+        use mkvo_contracts::{JobKind, JobStatus};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let statuses = [
+            JobStatus::Queued,
+            JobStatus::WaitingForResources,
+            JobStatus::Running,
+            JobStatus::Canceling,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Skipped,
+            JobStatus::Canceled,
+        ];
+        for status in statuses {
+            let snapshot = JobSnapshot {
+                id: JobId::new(),
+                kind: JobKind::Scan,
+                status,
+                correlation_id: mkvo_domain::CorrelationId::new(),
+                idempotency_key: IdempotencyKey::generate(),
+                request_fingerprint: String::new(),
+                plan_id: None,
+                created_utc: Utc::now(),
+                started_utc: None,
+                completed_utc: None,
+                completed: 0,
+                failed: 0,
+                skipped: 0,
+                total: 0,
+                current_file: String::new(),
+                current_file_percent: 0,
+                lines: Vec::new(),
+                result: None,
+                error: None,
+                revision: 0,
+            };
+            JobRepository::insert(&repositories, &snapshot)
+                .await
+                .expect("insert");
+        }
+
+        let unfinished = JobRepository::list_unfinished(&repositories)
+            .await
+            .expect("list");
+        let found: std::collections::HashSet<_> = unfinished.iter().map(|job| job.status).collect();
+        let expected: std::collections::HashSet<_> = statuses
+            .into_iter()
+            .filter(|status| !status.is_terminal())
+            .collect();
+        assert_eq!(unfinished.len(), expected.len());
+        assert_eq!(found, expected);
     }
 
     #[tokio::test]

@@ -171,6 +171,8 @@ pub trait JobRepository: Send + Sync {
         key: &IdempotencyKey,
     ) -> Result<Option<JobSnapshot>, PortError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError>;
+    /// Jobs that have not reached a terminal status.
+    async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError>;
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError>;
 }
 
