@@ -80,3 +80,23 @@ export function normalizeTrackSignature(file: MediaFileRow) {
     })
     .join(";");
 }
+
+type TrackRow = MediaFileRow["tracks"][number];
+
+/** One line per template track naming the track of `file` that an edit by position lands on. */
+export function describeTrackTargets(file: MediaFileRow, templateFile: MediaFileRow, kind: "audio" | "subtitle", labels: string[]) {
+  const ofKind = (row: MediaFileRow) => row.tracks.filter((track) => normalizeCompareValue(track.type).startsWith(kind));
+  const own = ofKind(file);
+  const reference = ofKind(templateFile);
+  return labels.map((label, index) => {
+    const track = own[index];
+    const templateTrack = reference[index];
+    if (!track) return `${label} → no ${kind} track in that position`;
+    const same = templateTrack && (["codec", "language", "name"] as const).every((key) => normalizeCompareValue(track[key]) === normalizeCompareValue(templateTrack[key]));
+    return `${label} → ${describeTrack(track)}${same ? "" : ` (template: ${templateTrack ? describeTrack(templateTrack) : "no track"})`}`;
+  });
+}
+
+function describeTrack(track: TrackRow) {
+  return `track ID ${track.id} · ${track.language || "und"} · ${track.codec || "Unknown"} · ${track.name || "No name"}`;
+}

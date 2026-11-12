@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { MediaFileRow } from "../api";
-import { getTemplateMismatchMessages, hasTemplateMismatch, normalizeCompareValue, normalizeTrackSignature } from "./templateMatch";
+import { describeTrackTargets, getTemplateMismatchMessages, hasTemplateMismatch, normalizeCompareValue, normalizeTrackSignature } from "./templateMatch";
 
 type Track = MediaFileRow["tracks"][number];
 
@@ -91,5 +91,23 @@ describe("template comparison", () => {
     expect(normalizeTrackSignature(file("02.mkv", { tracks: withTrack(0, { name: "Episode 02" }) }))).toBe(normalizeTrackSignature(template));
     expect(normalizeTrackSignature(file("02.mkv", { tracks: withTrack(1, { name: "Japonès" }) }))).not.toBe(normalizeTrackSignature(template));
     expect(normalizeTrackSignature(template)).toBe("0|1|video|hevc|und|none|default|none;1|2|audio|aac|cat|català|default|none;2|3|subtitles|ass|cat|complets|none|none");
+  });
+});
+
+describe("track targets", () => {
+  it("names the track in the same position within its type", () => {
+    const [video, audio, subtitle] = tracks();
+    const japanese: Track = { ...audio, id: 1, language: "jpn", name: "Japonès" };
+    const catalan: Track = { ...audio, id: 2, trackNumber: 3 };
+    const other = file("02.mkv", { tracks: [video, japanese, catalan, { ...subtitle, id: 3, trackNumber: 4 }] });
+
+    expect(describeTrackTargets(other, template, "audio", ["Audio 1", "Audio 2"])).toEqual([
+      "Audio 1 → track ID 1 · jpn · AAC · Japonès (template: track ID 1 · cat · AAC · Català)",
+      "Audio 2 → track ID 2 · cat · AAC · Català (template: no track)"
+    ]);
+    expect(describeTrackTargets(other, template, "subtitle", ["Subtitle 1", "Subtitle 2"])).toEqual([
+      "Subtitle 1 → track ID 3 · cat · ASS · Complets",
+      "Subtitle 2 → no subtitle track in that position"
+    ]);
   });
 });
