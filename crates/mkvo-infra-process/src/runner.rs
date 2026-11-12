@@ -2,7 +2,7 @@ use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncRead, AsyncReadExt},
     process::Command,
     sync::mpsc,
     task::JoinHandle,
@@ -10,6 +10,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const READ_BUFFER_BYTES: usize = 8 * 1024;
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 // Everything else, such as the server password and provider API keys, stays out of child tools.
 #[cfg(windows)]
@@ -273,39 +275,49 @@ where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stream);
+        let mut stream = stream;
+        let mut buffer = vec![0; READ_BUFFER_BYTES];
         let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
         let mut line = Vec::new();
         let mut truncated = false;
 
         loop {
-            line.clear();
-            let count = reader.read_until(b'\n', &mut line).await?;
+            let count = stream.read(&mut buffer).await?;
             if count == 0 {
                 break;
             }
-
-            if let Some(sender) = &events {
-                let text = String::from_utf8_lossy(&line)
-                    .trim_end_matches(['\r', '\n'])
-                    .to_owned();
-                let _ = sender.try_send(ProcessEvent {
-                    stream: kind,
-                    line: text,
-                });
-            }
+            let chunk = &buffer[..count];
 
             let remaining = limit.saturating_sub(bytes.len());
-            if remaining > 0 {
-                bytes.extend_from_slice(&line[..line.len().min(remaining)]);
+            bytes.extend_from_slice(&chunk[..count.min(remaining)]);
+            truncated |= count > remaining;
+
+            if let Some(sender) = &events {
+                for piece in chunk.split_inclusive(|byte| *byte == b'\n') {
+                    line.extend_from_slice(piece);
+                    // A tool that never prints a newline must not grow the line without bound.
+                    if piece.ends_with(b"\n") || line.len() >= MAX_LINE_BYTES {
+                        send_line(sender, kind, &line);
+                        line.clear();
+                    }
+                }
             }
-            if line.len() > remaining {
-                truncated = true;
-            }
+        }
+        if let Some(sender) = events.as_ref().filter(|_| !line.is_empty()) {
+            send_line(sender, kind, &line);
         }
 
         Ok(CapturedBytes { bytes, truncated })
     })
+}
+
+fn send_line(sender: &mpsc::Sender<ProcessEvent>, stream: OutputStream, line: &[u8]) {
+    let _ = sender.try_send(ProcessEvent {
+        stream,
+        line: String::from_utf8_lossy(line)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned(),
+    });
 }
 
 #[cfg(test)]
@@ -347,6 +359,45 @@ mod tests {
         assert!(!output.stdout.contains("CARGO_PKG_NAME"));
         assert!(output.stdout.contains("LANG=C.UTF-8"));
         assert!(output.stdout.to_ascii_uppercase().contains("PATH="));
+    }
+
+    #[tokio::test]
+    async fn output_is_reported_line_by_line() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let stream = std::io::Cursor::new(b"first\r\nsecond\nlast".to_vec());
+
+        let captured = capture_stream(stream, OutputStream::Stderr, 1024, Some(sender))
+            .await
+            .expect("join")
+            .expect("read");
+
+        assert_eq!(captured.bytes, b"first\r\nsecond\nlast");
+        assert!(!captured.truncated);
+        let mut lines = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            lines.push(event.line);
+        }
+        assert_eq!(lines, ["first", "second", "last"]);
+    }
+
+    #[tokio::test]
+    async fn output_without_newlines_is_reported_in_bounded_lines() {
+        let (sender, mut receiver) = mpsc::channel(64);
+        let stream = std::io::Cursor::new(vec![b'x'; 1024 * 1024]);
+
+        let captured = capture_stream(stream, OutputStream::Stdout, 1024, Some(sender))
+            .await
+            .expect("join")
+            .expect("read");
+
+        assert_eq!(captured.bytes.len(), 1024);
+        assert!(captured.truncated);
+        let mut reported = 0;
+        while let Ok(event) = receiver.try_recv() {
+            assert!(event.line.len() <= MAX_LINE_BYTES + READ_BUFFER_BYTES);
+            reported += event.line.len();
+        }
+        assert_eq!(reported, 1024 * 1024);
     }
 
     #[test]
