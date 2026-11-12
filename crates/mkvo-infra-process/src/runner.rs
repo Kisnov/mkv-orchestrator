@@ -1,4 +1,13 @@
-use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::{
@@ -12,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
+// A killed tool stuck in I/O on a dead network share may never exit.
+const KILL_GRACE: Duration = Duration::from_secs(10);
 
 // Everything else, such as the server password and provider API keys, stays out of child tools.
 #[cfg(windows)]
@@ -56,6 +67,8 @@ pub struct ProcessSpec {
     pub args: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub timeout: Option<Duration>,
+    pub inactivity_timeout: Option<Duration>,
+    pub watched_outputs: Vec<PathBuf>,
     pub output_limit: usize,
 }
 
@@ -66,6 +79,8 @@ impl ProcessSpec {
             args: Vec::new(),
             current_dir: None,
             timeout: None,
+            inactivity_timeout: None,
+            watched_outputs: Vec::new(),
             output_limit: DEFAULT_OUTPUT_LIMIT,
         }
     }
@@ -91,6 +106,17 @@ impl ProcessSpec {
 
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Stop the tool once it has printed nothing and grown none of `outputs` for `timeout`.
+    pub fn inactivity_timeout(
+        mut self,
+        timeout: Duration,
+        outputs: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        self.inactivity_timeout = Some(timeout);
+        self.watched_outputs = outputs.into_iter().collect();
         self
     }
 
@@ -133,6 +159,8 @@ pub enum ProcessError {
     Cancelled,
     #[error("external tool exceeded its {0:?} timeout")]
     TimedOut(Duration),
+    #[error("external tool printed and wrote nothing for {0:?}")]
+    Inactive(Duration),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -196,48 +224,41 @@ impl ProcessRunner {
         let stdout = child.stdout.take().expect("stdout is configured as piped");
         let stderr = child.stderr.take().expect("stderr is configured as piped");
 
+        let printed = Arc::new(AtomicU64::new(0));
         let stdout_task = capture_stream(
             stdout,
             OutputStream::Stdout,
             spec.output_limit,
             events.clone(),
+            Arc::clone(&printed),
         );
-        let stderr_task = capture_stream(stderr, OutputStream::Stderr, spec.output_limit, events);
-
-        enum WaitResult {
-            Exited(std::process::ExitStatus),
-            Cancelled,
-            TimedOut(Duration),
-        }
+        let stderr_task = capture_stream(
+            stderr,
+            OutputStream::Stderr,
+            spec.output_limit,
+            events,
+            Arc::clone(&printed),
+        );
 
         let mut wait = Box::pin(child.wait());
-        let wait_result = if let Some(timeout) = spec.timeout {
-            tokio::select! {
-                result = &mut wait => WaitResult::Exited(result?),
-                () = cancellation.cancelled() => WaitResult::Cancelled,
-                () = tokio::time::sleep(timeout) => WaitResult::TimedOut(timeout),
-            }
-        } else {
-            tokio::select! {
-                result = &mut wait => WaitResult::Exited(result?),
-                () = cancellation.cancelled() => WaitResult::Cancelled,
+        let stopped = tokio::select! {
+            result = &mut wait => Ok(result?),
+            () = cancellation.cancelled() => Err(ProcessError::Cancelled),
+            Some(timeout) = expired(spec.timeout) => Err(ProcessError::TimedOut(timeout)),
+            Some(timeout) = inactive(spec.inactivity_timeout, &printed, &spec.watched_outputs) => {
+                Err(ProcessError::Inactive(timeout))
             }
         };
         drop(wait);
 
-        let exit_status = match wait_result {
-            WaitResult::Exited(status) => status,
-            WaitResult::Cancelled => {
+        let exit_status = match stopped {
+            Ok(status) => status,
+            Err(error) => {
                 terminate(&mut child).await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                return Err(ProcessError::Cancelled);
-            }
-            WaitResult::TimedOut(timeout) => {
-                terminate(&mut child).await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                return Err(ProcessError::TimedOut(timeout));
+                // Whatever inherited the pipes may outlive the tool; do not wait for it.
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(error);
             }
         };
 
@@ -254,10 +275,55 @@ impl ProcessRunner {
 }
 
 async fn terminate(child: &mut tokio::process::Child) {
-    if let Err(error) = child.kill().await {
+    if let Err(error) = child.start_kill() {
         tracing::debug!(%error, "external tool was already stopped or could not be killed");
     }
-    let _ = child.wait().await;
+    if tokio::time::timeout(KILL_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("external tool did not exit after being killed");
+    }
+}
+
+async fn expired(timeout: Option<Duration>) -> Option<Duration> {
+    tokio::time::sleep(timeout?).await;
+    timeout
+}
+
+/// Resolves once neither the tool's output nor its watched files changed for `timeout`.
+async fn inactive(
+    timeout: Option<Duration>,
+    printed: &AtomicU64,
+    outputs: &[PathBuf],
+) -> Option<Duration> {
+    let timeout = timeout?;
+    // Few checks per timeout: each one may itself hang on the share being watched.
+    let interval = timeout / 6;
+    let mut seen = progress(printed, outputs, interval).await;
+    let mut idle = Duration::ZERO;
+    while idle < timeout {
+        tokio::time::sleep(interval).await;
+        let now = progress(printed, outputs, interval).await;
+        idle = if now == seen {
+            idle + interval
+        } else {
+            Duration::ZERO
+        };
+        seen = now;
+    }
+    Some(timeout)
+}
+
+async fn progress(printed: &AtomicU64, outputs: &[PathBuf], patience: Duration) -> (u64, u64) {
+    let mut written = 0;
+    for output in outputs {
+        if let Ok(Ok(metadata)) = tokio::time::timeout(patience, tokio::fs::metadata(output)).await
+        {
+            written += metadata.len();
+        }
+    }
+    (printed.load(Ordering::Relaxed), written)
 }
 
 struct CapturedBytes {
@@ -270,6 +336,7 @@ fn capture_stream<R>(
     kind: OutputStream,
     limit: usize,
     events: Option<mpsc::Sender<ProcessEvent>>,
+    printed: Arc<AtomicU64>,
 ) -> JoinHandle<Result<CapturedBytes, std::io::Error>>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -287,6 +354,7 @@ where
                 break;
             }
             let chunk = &buffer[..count];
+            printed.fetch_add(count as u64, Ordering::Relaxed);
 
             let remaining = limit.saturating_sub(bytes.len());
             bytes.extend_from_slice(&chunk[..count.min(remaining)]);
@@ -361,15 +429,70 @@ mod tests {
         assert!(output.stdout.to_ascii_uppercase().contains("PATH="));
     }
 
+    #[test]
+    fn a_silent_tool_is_stopped_for_inactivity() {
+        let wait_quietly = if cfg!(windows) {
+            "ping -n 9 127.0.0.1 >NUL"
+        } else {
+            "sleep 8"
+        };
+        let spec = shell(wait_quietly).inactivity_timeout(Duration::from_millis(300), []);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let started = std::time::Instant::now();
+
+        let error = runtime
+            .block_on(ProcessRunner.run(spec, CancellationToken::new()))
+            .expect_err("stopped");
+
+        assert!(matches!(error, ProcessError::Inactive(_)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // On Windows `ping` outlives the killed shell and keeps the output pipes open.
+        runtime.shutdown_background();
+    }
+
+    #[tokio::test]
+    async fn printed_output_and_growing_files_count_as_activity() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let output = directory.path().join("output.tmp");
+        let printed = AtomicU64::new(0);
+        let timeout = Duration::from_millis(900);
+        let step = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let work = async {
+            for size in 1..=5 {
+                tokio::time::sleep(step).await;
+                if size % 2 == 0 {
+                    printed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    std::fs::write(&output, vec![0; size]).expect("grow");
+                }
+            }
+        };
+
+        let (stopped, ()) = tokio::join!(
+            inactive(Some(timeout), &printed, std::slice::from_ref(&output)),
+            work
+        );
+
+        assert_eq!(stopped, Some(timeout));
+        assert!(started.elapsed() >= step * 5 + timeout);
+    }
+
     #[tokio::test]
     async fn output_is_reported_line_by_line() {
         let (sender, mut receiver) = mpsc::channel(8);
         let stream = std::io::Cursor::new(b"first\r\nsecond\nlast".to_vec());
 
-        let captured = capture_stream(stream, OutputStream::Stderr, 1024, Some(sender))
-            .await
-            .expect("join")
-            .expect("read");
+        let captured = capture_stream(
+            stream,
+            OutputStream::Stderr,
+            1024,
+            Some(sender),
+            Arc::default(),
+        )
+        .await
+        .expect("join")
+        .expect("read");
 
         assert_eq!(captured.bytes, b"first\r\nsecond\nlast");
         assert!(!captured.truncated);
@@ -385,10 +508,16 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(64);
         let stream = std::io::Cursor::new(vec![b'x'; 1024 * 1024]);
 
-        let captured = capture_stream(stream, OutputStream::Stdout, 1024, Some(sender))
-            .await
-            .expect("join")
-            .expect("read");
+        let captured = capture_stream(
+            stream,
+            OutputStream::Stdout,
+            1024,
+            Some(sender),
+            Arc::default(),
+        )
+        .await
+        .expect("join")
+        .expect("read");
 
         assert_eq!(captured.bytes.len(), 1024);
         assert!(captured.truncated);

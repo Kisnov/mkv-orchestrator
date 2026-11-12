@@ -1,4 +1,7 @@
-use std::{path::Path, time::SystemTime};
+use std::{
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -191,6 +194,9 @@ fn tool_kind(value: &str) -> Option<ToolKind> {
         .find(|kind| kind.command_name().eq_ignore_ascii_case(value))
 }
 
+// A remux can run for hours, so only a long silence counts as a dead share or a hung tool.
+const TOOL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Debug, Clone, Default)]
 pub struct ProcessToolExecutor {
     runner: ProcessRunner,
@@ -214,7 +220,12 @@ impl ToolExecutor for ProcessToolExecutor {
                 "tool executable is blank".to_owned(),
             ));
         }
-        let mut spec = ProcessSpec::new(&invocation.executable).args(&invocation.arguments);
+        let mut spec = ProcessSpec::new(&invocation.executable)
+            .args(&invocation.arguments)
+            .inactivity_timeout(
+                TOOL_INACTIVITY_TIMEOUT,
+                invocation.expected_outputs.iter().cloned(),
+            );
         if let Some(directory) = &invocation.working_directory {
             spec = spec.current_dir(directory);
         }
@@ -227,6 +238,14 @@ impl ToolExecutor for ProcessToolExecutor {
                 crate::ProcessError::TimedOut(timeout) => {
                     PortError::unavailable(format!("tool timed out after {timeout:?}"), true)
                 }
+                crate::ProcessError::Inactive(timeout) => PortError::unavailable(
+                    format!(
+                        "{} was stopped: it printed and wrote nothing for {} minutes",
+                        invocation.tool,
+                        timeout.as_secs() / 60
+                    ),
+                    true,
+                ),
                 _ => PortError::Other(error.to_string()),
             })?;
         let validated_outputs = invocation
