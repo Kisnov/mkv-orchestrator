@@ -184,9 +184,11 @@ fn external_subtitle_list(subtitles: &[ExternalSubtitle]) -> String {
                 details.push("forced".to_owned());
             }
 
-            let suffix = (!details.is_empty())
-                .then(|| format!(" ({})", details.join(" · ")))
-                .unwrap_or_default();
+            let suffix = if details.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", details.join(" · "))
+            };
             format!("• {}{suffix}", file_name(&subtitle.path))
         })
         .collect::<Vec<_>>()

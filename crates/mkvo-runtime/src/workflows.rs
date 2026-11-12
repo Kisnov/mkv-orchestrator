@@ -299,7 +299,7 @@ fn build_extractions(
                 .filter(|track| track.kind == TrackKind::Subtitle)
                 .filter(|track| {
                     languages.is_empty()
-                        || languages.contains(&"all".to_owned())
+                        || languages.contains("all")
                         || languages
                             .contains(&track.language_or_undetermined().to_ascii_lowercase())
                 })

@@ -897,9 +897,9 @@ impl MkvoRuntime {
         {
             arguments.push("--no-chapters".to_owned());
         }
-        let preserve_attachments = !attributes
+        let preserve_attachments = attributes
             .get("preserveAttachments")
-            .is_some_and(|value| value == "false");
+            .is_none_or(|value| value != "false");
         if !preserve_attachments {
             arguments.push("--no-attachments".to_owned());
         }
@@ -909,7 +909,7 @@ impl MkvoRuntime {
             .into_iter()
             .find(|file| same_path(&file.path, &item.source));
         if let Some(source) = source.as_ref() {
-            append_track_selection(&mut arguments, &source, &item.selected_track_ids);
+            append_track_selection(&mut arguments, source, &item.selected_track_ids);
             if preserve_attachments && !item.subtitle_transforms.is_empty() {
                 let all_formatable_tracks_selected = source
                     .tracks
@@ -1517,21 +1517,19 @@ fn transform_ass_document(
                 event_text_index = fields
                     .iter()
                     .position(|field| field.eq_ignore_ascii_case("Text"));
-            } else {
-                if let Some(value) = line.strip_prefix("Dialogue:") {
-                    let mut fields = value.split(',').map(str::to_owned).collect::<Vec<_>>();
-                    if let (Some(start), Some(end)) = (event_start_index, event_end_index) {
-                        if offset_ms != 0 && start < fields.len() && end < fields.len() {
-                            fields[start] = shift_ass_time(&fields[start], offset_ms)?;
-                            fields[end] = shift_ass_time(&fields[end], offset_ms)?;
-                        }
+            } else if let Some(value) = line.strip_prefix("Dialogue:") {
+                let mut fields = value.split(',').map(str::to_owned).collect::<Vec<_>>();
+                if let (Some(start), Some(end)) = (event_start_index, event_end_index) {
+                    if offset_ms != 0 && start < fields.len() && end < fields.len() {
+                        fields[start] = shift_ass_time(&fields[start], offset_ms)?;
+                        fields[end] = shift_ass_time(&fields[end], offset_ms)?;
                     }
-                    if let Some(text) = event_text_index.filter(|index| *index < fields.len()) {
-                        fields[text] = replace_ass_inline_fonts(&fields[text..].join(","), font);
-                        fields.truncate(text + 1);
-                    }
-                    next = format!("Dialogue:{}", fields.join(","));
                 }
+                if let Some(text) = event_text_index.filter(|index| *index < fields.len()) {
+                    fields[text] = replace_ass_inline_fonts(&fields[text..].join(","), font);
+                    fields.truncate(text + 1);
+                }
+                next = format!("Dialogue:{}", fields.join(","));
             }
         }
         output.push_str(&next);

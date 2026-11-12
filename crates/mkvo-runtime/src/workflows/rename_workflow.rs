@@ -561,10 +561,10 @@ impl MkvoRuntime {
                             )
                             .await
                             && fallback.iter().any(|episode| {
-                                !episode
+                                episode
                                     .title
                                     .strip_prefix("Episode ")
-                                    .is_some_and(|number| number.parse::<u32>().is_ok())
+                                    .is_none_or(|number| number.parse::<u32>().is_err())
                             })
                         {
                             return Ok(fallback);
