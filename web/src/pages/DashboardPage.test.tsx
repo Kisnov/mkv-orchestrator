@@ -235,6 +235,14 @@ describe("Dashboard UI cache reset", () => {
 
     expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /clear ui cache/i }));
+    const dialog = screen.getByRole("dialog", { name: "Clear UI Cache" });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(clearCurrentScanFiles).not.toHaveBeenCalled();
+    expect(screen.getByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /clear ui cache/i }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear UI Cache" }));
 
     await waitFor(() => expect(clearCurrentScanFiles).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.queryByRole("row", { name: /Episode 01\.mkv/i })).not.toBeInTheDocument());
@@ -287,6 +295,7 @@ describe("Dashboard UI cache reset", () => {
 
     expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /clear ui cache/i }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear UI Cache" }));
     await waitFor(() => expect(screen.queryByRole("row", { name: /Episode 01\.mkv/i })).not.toBeInTheDocument());
 
     await user.click(screen.getByRole("button", { name: /^scan$/i }));

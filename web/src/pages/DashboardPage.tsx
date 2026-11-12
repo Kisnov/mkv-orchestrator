@@ -3,6 +3,7 @@ import { Fragment, type MouseEvent, type ReactNode, useEffect, useMemo, useRef, 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ChevronUp, Copy, FileCheck, FileVideo, Folder, FolderOpen, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { authorizeBrowsedRoot, cancelScan, clearCurrentScanFiles, FileSystemEntry, getBackendTransport, getCurrentScanFiles, getScanJob, getStatus, getWebSettings, MediaFileRow, saveWebSettings, startScan } from "../api";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { SectionHeader } from "../components/SectionHeader";
 import { FileBrowser } from "../components/FileBrowser";
 import { SortableColumnHeader, type SortDirection } from "../components/SortableColumnHeader";
@@ -115,6 +116,7 @@ export function DashboardPage() {
     }
   });
   const scanCancel = useMutation({ mutationFn: cancelScan });
+  const [isCacheClearConfirmOpen, setIsCacheClearConfirmOpen] = useState(false);
   const cacheClear = useMutation({
     mutationFn: clearCurrentScanFiles,
     onSuccess: (emptyScan) => {
@@ -642,7 +644,7 @@ export function DashboardPage() {
           </div>
           <button
             type="button"
-            onClick={() => cacheClear.mutate()}
+            onClick={() => setIsCacheClearConfirmOpen(true)}
             disabled={isScanning || cacheClear.isPending}
             className="mt-2 inline-flex h-9 w-full items-center justify-center gap-2 rounded-md border border-border bg-button px-3 text-sm font-semibold text-muted transition hover:bg-button-hover hover:text-text disabled:cursor-not-allowed disabled:text-disabled"
           >
@@ -899,6 +901,15 @@ export function DashboardPage() {
           onPinToQuickAccess={pinBrowsePath}
           onUnpinFromQuickAccess={unpinBrowsePath}
           removableRootPaths={(settings.data?.libraryRoots ?? []).map((root) => root.path)}
+        />
+      ) : null}
+      {isCacheClearConfirmOpen ? (
+        <ConfirmModal
+          title="Clear UI Cache"
+          message="This clears the scanned files, the current selection and any rename or track edits in progress. Your scan sources and settings are kept, and no media files are changed."
+          confirmLabel="Clear UI Cache"
+          onConfirm={() => { setIsCacheClearConfirmOpen(false); cacheClear.mutate(); }}
+          onClose={() => setIsCacheClearConfirmOpen(false)}
         />
       ) : null}
       {contextMenu ? (
