@@ -166,16 +166,16 @@ fn parse_titles(xml: &str) -> Result<Vec<AnimeTitle>, ProviderError> {
 
 /// Fold the language spellings AniDB and MKVO each use onto one form.
 fn normalize_language(language: &str) -> String {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "eng" | "en" => "en",
-        "jpn" | "ja" => "ja",
+    let language = language.trim().to_ascii_lowercase();
+    match language.as_str() {
         "jpn-romaji" | "romaji" | "x_jat" | "x-jat" => "x-jat",
-        "spa" | "es" => "es",
-        "fre" | "fra" | "fr" => "fr",
-        "ger" | "deu" | "de" => "de",
-        "kor" | "ko" => "ko",
-        "chi" | "zh" => "zh",
-        other => other,
+        // AniDB files Catalan, Galician and Basque under Spain.
+        "cat" | "ca" => "es-ca",
+        "glg" | "gl" => "es-ga",
+        "baq" | "eus" | "eu" => "es-pv",
+        // Regional and AniDB-only tags (`pt-br`, `zh-hans`, `x-kot`) stay as they are.
+        other if other.contains('-') => other,
+        other => crate::iso639::lookup(other).map_or(other, |(language, _)| language),
     }
     .to_owned()
 }
@@ -483,6 +483,21 @@ mod tests {
         // the English official one.
         assert_eq!(pick_title(&group, "eng"), "Seikai no Monshou");
         assert_eq!(pick_title(&group, "x-jat"), "Seikai no Monshou");
+    }
+
+    #[test]
+    fn requested_languages_fold_onto_anidbs_codes() {
+        assert_eq!(normalize_language("eng"), "en");
+        assert_eq!(normalize_language("ita"), "it");
+        assert_eq!(normalize_language("por"), "pt");
+        assert_eq!(normalize_language("dut"), "nl");
+        assert_eq!(normalize_language("pt-BR"), "pt-br");
+        assert_eq!(normalize_language("zh-Hans"), "zh-hans");
+        assert_eq!(normalize_language("cat"), "es-ca");
+        assert_eq!(normalize_language("ca"), "es-ca");
+        assert_eq!(normalize_language("es-CA"), "es-ca");
+        assert_eq!(normalize_language("glg"), "es-ga");
+        assert_eq!(normalize_language("baq"), "es-pv");
     }
 
     #[test]

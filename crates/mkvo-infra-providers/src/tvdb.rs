@@ -365,16 +365,11 @@ fn tvdb_has_next_page(document: &Value, current_page: u32) -> bool {
     }
 }
 
+/// TVDB keys translations by the three-letter ISO 639-2/T code.
 fn tvdb_language(value: &str) -> String {
-    let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "en" | "en-us" | "eng" => "eng".to_owned(),
-        "ja" | "ja-jp" | "jpn" => "jpn".to_owned(),
-        "es" | "es-es" | "spa" => "spa".to_owned(),
-        "fr" | "fr-fr" | "fra" | "fre" => "fra".to_owned(),
-        "de" | "de-de" | "deu" | "ger" => "deu".to_owned(),
-        _ => "eng".to_owned(),
-    }
+    crate::iso639::lookup(value)
+        .map_or("eng", |(_, language)| language)
+        .to_owned()
 }
 
 fn translation_name(document: &Value, language: &str) -> Option<String> {
@@ -429,6 +424,18 @@ mod tests {
             translation_name(&document, "eng").as_deref(),
             Some("That Time I Got Reincarnated as a Slime")
         );
+    }
+
+    #[test]
+    fn languages_map_to_tvdbs_three_letter_codes() {
+        assert_eq!(tvdb_language("ca"), "cat");
+        assert_eq!(tvdb_language("cat"), "cat");
+        assert_eq!(tvdb_language("it"), "ita");
+        assert_eq!(tvdb_language("cze"), "ces");
+        assert_eq!(tvdb_language("ger"), "deu");
+        assert_eq!(tvdb_language("pt-BR"), "por");
+        assert_eq!(tvdb_language("en_US"), "eng");
+        assert_eq!(tvdb_language("und"), "eng");
     }
 
     #[test]

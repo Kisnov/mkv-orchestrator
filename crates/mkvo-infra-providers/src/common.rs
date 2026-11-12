@@ -240,23 +240,19 @@ where
     }
 }
 
+/// TMDB's `language` form: ISO 639-1, optionally followed by a country.
 pub fn normalize_language(value: &str) -> String {
     let value = value.trim().replace('_', "-").to_ascii_lowercase();
-    match value.as_str() {
-        "eng" => "en-US".to_owned(),
-        "jpn" => "ja-JP".to_owned(),
-        "spa" => "es-ES".to_owned(),
-        "fre" | "fra" => "fr-FR".to_owned(),
-        "ger" | "deu" => "de-DE".to_owned(),
-        "en" => "en-US".to_owned(),
-        "ja" => "ja-JP".to_owned(),
-        "es" => "es-ES".to_owned(),
-        "fr" => "fr-FR".to_owned(),
-        "de" => "de-DE".to_owned(),
-        value if value.len() == 5 && value.as_bytes()[2] == b'-' => {
-            format!("{}-{}", &value[..2], value[3..].to_ascii_uppercase())
-        }
-        _ => "en-US".to_owned(),
+    if value.len() == 5 && value.as_bytes()[2] == b'-' {
+        return format!("{}-{}", &value[..2], value[3..].to_ascii_uppercase());
+    }
+    match crate::iso639::lookup(&value) {
+        Some(("en", _)) | None => "en-US".to_owned(),
+        Some(("ja", _)) => "ja-JP".to_owned(),
+        Some(("es", _)) => "es-ES".to_owned(),
+        Some(("fr", _)) => "fr-FR".to_owned(),
+        Some(("de", _)) => "de-DE".to_owned(),
+        Some((language, _)) => language.to_owned(),
     }
 }
 
@@ -298,5 +294,16 @@ mod tests {
         assert_eq!(normalize_language("eng"), "en-US");
         assert_eq!(normalize_language("ja_jp"), "ja-JP");
         assert_eq!(normalize_language("unknown"), "en-US");
+    }
+
+    #[test]
+    fn languages_beyond_the_big_five_keep_their_own_code() {
+        assert_eq!(normalize_language("cat"), "ca");
+        assert_eq!(normalize_language("ita"), "it");
+        assert_eq!(normalize_language("ko"), "ko");
+        assert_eq!(normalize_language("dut"), "nl");
+        assert_eq!(normalize_language("pt-br"), "pt-BR");
+        assert_eq!(normalize_language("fre"), "fr-FR");
+        assert_eq!(normalize_language("und"), "en-US");
     }
 }
