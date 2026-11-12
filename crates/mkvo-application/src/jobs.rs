@@ -13,9 +13,14 @@ use mkvo_contracts::{
 };
 use mkvo_domain::{CorrelationId, IdempotencyKey, JobId, PlanId, ResourceAccess, ResourceClaim};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ApplicationError, ApplicationResult, JobRepository, PortError};
+
+/// Progress lives in memory. While a job runs the repository is brought up to
+/// date at most this often, and always when the job's status changes.
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct JobSpec {
@@ -179,14 +184,14 @@ impl JobSupervisor {
             sequence: AtomicU64::new(0),
             repository: Arc::clone(&self.repository),
             retained_lines: self.retained_lines,
+            saved_at: Mutex::new(Instant::now()),
         });
 
         self.repository.insert(&snapshot).await?;
         self.live.write().await.insert(id, Arc::clone(&live));
         live.publish(JobEvent::Snapshot {
             snapshot: snapshot.clone(),
-        })
-        .await?;
+        });
 
         let supervisor = Arc::clone(self);
         tokio::spawn(async move {
@@ -318,6 +323,9 @@ struct LiveJob {
     sequence: AtomicU64,
     repository: Arc<dyn JobRepository>,
     retained_lines: usize,
+    /// When the snapshot last reached the repository. Held across each write
+    /// so an older snapshot can never land after a newer one.
+    saved_at: Mutex<Instant>,
 }
 
 impl LiveJob {
@@ -337,7 +345,8 @@ impl LiveJob {
             Ok(())
         })
         .await?;
-        self.publish(JobEvent::StatusChanged { status }).await
+        self.publish(JobEvent::StatusChanged { status });
+        Ok(())
     }
 
     async fn update(
@@ -352,9 +361,32 @@ impl LiveJob {
         self.persist().await
     }
 
+    /// Change progress in memory, saving it only once the last write is old
+    /// enough: a scan reports every file, and a write per file starves it.
+    async fn record(&self, mutate: impl FnOnce(&mut JobSnapshot)) -> ApplicationResult<()> {
+        {
+            let mut snapshot = self.snapshot.lock().await;
+            mutate(&mut snapshot);
+            snapshot.revision = snapshot.revision.saturating_add(1);
+        }
+        // A write already in flight is recent enough.
+        if let Ok(mut saved_at) = self.saved_at.try_lock()
+            && saved_at.elapsed() >= PROGRESS_PERSIST_INTERVAL
+        {
+            self.write(&mut saved_at).await?;
+        }
+        Ok(())
+    }
+
     async fn persist(&self) -> ApplicationResult<JobSnapshot> {
+        let mut saved_at = self.saved_at.lock().await;
+        self.write(&mut saved_at).await
+    }
+
+    async fn write(&self, saved_at: &mut Instant) -> ApplicationResult<JobSnapshot> {
         let snapshot = self.snapshot.lock().await.clone();
         self.repository.update(&snapshot).await?;
+        *saved_at = Instant::now();
         Ok(snapshot)
     }
 
@@ -368,11 +400,10 @@ impl LiveJob {
         }
     }
 
-    async fn publish(&self, event: JobEvent) -> ApplicationResult<()> {
-        let envelope = self.envelope(event);
-        self.repository.append_event(&envelope).await?;
-        let _ = self.events.send(envelope);
-        Ok(())
+    /// Tell live subscribers. Only the event that ends a job is stored: a
+    /// scan would otherwise leave rows for every file it looked at.
+    fn publish(&self, event: JobEvent) {
+        let _ = self.events.send(self.envelope(event));
     }
 
     /// Cancel under the snapshot lock, where the runner also decides how the
@@ -390,8 +421,7 @@ impl LiveJob {
         let snapshot = self.persist().await?;
         self.publish(JobEvent::StatusChanged {
             status: JobStatus::Canceling,
-        })
-        .await?;
+        });
         Ok(snapshot)
     }
 
@@ -510,71 +540,64 @@ impl JobContext {
     ) -> ApplicationResult<()> {
         let current_file = current_file.into();
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.completed = completed.min(total);
                 snapshot.total = total;
                 snapshot.current_file.clone_from(&current_file);
                 snapshot.current_file_percent = current_file_percent.min(100);
-                Ok(())
             })
             .await?;
-        self.live
-            .publish(JobEvent::Progress {
-                completed: completed.min(total),
-                total,
-                current_file,
-                current_file_percent: current_file_percent.min(100),
-            })
-            .await
+        self.live.publish(JobEvent::Progress {
+            completed: completed.min(total),
+            total,
+            current_file,
+            current_file_percent: current_file_percent.min(100),
+        });
+        Ok(())
     }
 
     pub async fn record_completed(&self) -> ApplicationResult<()> {
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.completed = snapshot.completed.saturating_add(1).min(snapshot.total);
-                Ok(())
             })
             .await
-            .map(|_| ())
     }
 
     pub async fn record_failed(&self) -> ApplicationResult<()> {
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.failed = snapshot.failed.saturating_add(1);
-                Ok(())
             })
             .await
-            .map(|_| ())
     }
 
     pub async fn record_skipped(&self) -> ApplicationResult<()> {
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.skipped = snapshot.skipped.saturating_add(1);
-                Ok(())
             })
             .await
-            .map(|_| ())
     }
 
     pub async fn log(&self, level: JobLogLevel, line: impl Into<String>) -> ApplicationResult<()> {
         let line = line.into();
         let limit = self.live.retained_lines;
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.lines.push(line.clone());
                 if snapshot.lines.len() > limit {
                     snapshot.lines.drain(0..snapshot.lines.len() - limit);
                 }
-                Ok(())
             })
             .await?;
-        self.live.publish(JobEvent::Log { level, line }).await
+        self.live.publish(JobEvent::Log { level, line });
+        Ok(())
     }
 
     pub async fn emit(&self, event: JobEvent) -> ApplicationResult<()> {
-        self.live.publish(event).await
+        self.live.publish(event);
+        Ok(())
     }
 }
 
@@ -912,7 +935,7 @@ mod tests {
     }
 
     async fn wait_for_status(supervisor: &JobSupervisor, id: JobId, status: JobStatus) {
-        for _ in 0..50 {
+        for _ in 0..400 {
             if supervisor.get(id).await.unwrap().unwrap().status == status {
                 return;
             }
@@ -1039,6 +1062,96 @@ mod tests {
         assert_eq!(stored.status, JobStatus::Running);
         let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
         assert_eq!(snapshot.status, JobStatus::Completed);
+    }
+
+    fn discovered(path: &str) -> JobEvent {
+        let file = mkvo_domain::MediaFile {
+            path: PathBuf::from(path),
+            original_file_name: None,
+            watch_root: None,
+            relative_path: None,
+            fingerprint: mkvo_domain::FileFingerprint {
+                path: PathBuf::from(path),
+                size_bytes: 1,
+                modified_at: Utc::now(),
+                quick_hash: None,
+            },
+            container: mkvo_domain::ContainerMetadata::default(),
+            tracks: Vec::new(),
+            attachments: Vec::new(),
+            episode: None,
+            provider_match: None,
+            status: mkvo_domain::MediaStatus::Ready,
+        };
+        JobEvent::MediaDiscovered {
+            file: mkvo_contracts::MediaFileDto::from(&file),
+        }
+    }
+
+    /// A scan reports every file. Neither the number of repository writes nor
+    /// the stored events may grow with the number of files.
+    #[tokio::test]
+    async fn per_file_progress_is_not_written_per_file() {
+        const FILES: u64 = 2_000;
+        let repository = Arc::new(ObservedRepository::default());
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let accepted = supervisor
+            .start(spec("many-files", Vec::new()), |context| async move {
+                for index in 1..=FILES {
+                    context.emit(discovered("library/show/a.mkv")).await?;
+                    context.progress(index, FILES, "a.mkv", 100).await?;
+                    context.record_skipped().await?;
+                    context.log(JobLogLevel::Warning, "skipped").await?;
+                }
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+        wait_for_status(&supervisor, accepted.id, JobStatus::Completed).await;
+
+        // Running, at most a handful of timed saves, and the terminal state.
+        let updates = repository.updates.load(Ordering::SeqCst);
+        assert!(updates <= 5, "{updates} snapshot writes for {FILES} files");
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::Completed);
+        assert_eq!((stored.completed, stored.skipped), (FILES, FILES));
+
+        let stored_events = repository.inner.events.read().await;
+        let stored_events = &stored_events[&accepted.id];
+        assert_eq!(stored_events.len(), 1);
+        assert!(matches!(stored_events[0].event, JobEvent::Completed { .. }));
+
+        // Live subscribers still get the stream.
+        let mut live_events = 0;
+        while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = events.try_recv() {
+            live_events += 1;
+        }
+        assert!(live_events > 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_is_saved_once_the_last_write_is_old_enough() {
+        let repository = Arc::new(ObservedRepository::default());
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let (step, mut steps) = tokio::sync::mpsc::channel::<()>(1);
+        let accepted = supervisor
+            .start(spec("slow-file", Vec::new()), |context| async move {
+                context.progress(1, 3, "a.mkv", 100).await?;
+                tokio::time::sleep(PROGRESS_PERSIST_INTERVAL).await;
+                context.progress(2, 3, "b.mkv", 100).await?;
+                step.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        steps.recv().await.unwrap();
+
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.completed, 2);
+        let live = supervisor.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(live.current_file, "b.mkv");
     }
 
     #[tokio::test]
