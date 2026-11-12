@@ -114,31 +114,47 @@ impl SqliteStore {
     }
 
     pub fn upsert_media(&self, media: &CachedMedia) -> StoreResult<()> {
-        let size =
-            i64::try_from(media.fingerprint.file_size).map_err(|_| StoreError::NumericOverflow)?;
-        let payload = serde_json::to_string(&media.payload)?;
-        let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO media_cache
-             (file_path, file_size, modified_at_ns, quick_hash, tool_fingerprint, scanned_at_ms, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(file_path) DO UPDATE SET
-               file_size=excluded.file_size,
-               modified_at_ns=excluded.modified_at_ns,
-               quick_hash=excluded.quick_hash,
-               tool_fingerprint=excluded.tool_fingerprint,
-               scanned_at_ms=excluded.scanned_at_ms,
-               payload_json=excluded.payload_json",
-            params![
-                path_text(&media.fingerprint.path),
-                size,
-                media.fingerprint.modified_at_ns,
-                media.fingerprint.quick_hash,
-                media.fingerprint.tool_fingerprint,
-                media.scanned_at_ms,
-                payload,
-            ],
-        )?;
+        self.upsert_media_batch(
+            &[(media.fingerprint.clone(), &media.payload)],
+            media.scanned_at_ms,
+        )
+    }
+
+    /// Writes every entry in one transaction.
+    pub fn upsert_media_batch<T: Serialize>(
+        &self,
+        entries: &[(CacheFingerprint, T)],
+        scanned_at_ms: i64,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut upsert = transaction.prepare(
+                "INSERT INTO media_cache
+                 (file_path, file_size, modified_at_ns, quick_hash, tool_fingerprint, scanned_at_ms, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(file_path) DO UPDATE SET
+                   file_size=excluded.file_size,
+                   modified_at_ns=excluded.modified_at_ns,
+                   quick_hash=excluded.quick_hash,
+                   tool_fingerprint=excluded.tool_fingerprint,
+                   scanned_at_ms=excluded.scanned_at_ms,
+                   payload_json=excluded.payload_json",
+            )?;
+            for (fingerprint, payload) in entries {
+                upsert.execute(params![
+                    path_text(&fingerprint.path),
+                    i64::try_from(fingerprint.file_size)
+                        .map_err(|_| StoreError::NumericOverflow)?,
+                    fingerprint.modified_at_ns,
+                    fingerprint.quick_hash,
+                    fingerprint.tool_fingerprint,
+                    scanned_at_ms,
+                    serde_json::to_string(payload)?,
+                ])?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -253,6 +269,29 @@ mod tests {
         assert!(cached(&store, "/media/anime/c.mkv"));
         assert!(cached(&store, "/media/Anime2/d.mkv"));
         assert!(cached(&store, "/media/Anime.old/e.mkv"));
+    }
+
+    #[test]
+    fn a_batch_is_written_whole_or_not_at_all() {
+        let store = store_with(&[]);
+        let entries = [
+            (fingerprint("/lib/a.mkv"), json!({"tracks": 1})),
+            (fingerprint("/lib/b.mkv"), json!({"tracks": 2})),
+        ];
+        store.upsert_media_batch(&entries, 100).expect("batch");
+        assert_eq!(store.cache_count().expect("count"), 2);
+        assert!(cached(&store, "/lib/b.mkv"));
+
+        let oversized = CacheFingerprint {
+            file_size: u64::MAX,
+            ..fingerprint("/lib/d.mkv")
+        };
+        let entries = [
+            (fingerprint("/lib/c.mkv"), json!({})),
+            (oversized, json!({})),
+        ];
+        assert!(store.upsert_media_batch(&entries, 100).is_err());
+        assert!(!cached(&store, "/lib/c.mkv"));
     }
 
     #[test]

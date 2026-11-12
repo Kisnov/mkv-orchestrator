@@ -57,6 +57,13 @@ pub trait MetadataCache: Send + Sync {
         root: &Path,
         cutoff: DateTime<Utc>,
     ) -> Result<u64, PortError>;
+    /// Store several probe results at once.
+    async fn upsert_many(&self, files: &[MediaFile]) -> Result<(), PortError> {
+        for file in files {
+            self.upsert(file).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

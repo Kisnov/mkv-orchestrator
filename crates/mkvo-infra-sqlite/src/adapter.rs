@@ -14,8 +14,7 @@ use mkvo_domain::{
 use rusqlite::{OptionalExtension, params};
 
 use crate::{
-    CacheFingerprint, CachedMedia, RenameBatch, RenameBatchEntry, SqliteStore, StoreError,
-    StoredJob, StoredPlan,
+    CacheFingerprint, RenameBatch, RenameBatchEntry, SqliteStore, StoreError, StoredJob, StoredPlan,
 };
 
 const SETTINGS_KEY: &str = "app";
@@ -73,13 +72,17 @@ impl MetadataCache for SqliteRepositories {
     }
 
     async fn upsert(&self, file: &MediaFile) -> Result<(), PortError> {
-        let file = file.clone();
+        self.upsert_many(std::slice::from_ref(file)).await
+    }
+
+    async fn upsert_many(&self, files: &[MediaFile]) -> Result<(), PortError> {
+        let files = files.to_vec();
         self.blocking(move |store| {
-            store.upsert_media(&CachedMedia {
-                fingerprint: to_cache_fingerprint(&file.fingerprint),
-                scanned_at_ms: Utc::now().timestamp_millis(),
-                payload: serde_json::to_value(file)?,
-            })
+            let entries: Vec<_> = files
+                .iter()
+                .map(|file| (to_cache_fingerprint(&file.fingerprint), file))
+                .collect();
+            store.upsert_media_batch(&entries, Utc::now().timestamp_millis())
         })
         .await
     }
@@ -658,7 +661,7 @@ mod tests {
         let eight_days_later = probed_at + chrono::TimeDelta::days(8);
         repositories
             .store()
-            .upsert_media(&CachedMedia {
+            .upsert_media(&crate::CachedMedia {
                 fingerprint: to_cache_fingerprint(&fingerprint),
                 scanned_at_ms: probed_at.timestamp_millis(),
                 payload: serde_json::to_value(&file).expect("payload"),

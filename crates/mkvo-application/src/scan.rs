@@ -7,6 +7,7 @@ use chrono::{TimeDelta, Utc};
 use futures::{StreamExt, stream};
 use mkvo_contracts::{JobEvent, MediaFileDto, ScanRequest, ScanResponse, ScanSummary};
 use mkvo_domain::MediaFile;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -16,6 +17,7 @@ use crate::{
 
 const MEDIA_CACHE_RETENTION_DAYS: i64 = 7;
 const CACHE_BATCH: usize = 200;
+const CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanSkip {
@@ -97,6 +99,23 @@ impl ScanEventSink for JobContext {
     }
 }
 
+/// Cache writes held back so that a batch is one SQLite transaction.
+#[derive(Default)]
+struct CacheWrites {
+    probed: Vec<MediaFile>,
+    seen: Vec<PathBuf>,
+    probed_since: Option<Instant>,
+}
+
+impl CacheWrites {
+    fn is_due(&self) -> bool {
+        self.probed.len() + self.seen.len() >= CACHE_BATCH
+            || self
+                .probed_since
+                .is_some_and(|since| since.elapsed() >= CACHE_FLUSH_INTERVAL)
+    }
+}
+
 pub struct ScanService {
     catalog: Arc<dyn MediaCatalog>,
     probe: Arc<dyn MediaProbe>,
@@ -168,7 +187,56 @@ impl ScanService {
                 .map(str::to_owned)
                 .collect::<BTreeSet<_>>(),
         };
-        let fingerprints = self.catalog.enumerate(&enumeration, cancel.clone()).await?;
+        let mut outcome = ScanOutcome::default();
+        let mut writes = CacheWrites::default();
+        let scanned = self
+            .collect(
+                &enumeration,
+                request,
+                &cancel,
+                sink,
+                &mut outcome,
+                &mut writes,
+            )
+            .await;
+        // A canceled scan still keeps what it probed.
+        self.flush(&mut writes).await?;
+        scanned?;
+
+        // Files that moved away must not pile up in the cache. Everything found was
+        // just marked seen, so this drops only what has been gone from these roots
+        // for the whole retention.
+        let cutoff = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
+        for root in &enumeration.roots {
+            self.cache.remove_unseen_under(root, cutoff).await?;
+        }
+        outcome
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(outcome)
+    }
+
+    async fn flush(&self, writes: &mut CacheWrites) -> ApplicationResult<()> {
+        if !writes.probed.is_empty() {
+            self.cache.upsert_many(&writes.probed).await?;
+        }
+        if !writes.seen.is_empty() {
+            self.cache.mark_seen(&writes.seen, Utc::now()).await?;
+        }
+        *writes = CacheWrites::default();
+        Ok(())
+    }
+
+    async fn collect(
+        &self,
+        enumeration: &MediaEnumerationRequest,
+        request: &ScanRequest,
+        cancel: &CancellationToken,
+        sink: &dyn ScanEventSink,
+        outcome: &mut ScanOutcome,
+        writes: &mut CacheWrites,
+    ) -> ApplicationResult<()> {
+        let fingerprints = self.catalog.enumerate(enumeration, cancel.clone()).await?;
         let total = u64::try_from(fingerprints.len()).unwrap_or(u64::MAX);
         let workers = request
             .max_workers
@@ -197,9 +265,6 @@ impl ScanService {
                 match probe.inspect(&fingerprint.path, cancel).await {
                     Ok(mut file) => {
                         file.fingerprint = fingerprint;
-                        if let Err(error) = cache.upsert(&file).await {
-                            return Err((file.path.clone(), error.into()));
-                        }
                         Ok((file, false))
                     }
                     Err(error) => Err((fingerprint.path.clone(), error.into())),
@@ -208,8 +273,6 @@ impl ScanService {
         }))
         .buffer_unordered(workers);
 
-        let mut outcome = ScanOutcome::default();
-        let mut seen = Vec::new();
         while let Some(result) = work.next().await {
             if cancel.is_cancelled() {
                 return Err(ApplicationError::Canceled);
@@ -219,11 +282,10 @@ impl ScanService {
                     outcome.summary.total += 1;
                     if cached {
                         outcome.summary.cached += 1;
-                        seen.push(file.fingerprint.path.clone());
-                        if seen.len() >= CACHE_BATCH {
-                            self.cache.mark_seen(&seen, Utc::now()).await?;
-                            seen.clear();
-                        }
+                        writes.seen.push(file.fingerprint.path.clone());
+                    } else {
+                        writes.probed.push(file.clone());
+                        writes.probed_since.get_or_insert_with(Instant::now);
                     }
                     let extension = file.extension();
                     if extension.eq_ignore_ascii_case("mkv") {
@@ -251,19 +313,11 @@ impl ScanService {
                     outcome.skipped.push(ScanSkip { path, reason });
                 }
             }
+            if writes.is_due() {
+                self.flush(writes).await?;
+            }
         }
-        self.cache.mark_seen(&seen, Utc::now()).await?;
-        // Files that moved away must not pile up in the cache. Everything found was
-        // just marked seen, so this drops only what has been gone from these roots
-        // for the whole retention.
-        let cutoff = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
-        for root in &enumeration.roots {
-            self.cache.remove_unseen_under(root, cutoff).await?;
-        }
-        outcome
-            .files
-            .sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(outcome)
+        Ok(())
     }
 }
 
@@ -296,6 +350,7 @@ mod tests {
     #[derive(Default)]
     struct Probe {
         calls: AtomicUsize,
+        delay: Duration,
     }
     #[async_trait]
     impl MediaProbe for Probe {
@@ -305,6 +360,9 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<MediaFile, PortError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             Ok(media(path))
         }
     }
@@ -313,6 +371,7 @@ mod tests {
     #[derive(Default)]
     struct Cache {
         files: RwLock<HashMap<PathBuf, (MediaFile, DateTime<Utc>)>>,
+        writes: AtomicUsize,
     }
     impl Cache {
         async fn seed(&self, path: &str, seen_at: DateTime<Utc>) {
@@ -336,10 +395,14 @@ mod tests {
             Ok(files.get(&fingerprint.path).map(|(file, _)| file.clone()))
         }
         async fn upsert(&self, file: &MediaFile) -> Result<(), PortError> {
-            self.files
-                .write()
-                .await
-                .insert(file.path.clone(), (file.clone(), Utc::now()));
+            self.upsert_many(std::slice::from_ref(file)).await
+        }
+        async fn upsert_many(&self, batch: &[MediaFile]) -> Result<(), PortError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            let mut files = self.files.write().await;
+            for file in batch {
+                files.insert(file.path.clone(), (file.clone(), Utc::now()));
+            }
             Ok(())
         }
         async fn remove(&self, path: &Path) -> Result<bool, PortError> {
@@ -424,12 +487,7 @@ mod tests {
         }
     }
 
-    async fn scan(
-        source: &str,
-        found: &[&str],
-        cache: &Arc<Cache>,
-        probe: &Arc<Probe>,
-    ) -> ScanOutcome {
+    fn service(found: &[&str], cache: &Arc<Cache>, probe: &Arc<Probe>) -> ScanService {
         let catalog = Catalog(found.iter().map(|path| fingerprint(path)).collect());
         ScanService::new(
             Arc::new(catalog),
@@ -438,16 +496,44 @@ mod tests {
             Arc::new(Paths),
             2,
         )
-        .scan(
-            &ScanRequest {
-                source_path: Some(source.to_owned()),
-                ..ScanRequest::default()
-            },
-            CancellationToken::new(),
-            &NoopScanEventSink,
-        )
-        .await
-        .unwrap()
+    }
+
+    fn request(source: &str) -> ScanRequest {
+        ScanRequest {
+            source_path: Some(source.to_owned()),
+            ..ScanRequest::default()
+        }
+    }
+
+    async fn scan(
+        source: &str,
+        found: &[&str],
+        cache: &Arc<Cache>,
+        probe: &Arc<Probe>,
+    ) -> ScanOutcome {
+        service(found, cache, probe)
+            .scan(
+                &request(source),
+                CancellationToken::new(),
+                &NoopScanEventSink,
+            )
+            .await
+            .unwrap()
+    }
+
+    struct CancelOnProgress(CancellationToken);
+    #[async_trait]
+    impl ScanEventSink for CancelOnProgress {
+        async fn file_discovered(&self, _file: &MediaFile) -> ApplicationResult<()> {
+            Ok(())
+        }
+        async fn progress(&self, _done: u64, _total: u64, _current: &str) -> ApplicationResult<()> {
+            self.0.cancel();
+            Ok(())
+        }
+        async fn skipped(&self, _path: &str, _reason: &str) -> ApplicationResult<()> {
+            Ok(())
+        }
     }
 
     fn days_ago(days: i64) -> DateTime<Utc> {
@@ -466,6 +552,46 @@ mod tests {
         assert_eq!(outcome.summary.mp4, 1);
         assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
         assert!(cache.contains("two.mp4").await);
+    }
+
+    #[tokio::test]
+    async fn probe_results_are_written_to_the_cache_in_batches() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        let found: Vec<_> = (0..450).map(|n| format!("lib/{n:03}.mkv")).collect();
+        let found: Vec<_> = found.iter().map(String::as_str).collect();
+
+        let outcome = scan("lib", &found, &cache, &probe).await;
+        assert_eq!(outcome.files.len(), 450);
+        assert_eq!(cache.count().await.unwrap(), 450);
+        assert_eq!(cache.writes.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_probes_are_written_without_waiting_for_a_full_batch() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe {
+            delay: CACHE_FLUSH_INTERVAL,
+            ..Probe::default()
+        });
+        let found = ["lib/1.mkv", "lib/2.mkv", "lib/3.mkv", "lib/4.mkv"];
+
+        scan("lib", &found, &cache, &probe).await;
+        assert_eq!(cache.writes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_canceled_scan_keeps_what_it_already_probed() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        let cancel = CancellationToken::new();
+        let found = ["lib/1.mkv", "lib/2.mkv", "lib/3.mkv", "lib/4.mkv"];
+
+        let result = service(&found, &cache, &probe)
+            .scan(&request("lib"), cancel.clone(), &CancelOnProgress(cancel))
+            .await;
+        assert!(matches!(result, Err(ApplicationError::Canceled)));
+        assert!(cache.count().await.unwrap() >= 1);
     }
 
     #[tokio::test]
