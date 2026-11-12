@@ -123,7 +123,7 @@ pub struct EpisodeMetadata {
     pub air_date: Option<String>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ProviderError {
     #[error("{provider} credentials are not configured")]
     MissingCredentials { provider: ProviderKind },

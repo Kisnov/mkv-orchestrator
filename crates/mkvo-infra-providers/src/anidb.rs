@@ -13,7 +13,7 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -33,6 +33,8 @@ const KIND: ProviderKind = ProviderKind::AniDb;
 const TITLES_FILE: &str = "anidb-titles.xml.gz";
 /// AniDB asks clients not to fetch the title dump more than once a day.
 const TITLE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// After a failed download AniDB is left alone this long before the next try.
+const DOWNLOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// AniDB bans clients that send more than one request every two seconds.
 const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESULTS: usize = 50;
@@ -52,6 +54,18 @@ struct AnimeTitle {
 struct TitleCache {
     titles: Arc<[AnimeTitle]>,
     fetched_at: Option<SystemTime>,
+    failure: Option<(Instant, ProviderError)>,
+}
+
+impl TitleCache {
+    /// An outdated dump still answers searches while AniDB cannot be reached.
+    fn outdated_or(&self, error: ProviderError) -> Result<Arc<[AnimeTitle]>, ProviderError> {
+        if self.fetched_at.is_some() {
+            Ok(Arc::clone(&self.titles))
+        } else {
+            Err(error)
+        }
+    }
 }
 
 /// A date in the future means the clock stepped back, which counts as just fetched.
@@ -111,7 +125,7 @@ impl AniDbClient {
             () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider: KIND }),
             cache = self.cache.lock() => cache,
         };
-        if !cache.fetched_at.is_some_and(is_fresh)
+        if cache.fetched_at.is_none()
             && let Some(stored) = self.stored_titles().await
         {
             *cache = stored;
@@ -119,8 +133,35 @@ impl AniDbClient {
         if cache.fetched_at.is_some_and(is_fresh) {
             return Ok(Arc::clone(&cache.titles));
         }
+        if let Some((failed_at, error)) = &cache.failure
+            && failed_at.elapsed() < DOWNLOAD_RETRY_INTERVAL
+        {
+            return cache.outdated_or(error.clone());
+        }
 
-        let mut response = send_rate_limited(KIND, &cancellation, Some(&self.limiter), || {
+        match self.download(&cancellation).await {
+            Ok((bytes, titles)) => {
+                *cache = TitleCache {
+                    titles: titles.into(),
+                    fetched_at: Some(SystemTime::now()),
+                    failure: None,
+                };
+                self.store(&bytes).await;
+                Ok(Arc::clone(&cache.titles))
+            }
+            Err(error @ ProviderError::Cancelled { .. }) => Err(error),
+            Err(error) => {
+                cache.failure = Some((Instant::now(), error.clone()));
+                cache.outdated_or(error)
+            }
+        }
+    }
+
+    async fn download(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<u8>, Vec<AnimeTitle>), ProviderError> {
+        let mut response = send_rate_limited(KIND, cancellation, Some(&self.limiter), || {
             self.http.get(&self.titles_url)
         })
         .await?;
@@ -135,35 +176,35 @@ impl AniDbClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let xml = decompress(&bytes, MAX_TITLES_BYTES)?;
-        cache.titles = parse_titles(&xml)?.into();
-        cache.fetched_at = Some(SystemTime::now());
-        if let Some(path) = &self.titles_path {
-            // A copy that cannot be written only costs one download after a restart.
-            if let Some(directory) = path.parent() {
-                let _ = tokio::fs::create_dir_all(directory).await;
-            }
-            // Renamed into place so a crash mid-write cannot leave half a dump.
-            let temporary = path.with_extension("tmp");
-            if tokio::fs::write(&temporary, &bytes).await.is_ok() {
-                let _ = tokio::fs::rename(&temporary, path).await;
-            }
-        }
-        Ok(Arc::clone(&cache.titles))
+        let titles = parse_titles(&decompress(&bytes, MAX_TITLES_BYTES)?)?;
+        Ok((bytes, titles))
     }
 
-    /// The dump an earlier run saved, while it is still less than a day old.
+    /// A copy that cannot be written only costs one download after a restart.
+    async fn store(&self, bytes: &[u8]) {
+        let Some(path) = &self.titles_path else {
+            return;
+        };
+        if let Some(directory) = path.parent() {
+            let _ = tokio::fs::create_dir_all(directory).await;
+        }
+        // Renamed into place so a crash mid-write cannot leave half a dump.
+        let temporary = path.with_extension("tmp");
+        if tokio::fs::write(&temporary, bytes).await.is_ok() {
+            let _ = tokio::fs::rename(&temporary, path).await;
+        }
+    }
+
+    /// The dump an earlier run saved, however old it is by now.
     async fn stored_titles(&self) -> Option<TitleCache> {
         let path = self.titles_path.as_ref()?;
         let fetched_at = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
-        if !is_fresh(fetched_at) {
-            return None;
-        }
         let bytes = tokio::fs::read(path).await.ok()?;
         let xml = decompress(&bytes, MAX_TITLES_BYTES).ok()?;
         Some(TitleCache {
             titles: parse_titles(&xml).ok()?.into(),
             fetched_at: Some(fetched_at),
+            failure: None,
         })
     }
 }
@@ -508,7 +549,7 @@ fn split_client(value: &str) -> (String, String) {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use axum::{Router, routing::get};
+    use axum::{Router, http::StatusCode, routing::get};
 
     use super::*;
     use crate::common::serve_stub;
@@ -524,9 +565,10 @@ mod tests {
   </anime>
 </animetitles>"#;
 
-    /// A stub AniDB that counts how often the title dump is downloaded. Each
-    /// call to the returned closure is a client as a restarted process has it.
-    async fn stub() -> (impl Fn() -> AniDbClient, Arc<AtomicUsize>) {
+    /// A stub AniDB that answers the title dump with `status` and counts how
+    /// often it is asked. Each call to the returned closure is a client as a
+    /// restarted process has it.
+    async fn stub(status: StatusCode) -> (impl Fn() -> AniDbClient, Arc<AtomicUsize>) {
         let downloads = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&downloads);
         let router = Router::new()
@@ -535,7 +577,7 @@ mod tests {
                 get(move || async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    TITLES_XML
+                    (status, TITLES_XML)
                 }),
             )
             .route(
@@ -593,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_saved_dump_survives_a_restart() {
-        let (client, downloads) = stub().await;
+        let (client, downloads) = stub(StatusCode::OK).await;
         let directory = CacheDir::new("restart");
 
         assert_eq!(
@@ -609,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_saved_dump_older_than_a_day_is_downloaded_again() {
-        let (client, downloads) = stub().await;
+        let (client, downloads) = stub(StatusCode::OK).await;
         let directory = CacheDir::new("stale");
         let path = save_dump(&directory, SystemTime::now() - 2 * TITLE_CACHE_TTL);
 
@@ -622,7 +664,7 @@ mod tests {
     /// A clock that stepped back must not turn every search into a download.
     #[tokio::test]
     async fn a_saved_dump_dated_in_the_future_is_not_downloaded_again() {
-        let (client, downloads) = stub().await;
+        let (client, downloads) = stub(StatusCode::OK).await;
         let directory = CacheDir::new("future");
         save_dump(&directory, SystemTime::now() + Duration::from_secs(3600));
 
@@ -634,8 +676,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_download_falls_back_to_the_outdated_saved_dump() {
+        let (client, downloads) = stub(StatusCode::NOT_FOUND).await;
+        let directory = CacheDir::new("offline");
+        save_dump(&directory, SystemTime::now() - 2 * TITLE_CACHE_TTL);
+        let client = client().with_cache_dir(&directory.0);
+
+        assert_eq!(search(&client).await[0].id, 2);
+        assert_eq!(search(&client).await[0].id, 2);
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_is_not_repeated_by_the_next_search() {
+        let (client, downloads) = stub(StatusCode::NOT_FOUND).await;
+        let client = client();
+        for _ in 0..2 {
+            let error = client
+                .search(
+                    &ProviderCredentials::api_key(""),
+                    "bebop",
+                    "eng",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("no dump");
+            assert!(error.to_string().contains("404"), "{error}");
+        }
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn requests_wait_for_their_turn_in_the_rate_limiter() {
-        let (client, _) = stub().await;
+        let (client, _) = stub(StatusCode::OK).await;
         let mut client = client();
         client.limiter = Arc::new(RateLimiter::new(Duration::from_millis(300)));
         let selected = SelectedMedia {
@@ -667,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_searches_share_one_download() {
-        let (client, downloads) = stub().await;
+        let (client, downloads) = stub(StatusCode::OK).await;
         let client = client();
         let (first, second, third) =
             tokio::join!(search(&client), search(&client), search(&client));
