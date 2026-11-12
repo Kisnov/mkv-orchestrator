@@ -60,6 +60,20 @@ impl SqliteStore {
         &self,
         fingerprint: &CacheFingerprint,
     ) -> StoreResult<Option<CachedMedia>> {
+        Ok(self
+            .get_valid_payload(fingerprint)?
+            .map(|(scanned_at_ms, payload)| CachedMedia {
+                fingerprint: fingerprint.clone(),
+                scanned_at_ms,
+                payload,
+            }))
+    }
+
+    /// A valid entry's `scanned_at_ms` and its payload parsed straight into `T`.
+    pub fn get_valid_payload<T: serde::de::DeserializeOwned>(
+        &self,
+        fingerprint: &CacheFingerprint,
+    ) -> StoreResult<Option<(i64, T)>> {
         let path = path_text(&fingerprint.path);
         let connection = self.connection()?;
         let row = connection
@@ -96,11 +110,7 @@ impl SqliteStore {
             connection.execute("DELETE FROM media_cache WHERE file_path = ?1", [&path])?;
             return Ok(None);
         }
-        Ok(Some(CachedMedia {
-            fingerprint: fingerprint.clone(),
-            scanned_at_ms,
-            payload: serde_json::from_str(&payload)?,
-        }))
+        Ok(Some((scanned_at_ms, serde_json::from_str(&payload)?)))
     }
 
     pub fn upsert_media(&self, media: &CachedMedia) -> StoreResult<()> {

@@ -68,13 +68,8 @@ impl MetadataCache for SqliteRepositories {
         fingerprint: &FileFingerprint,
     ) -> Result<Option<MediaFile>, PortError> {
         let fingerprint = to_cache_fingerprint(fingerprint);
-        self.blocking(move |store| {
-            store
-                .get_valid_media(&fingerprint)?
-                .map(|cached| serde_json::from_value(cached.payload).map_err(StoreError::from))
-                .transpose()
-        })
-        .await
+        self.blocking(move |store| Ok(store.get_valid_payload(&fingerprint)?.map(|(_, file)| file)))
+            .await
     }
 
     async fn upsert(&self, file: &MediaFile) -> Result<(), PortError> {
