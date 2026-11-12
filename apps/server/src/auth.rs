@@ -562,10 +562,12 @@ mod tests {
         let (token, value) = auth.login("admin", "password").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, value);
-        auth.sessions
-            .write()
-            .unwrap()
-            .insert(token, Instant::now() - Duration::from_secs(86400));
+        auth.sessions.write().unwrap().insert(
+            token,
+            Instant::now()
+                .checked_sub(Duration::from_secs(86400))
+                .unwrap_or_else(Instant::now),
+        );
         assert!(auth.authenticated(&headers));
         auth.logout(&headers);
         assert!(!auth.authenticated(&headers));
