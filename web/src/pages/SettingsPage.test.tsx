@@ -667,6 +667,24 @@ describe("Settings media servers", () => {
 
     expect(screen.getByLabelText("Type")).toHaveDisplayValue("Jellyfin");
   });
+
+  it("makes the first remaining server the default when the default is deleted", async () => {
+    const user = userEvent.setup();
+    const other = mediaServer({ id: "0198c1d2-0000-7000-8000-000000000002", name: "Attic", isDefault: false });
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [{ ...other, isDefault: true }] }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer(), other] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Delete Home" }));
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalled());
+    expect(saveWebSettings.mock.calls[0][0].mediaServers).toEqual([
+      expect.objectContaining({ id: other.id, isDefault: true })
+    ]);
+  });
 });
 
 describe("Settings attribution", () => {

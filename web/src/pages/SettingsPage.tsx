@@ -396,7 +396,11 @@ export function SettingsPage() {
   }
 
   function removeMediaServer(id: string) {
-    setMediaServers((current) => current.filter((server) => server.id !== id));
+    setMediaServers((current) => {
+      const remaining = current.filter((server) => server.id !== id);
+      if (remaining.some((server) => server.isDefault)) return remaining;
+      return remaining.map((server, index) => ({ ...server, isDefault: index === 0 }));
+    });
     setSettingsStatus("Media server removed. Save settings to apply.");
   }
 
