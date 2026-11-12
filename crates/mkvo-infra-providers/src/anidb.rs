@@ -31,6 +31,8 @@ const KIND: ProviderKind = ProviderKind::AniDb;
 /// AniDB asks clients not to fetch the title dump more than once a day.
 const TITLE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RESULTS: usize = 50;
+/// The dump is a few megabytes; far more than that is not the dump.
+const MAX_TITLES_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct AnimeTitle {
@@ -91,13 +93,20 @@ impl AniDbClient {
             return Ok(cached);
         }
 
-        let response =
+        let mut response =
             send_with_retry(KIND, &cancellation, || self.http.get(&self.titles_url)).await?;
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| ProviderError::network(KIND, error))?;
-        let xml = decompress(&bytes)?;
+            .map_err(|error| ProviderError::network(KIND, error))?
+        {
+            if bytes.len() + chunk.len() > MAX_TITLES_BYTES {
+                return Err(ProviderError::invalid(KIND, "title dump is too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let xml = decompress(&bytes, MAX_TITLES_BYTES)?;
         let titles = parse_titles(&xml)?;
 
         let mut cache = self.cache.write().await;
@@ -114,13 +123,16 @@ impl AniDbClient {
 
 /// The dump is served gzipped, but a proxy or CDN may have decompressed it
 /// already, so plain XML is accepted rather than treated as corrupt.
-fn decompress(bytes: &[u8]) -> Result<String, ProviderError> {
+fn decompress(bytes: &[u8], limit: usize) -> Result<String, ProviderError> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = GzDecoder::new(bytes);
         let mut xml = String::new();
-        decoder
+        GzDecoder::new(bytes)
+            .take(limit as u64 + 1)
             .read_to_string(&mut xml)
             .map_err(|error| ProviderError::invalid(KIND, error))?;
+        if xml.len() > limit {
+            return Err(ProviderError::invalid(KIND, "title dump is too large"));
+        }
         return Ok(xml);
     }
     String::from_utf8(bytes.to_vec()).map_err(|error| ProviderError::invalid(KIND, error))
@@ -509,10 +521,28 @@ mod tests {
         encoder.write_all(TITLES_XML.as_bytes()).expect("write");
         let gzipped = encoder.finish().expect("finish");
 
-        assert_eq!(decompress(&gzipped).expect("gzip"), TITLES_XML);
+        assert_eq!(decompress(&gzipped, 1024).expect("gzip"), TITLES_XML);
         assert_eq!(
-            decompress(TITLES_XML.as_bytes()).expect("plain"),
+            decompress(TITLES_XML.as_bytes(), 1024).expect("plain"),
             TITLES_XML
+        );
+    }
+
+    #[test]
+    fn a_gzip_bomb_is_rejected_instead_of_inflated() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![b' '; 1024 * 1024]).expect("write");
+        let bomb = encoder.finish().expect("finish");
+        assert!(bomb.len() < 4096);
+
+        let error = decompress(&bomb, 4096).expect_err("bomb");
+        assert!(error.to_string().contains("too large"), "{error}");
+        assert_eq!(
+            decompress(&bomb, 1024 * 1024).expect("fits").len(),
+            1024 * 1024
         );
     }
 
