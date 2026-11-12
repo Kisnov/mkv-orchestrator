@@ -6,18 +6,21 @@
 //! A stub server covers those without requiring a real Emby, Jellyfin, or Plex
 //! instance.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Router,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
 };
 use mkvo_infra_media_servers::{
-    MediaServerClient, MediaServerConfig, MediaServerDiscoveryClient, MediaServerKind,
-    MediaServerPathMapping, SecretString,
+    DiscoveredItem, MediaServerClient, MediaServerConfig, MediaServerDiscoveryClient,
+    MediaServerKind, MediaServerPathMapping, SecretString,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -331,4 +334,140 @@ async fn a_malformed_body_is_reported_as_an_invalid_response() {
 
     assert!(error.to_string().contains("invalid response"), "{error}");
     server.abort();
+}
+
+/// A Jellyfin library whose `/Items` honours `StartIndex` and `Limit`.
+#[derive(Clone)]
+struct Catalog {
+    item_count: usize,
+    reports_total: bool,
+    max_page: usize,
+    requests: Arc<Mutex<Vec<(usize, usize)>>>,
+}
+
+impl Catalog {
+    fn new(item_count: usize, reports_total: bool, max_page: usize) -> Self {
+        Self {
+            item_count,
+            reports_total,
+            max_page,
+            requests: Arc::default(),
+        }
+    }
+
+    fn requests(&self) -> Vec<(usize, usize)> {
+        self.requests.lock().expect("request log").clone()
+    }
+}
+
+async fn catalog_page(
+    State(catalog): State<Catalog>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        != Some("MediaBrowser Token=\"token-123\"")
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let number = |name: &str| {
+        query
+            .get(name)
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    let start = number("StartIndex").unwrap_or(0);
+    let limit = number("Limit").unwrap_or(usize::MAX);
+    catalog
+        .requests
+        .lock()
+        .expect("request log")
+        .push((start, limit));
+    let end = catalog
+        .item_count
+        .min(start.saturating_add(limit.min(catalog.max_page)));
+    let items: Vec<_> = (start..end)
+        .map(|index| {
+            serde_json::json!({
+                "Id": format!("item-{index}"),
+                "Name": format!("Show {index:05}"),
+                "Type": "Series",
+                "Path": format!("/data/tv/Show {index:05}")
+            })
+        })
+        .collect();
+    let mut document = serde_json::json!({ "Items": items });
+    if catalog.reports_total {
+        document["TotalRecordCount"] = catalog.item_count.into();
+    }
+    axum::Json(document).into_response()
+}
+
+async fn discover_catalog(catalog: &Catalog) -> Vec<DiscoveredItem> {
+    let router = Router::new()
+        .route(
+            "/Library/VirtualFolders",
+            get(|| async {
+                axum::Json(serde_json::json!([
+                    {"Name": "Shows", "ItemId": "lib-1", "Locations": ["/data/tv"]}
+                ]))
+            }),
+        )
+        .route("/Items", get(catalog_page))
+        .with_state(catalog.clone());
+    let (base, server) = start_stub(router).await;
+
+    let items = MediaServerDiscoveryClient::new()
+        .discover_items(
+            &config(MediaServerKind::Jellyfin, &base),
+            "Shows",
+            &[std::path::PathBuf::from("/data/tv")],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("catalog items");
+    server.abort();
+    items
+}
+
+#[tokio::test]
+async fn a_library_larger_than_ten_thousand_items_is_not_truncated() {
+    let catalog = Catalog::new(10_001, true, usize::MAX);
+
+    let items = discover_catalog(&catalog).await;
+
+    assert_eq!(items.len(), 10_001);
+    assert_eq!(items[10_000].id, "item-10000");
+    let requests = catalog.requests();
+    assert_eq!(requests.len(), 21);
+    assert_eq!(requests[0], (0, 500));
+    assert_eq!(requests[20], (10_000, 500));
+}
+
+#[tokio::test]
+async fn paging_stops_at_the_reported_total_without_an_extra_request() {
+    let catalog = Catalog::new(1_000, true, usize::MAX);
+
+    assert_eq!(discover_catalog(&catalog).await.len(), 1_000);
+    assert_eq!(catalog.requests(), [(0, 500), (500, 500)]);
+}
+
+#[tokio::test]
+async fn paging_without_a_total_stops_on_a_short_or_empty_page() {
+    let short = Catalog::new(700, false, usize::MAX);
+    assert_eq!(discover_catalog(&short).await.len(), 700);
+    assert_eq!(short.requests(), [(0, 500), (500, 500)]);
+
+    let exact = Catalog::new(1_000, false, usize::MAX);
+    assert_eq!(discover_catalog(&exact).await.len(), 1_000);
+    assert_eq!(exact.requests(), [(0, 500), (500, 500), (1_000, 500)]);
+}
+
+#[tokio::test]
+async fn paging_follows_the_total_when_the_server_returns_smaller_pages() {
+    let catalog = Catalog::new(450, true, 200);
+
+    assert_eq!(discover_catalog(&catalog).await.len(), 450);
+    assert_eq!(catalog.requests(), [(0, 500), (200, 500), (400, 500)]);
 }
