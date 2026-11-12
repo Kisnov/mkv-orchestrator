@@ -175,10 +175,7 @@ impl MkvoRuntime {
             journal_enumeration_supported: false,
             limitations: Vec::new(),
         };
-        for mut snapshot in self.inner.dependencies.jobs.list_recent(1_000).await? {
-            if snapshot.status.is_terminal() {
-                continue;
-            }
+        for mut snapshot in self.inner.dependencies.jobs.list_unfinished().await? {
             let previous_status = snapshot.status;
             let journal = self
                 .inner

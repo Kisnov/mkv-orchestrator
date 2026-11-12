@@ -752,6 +752,17 @@ impl JobRepository for InMemoryJobRepository {
         Ok(jobs)
     }
 
+    async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError> {
+        Ok(self
+            .jobs
+            .read()
+            .await
+            .values()
+            .filter(|job| !job.status.is_terminal())
+            .cloned()
+            .collect())
+    }
+
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
         self.events
             .write()
