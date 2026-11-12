@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -6,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -17,6 +18,12 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api4.thetvdb.com/v4/";
+const NAME_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Each name lookup is one request, so later results keep their search name.
+const MAX_NAME_LOOKUPS: usize = 10;
+
+/// Translated series names by id and language; `None` records a missing translation.
+type NameCache = HashMap<(u64, String), (Instant, Option<String>)>;
 
 #[derive(Debug)]
 struct CachedToken {
@@ -30,6 +37,7 @@ pub struct TvdbClient {
     client: Client,
     base_url: Url,
     token: Arc<RwLock<Option<CachedToken>>>,
+    names: Arc<Mutex<NameCache>>,
 }
 
 impl TvdbClient {
@@ -38,6 +46,7 @@ impl TvdbClient {
             client: provider_http_client(),
             base_url: Url::parse(DEFAULT_BASE_URL).expect("TVDB base URL is valid"),
             token: Arc::new(RwLock::new(None)),
+            names: Arc::default(),
         }
     }
 
@@ -46,6 +55,7 @@ impl TvdbClient {
             client,
             base_url,
             token: Arc::new(RwLock::new(None)),
+            names: Arc::default(),
         }
     }
 
@@ -146,6 +156,12 @@ impl TvdbClient {
         language: &str,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, ProviderError> {
+        let key = (id, language.to_owned());
+        if let Some((cached_at, name)) = self.names.lock().await.get(&key)
+            && cached_at.elapsed() < NAME_CACHE_TTL
+        {
+            return Ok(name.clone());
+        }
         let document = self
             .get_json(
                 credentials,
@@ -157,7 +173,11 @@ impl TvdbClient {
                 cancellation,
             )
             .await?;
-        Ok(translation_name(&document, language))
+        let name = translation_name(&document, language);
+        let mut names = self.names.lock().await;
+        names.retain(|_, (cached_at, _)| cached_at.elapsed() < NAME_CACHE_TTL);
+        names.insert(key, (Instant::now(), name.clone()));
+        Ok(name)
     }
 }
 
@@ -185,6 +205,7 @@ impl MetadataProviderClient for TvdbClient {
         }
         let language = tvdb_language(language);
         let mut results = Vec::new();
+        let mut translated = HashMap::new();
         for (media_type, kind) in [("series", MediaKind::Series), ("movie", MediaKind::Movie)] {
             let document = self
                 .get_json(
@@ -198,12 +219,24 @@ impl MetadataProviderClient for TvdbClient {
                     &cancellation,
                 )
                 .await?;
+            if kind == MediaKind::Series {
+                translated = search_translations(&document, &language);
+            }
             results.extend(normalize_search_results(&document, kind));
         }
+        let mut lookups = 0;
         for result in &mut results {
             if result.kind != MediaKind::Series {
                 continue;
             }
+            if let Some(name) = translated.remove(&result.id) {
+                result.name = name;
+                continue;
+            }
+            if lookups == MAX_NAME_LOOKUPS {
+                continue;
+            }
+            lookups += 1;
             if let Ok(Some(name)) = self
                 .localized_series_name(credentials, result.id, &language, &cancellation)
                 .await
@@ -295,6 +328,21 @@ fn normalize_search_results(document: &Value, kind: MediaKind) -> Vec<SearchResu
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             })
+        })
+        .collect()
+}
+
+/// Search results can already carry each name in every language TVDB has.
+fn search_translations(document: &Value, language: &str) -> HashMap<u64, String> {
+    document
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = value_u64(item.get("tvdb_id").or_else(|| item.get("id"))?)?;
+            let name = item.get("translations")?.get(language)?.as_str()?;
+            (!name.trim().is_empty()).then(|| (id, name.to_owned()))
         })
         .collect()
 }
@@ -412,6 +460,7 @@ mod tests {
 
     use axum::{
         Json, Router,
+        extract::{Path, Query},
         http::{HeaderMap, StatusCode},
         routing::{get, post},
     };
@@ -480,6 +529,83 @@ mod tests {
             .expect_err("still unauthorized");
         assert!(error.to_string().contains("401"), "{error}");
         assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
+
+    /// A stub whose series search returns `series` and which counts the name lookups.
+    async fn search_stub(series: Value) -> (TvdbClient, Arc<AtomicUsize>) {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&lookups);
+        let router = Router::new()
+            .route(
+                "/login",
+                post(|| async { Json(json!({"data": {"token": "token"}})) }),
+            )
+            .route(
+                "/search",
+                get(
+                    move |Query(query): Query<HashMap<String, String>>| async move {
+                        if query["type"] == "series" {
+                            Json(json!({"data": series}))
+                        } else {
+                            Json(json!({"data": []}))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/series/{id}/extended",
+                get(move |Path(id): Path<u64>| async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"data": {"translations": {"nameTranslations": [
+                        {"language": "cat", "name": format!("Sèrie {id}")}
+                    ]}}}))
+                }),
+            );
+        let base = Url::parse(&format!("{}/", serve_stub(router).await)).expect("stub URL");
+        (
+            TvdbClient::with_client(provider_http_client(), base),
+            lookups,
+        )
+    }
+
+    #[tokio::test]
+    async fn name_lookups_are_capped_and_cached() {
+        let series: Vec<Value> = (1..=15)
+            .map(|id| json!({"tvdb_id": id.to_string(), "name": format!("Series {id}")}))
+            .collect();
+        let (client, lookups) = search_stub(json!(series)).await;
+        let credentials = ProviderCredentials::api_key("key");
+
+        for _ in 0..2 {
+            let results = client
+                .search(&credentials, "series", "cat", CancellationToken::new())
+                .await
+                .expect("search");
+            assert_eq!(results.len(), 15);
+            assert_eq!(results[0].name, "Sèrie 1");
+            assert_eq!(results[9].name, "Sèrie 10");
+            assert_eq!(results[10].name, "Series 11");
+        }
+        assert_eq!(lookups.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn translations_in_the_search_response_need_no_lookup() {
+        let (client, lookups) = search_stub(json!([
+            {"tvdb_id": "1", "name": "Series 1", "translations": {"cat": "Sèrie u", "eng": "One"}}
+        ]))
+        .await;
+        let results = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "series",
+                "ca",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search");
+        assert_eq!(results[0].name, "Sèrie u");
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
     }
 
     #[test]
