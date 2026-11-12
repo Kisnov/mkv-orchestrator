@@ -143,7 +143,11 @@ impl AniDbClient {
             if let Some(directory) = path.parent() {
                 let _ = tokio::fs::create_dir_all(directory).await;
             }
-            let _ = tokio::fs::write(path, &bytes).await;
+            // Renamed into place so a crash mid-write cannot leave half a dump.
+            let temporary = path.with_extension("tmp");
+            if tokio::fs::write(&temporary, &bytes).await.is_ok() {
+                let _ = tokio::fs::rename(&temporary, path).await;
+            }
         }
         Ok(Arc::clone(&cache.titles))
     }
