@@ -1,3 +1,5 @@
+import { ApiError } from "../backend/error";
+
 export type AuthSession = {
   username?: string;
   authenticated: boolean;
@@ -15,15 +17,23 @@ export function announceUnauthorized() {
 }
 
 async function request<T>(path: string, method = "GET", body?: unknown): Promise<T> {
-  const response = await fetch(path, {
-    method, credentials: "same-origin", cache: "no-store",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method, credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(30_000),
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+  } catch (cause) {
+    throw new ApiError("Unable to reach the MKVO server.", { code: "TRANSPORT_ERROR", cause });
+  }
   if (response.status === 401) announceUnauthorized();
   if (response.status === 204) return undefined as T;
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.detail ?? "Authentication request failed.");
+  // A proxy in front of MKVO answers with an HTML error page, not JSON.
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok || payload === undefined) {
+    throw new ApiError(payload?.detail ?? `Unexpected response from the MKVO server (HTTP ${response.status}).`, { status: response.status });
+  }
   return payload as T;
 }
 

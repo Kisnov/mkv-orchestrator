@@ -31,3 +31,17 @@ it("accepts a 204 activity response without parsing JSON", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
   await expect(api.authActivity()).resolves.toBeUndefined();
 });
+
+it("reports a gateway error page by its status instead of a JSON parse error", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>Bad Gateway</html>", { status: 502 })));
+  await expect(api.authStatus()).rejects.toMatchObject({ name: "ApiError", status: 502 });
+});
+
+it("reports an unreachable server without announcing an expired session", async () => {
+  const expired = vi.fn();
+  window.addEventListener("mkvo:unauthorized", expired);
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+  await expect(api.authStatus()).rejects.toMatchObject({ name: "ApiError", code: "TRANSPORT_ERROR" });
+  expect(expired).not.toHaveBeenCalled();
+  window.removeEventListener("mkvo:unauthorized", expired);
+});

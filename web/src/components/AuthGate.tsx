@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { LockKeyhole, Loader2 } from "lucide-react";
 import { api, type AuthSession } from "../auth/api";
+import { ApiError } from "../backend/error";
 import { useIdleSession } from "../lib/useIdleSession";
 import { Logo } from "./AuthLogo";
 import { AuthSessionContext } from "../lib/authContext";
@@ -16,6 +17,8 @@ export default function AuthGate({ children }: { children: ReactNode }) {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [session, setSession] = useState<AuthSession | null>(null);
+  const [statusError, setStatusError] = useState("");
+  const [attempt, setAttempt] = useState(0);
   const revision = useRef(0);
   const expire = useCallback(() => {
     revision.current += 1;
@@ -51,9 +54,13 @@ export default function AuthGate({ children }: { children: ReactNode }) {
           if (remembersUsername() && !usernameEdited.current) setUsername(status.username);
         }
         setSession(status);
+        setStatusError("");
         setAuthenticated(status.authenticated);
-      }).catch(() => {
-        if (!cancelled && requestedRevision === revision.current) setAuthenticated(false);
+      }).catch((cause) => {
+        if (cancelled || requestedRevision !== revision.current) return;
+        // Only a 401 means signed out; anything else is the server or the network.
+        if (cause instanceof ApiError && cause.status === 401) setAuthenticated(false);
+        else setStatusError(cause instanceof Error ? cause.message : "Unable to reach the MKVO server.");
       });
     };
     refresh();
@@ -67,7 +74,7 @@ export default function AuthGate({ children }: { children: ReactNode }) {
       window.removeEventListener("mkvo:unauthorized", expired);
       window.removeEventListener("mkvo:security-changed", refresh);
     };
-  }, [expire]);
+  }, [expire, attempt]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -89,6 +96,20 @@ export default function AuthGate({ children }: { children: ReactNode }) {
     }
   }
 
+  if (authenticated === null && statusError) {
+    return (
+      <main className="grid h-full place-items-center bg-window px-4">
+        <div className="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-xl">
+          <Logo />
+          <h1 className="mt-8 font-semibold text-text">MKVO is not responding</h1>
+          <p role="alert" className="mt-2 text-sm text-red-400">{statusError}</p>
+          <button type="button" onClick={() => { setStatusError(""); setAttempt((current) => current + 1); }} className="mt-5 w-full rounded-lg bg-accent px-4 py-2.5 font-medium text-black">
+            Retry
+          </button>
+        </div>
+      </main>
+    );
+  }
   if (authenticated === null) {
     return <div className="grid h-full place-items-center"><Loader2 className="size-6 animate-spin text-accent" /></div>;
   }

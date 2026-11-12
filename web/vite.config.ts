@@ -19,6 +19,10 @@ export default defineConfig({
           if (id.includes("/src/generated/contracts.ts")) {
             return "contracts";
           }
+          // React changes far less often than the rest, so it caches apart.
+          if (/\/node_modules\/(react|react-dom|scheduler)\//.test(id)) {
+            return "react";
+          }
           if (id.includes("/node_modules/")) {
             return "vendor";
           }

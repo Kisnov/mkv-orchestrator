@@ -233,13 +233,11 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
       pushSelection(paths);
     },
     toggleSelectedPath: (path) => {
-      setSelectedPathsState((current) => {
-        const next = current.some((selected) => pathKey(selected) === pathKey(path))
-          ? current.filter((selected) => pathKey(selected) !== pathKey(path))
-          : [...current, path];
-        pushSelection(next);
-        return next;
-      });
+      const next = selectedPaths.some((selected) => pathKey(selected) === pathKey(path))
+        ? selectedPaths.filter((selected) => pathKey(selected) !== pathKey(path))
+        : [...selectedPaths, path];
+      setSelectedPathsState(next);
+      pushSelection(next);
     },
     hydrateSelection: (paths) => setSelectedPathsState(paths),
     syncFromBackend,
