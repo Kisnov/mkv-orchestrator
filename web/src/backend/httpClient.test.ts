@@ -24,3 +24,68 @@ describe("HttpBackendClient library audits", () => {
     expect(String(init.body).length).toBeLessThan(1024 * 1024);
   });
 });
+
+describe("HttpBackendClient timeouts", () => {
+  function timedOutSignal() {
+    const controller = new AbortController();
+    controller.abort(new DOMException("signal timed out", "TimeoutError"));
+    return controller.signal;
+  }
+
+  it("reports a request the server never answers as a timeout", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timedOutSignal());
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => Promise.reject(init?.signal?.reason));
+    const client = new HttpBackendClient({ fetch: fetchMock });
+
+    await expect(client.getStatus()).rejects.toMatchObject({ name: "ApiError", code: "TIMEOUT" });
+    expect(timeout).toHaveBeenCalledWith(60_000);
+  });
+
+  it("gives calls that do their work inline a much longer limit", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timedOutSignal());
+    const client = new HttpBackendClient({ fetch: vi.fn().mockRejectedValue(new Error("offline")) });
+
+    await expect(client.applyRenamePreview({ previewId: "p" } as never)).rejects.toThrow();
+    await expect(client.loadPropEditTemplate({ path: "/media/a.mkv" } as never)).rejects.toThrow();
+    await expect(client.getLibraryCatalog({} as never)).rejects.toThrow();
+
+    expect(timeout.mock.calls).toEqual([[30 * 60_000], [30 * 60_000], [30 * 60_000]]);
+  });
+});
+
+describe("HttpBackendClient job polling", () => {
+  function pollWith(status: number) {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{"detail":"nope"}', { status })));
+    const client = new HttpBackendClient({ fetch: fetchMock });
+    const onError = vi.fn();
+    return { fetchMock, onError, start: () => client.subscribeJobProgress({ jobId: "j", kind: "operation", pollIntervalMs: 250 }, vi.fn(), onError) };
+  }
+
+  it("stops polling once the session is rejected", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchMock, onError, start } = pollWith(401);
+      await start();
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps polling through other failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fetchMock, start } = pollWith(503);
+      const stop = await start();
+      await vi.advanceTimersByTimeAsync(2_000);
+      stop();
+
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
