@@ -1,6 +1,6 @@
-import { lazy, Suspense } from "react";
+import { Component, lazy, Suspense, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
-import { Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import AuthGate from "./components/AuthGate";
 import { getBackendTransport } from "./api";
 import { Layout } from "./components/Layout";
@@ -23,12 +23,43 @@ export default function App() {
   return <AuthGate><ProtectedApp /></AuthGate>;
 }
 
-// Keeps the sidebar on screen while a page chunk loads.
+// A tab left open across an update asks for page chunks that no longer exist.
+class PageErrorBoundary extends Component<{ path: string; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidUpdate(previous: { path: string }) {
+    if (this.state.failed && previous.path !== this.props.path) this.setState({ failed: false });
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div className="grid h-full place-items-center px-4">
+        <div role="alert" className="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-xl">
+          <h1 className="font-semibold text-text">This page could not be loaded</h1>
+          <p className="mt-2 text-sm text-muted">MKVO may have been updated since this tab was opened.</p>
+          <button type="button" onClick={() => window.location.reload()} className="mt-5 w-full rounded-lg bg-accent px-4 py-2.5 font-medium text-black">
+            Reload
+          </button>
+        </div>
+      </div>
+    );
+  }
+}
+
+// Keeps the sidebar on screen while a page chunk loads, or fails to.
 function LazyPage() {
+  const { pathname } = useLocation();
   return (
-    <Suspense fallback={<div className="grid h-full place-items-center"><Loader2 className="size-6 animate-spin text-accent" /></div>}>
-      <Outlet />
-    </Suspense>
+    <PageErrorBoundary path={pathname}>
+      <Suspense fallback={<div className="grid h-full place-items-center"><Loader2 className="size-6 animate-spin text-accent" /></div>}>
+        <Outlet />
+      </Suspense>
+    </PageErrorBoundary>
   );
 }
 
