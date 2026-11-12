@@ -1,3 +1,4 @@
+use super::remux_workflow::tool_warning;
 use super::*;
 
 impl MkvoRuntime {
@@ -264,12 +265,13 @@ impl MkvoRuntime {
             .tool_executor
             .execute(&invocation, context.cancellation_token())
             .await?;
-        if execution.exit_code != Some(0) {
-            return Err(ApplicationError::Internal(format!(
-                "mkvpropedit exited with {:?}: {}",
-                execution.exit_code,
-                execution.stderr.trim()
-            )));
+        if let Some(warning) = tool_warning(&invocation.tool, &execution)? {
+            context
+                .log(
+                    JobLogLevel::Warning,
+                    format!("{}: {warning}", item.path.display()),
+                )
+                .await?;
         }
         // Refresh each successful file immediately. If a later file in the
         // batch fails, every tab still sees the edits that already landed.
@@ -293,5 +295,62 @@ impl MkvoRuntime {
             working_directory: item.path.parent().map(Path::to_path_buf),
             expected_outputs: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use mkvo_contracts::{JobSnapshot, JobStatus};
+
+    use super::super::remux_workflow::execution_tests::{Library, ScriptedTools, exited, library};
+    use super::*;
+
+    async fn start_title_edit(library: &Library, files: Vec<MediaFile>) -> mkvo_domain::JobId {
+        let plan = PropertyEditPlanner
+            .build_plan(PropertyEditPlanRequest {
+                files,
+                source_access: BTreeMap::new(),
+                container_title: TextEdit::Set("Title".to_owned()),
+                video_track_name: TextEdit::Keep,
+                track_edits: Vec::new(),
+                authorized_roots: Vec::new(),
+                settings_fingerprint: "settings".to_owned(),
+                tool_fingerprints: BTreeMap::new(),
+                expires_in_seconds: 60,
+                idempotency_key: IdempotencyKey::generate(),
+            })
+            .expect("propedit plan");
+        library.runtime.persist_plan(&plan).await.expect("persist");
+        library
+            .start_job(JobKind::PropertyEdit, |runtime, context| async move {
+                runtime.execute_propedit_plan(&plan, &context).await
+            })
+            .await
+    }
+
+    async fn run_title_edit(library: &Library, files: Vec<MediaFile>) -> JobSnapshot {
+        let id = start_title_edit(library, files).await;
+        library.finished_job(id).await
+    }
+
+    #[tokio::test]
+    async fn an_edit_written_with_warnings_is_not_a_failure() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            exited(
+                invocation,
+                1,
+                "The file is being analyzed.\nWarning: No attachment matched the spec '5'.\nThe changes are written to the file.\nDone.\n",
+            )
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+
+        let job = run_title_edit(&library, vec![episode]).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert!(
+            job.lines
+                .iter()
+                .any(|line| line.contains("No attachment matched the spec"))
+        );
     }
 }
