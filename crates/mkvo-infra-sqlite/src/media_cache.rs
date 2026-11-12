@@ -168,6 +168,29 @@ impl SqliteStore {
         u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
     }
 
+    pub fn mark_media_seen(&self, paths: &[PathBuf], seen_at_ms: i64) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut update = transaction
+                .prepare("UPDATE media_cache SET scanned_at_ms = ?1 WHERE file_path = ?2")?;
+            for path in paths {
+                update.execute(params![seen_at_ms, path_text(path)])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_media_unseen_under(&self, root: &Path, cutoff_ms: i64) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let removed = connection.execute(
+            &format!("DELETE FROM media_cache WHERE scanned_at_ms < ?2 AND {UNDER_ROOT}"),
+            params![subtree_root(root), cutoff_ms],
+        )?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
     pub fn clear_media_cache(&self) -> StoreResult<u64> {
         let connection = self.connection()?;
         let removed = connection.execute("DELETE FROM media_cache", [])?;
@@ -230,6 +253,24 @@ mod tests {
         assert!(cached(&store, "/media/anime/c.mkv"));
         assert!(cached(&store, "/media/Anime2/d.mkv"));
         assert!(cached(&store, "/media/Anime.old/e.mkv"));
+    }
+
+    #[test]
+    fn an_entry_marked_seen_survives_pruning_and_only_the_given_root_is_pruned() {
+        let store = store_with(&["/lib/kept.mkv", "/lib/gone.mkv", "/other/old.mkv"]);
+
+        store
+            .mark_media_seen(&[PathBuf::from("/lib/kept.mkv")], 500)
+            .expect("mark seen");
+        assert_eq!(
+            store
+                .remove_media_unseen_under(Path::new("/lib"), 200)
+                .expect("prune"),
+            1
+        );
+        assert!(cached(&store, "/lib/kept.mkv"));
+        assert!(!cached(&store, "/lib/gone.mkv"));
+        assert!(cached(&store, "/other/old.mkv"));
     }
 
     #[test]

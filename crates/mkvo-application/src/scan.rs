@@ -15,6 +15,7 @@ use crate::{
 };
 
 const MEDIA_CACHE_RETENTION_DAYS: i64 = 7;
+const CACHE_BATCH: usize = 200;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanSkip {
@@ -154,12 +155,6 @@ impl ScanService {
             ));
         }
 
-        // Temporary working directories are the common scan source. Prune old
-        // probe payloads before looking up this scan so moved-away files cannot
-        // accumulate indefinitely in the persistent SQLite database.
-        let cache_cutoff = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
-        self.cache.remove_older_than(cache_cutoff).await?;
-
         let enumeration = MediaEnumerationRequest {
             roots,
             ignored_folder_names: request
@@ -214,6 +209,7 @@ impl ScanService {
         .buffer_unordered(workers);
 
         let mut outcome = ScanOutcome::default();
+        let mut seen = Vec::new();
         while let Some(result) = work.next().await {
             if cancel.is_cancelled() {
                 return Err(ApplicationError::Canceled);
@@ -223,6 +219,11 @@ impl ScanService {
                     outcome.summary.total += 1;
                     if cached {
                         outcome.summary.cached += 1;
+                        seen.push(file.fingerprint.path.clone());
+                        if seen.len() >= CACHE_BATCH {
+                            self.cache.mark_seen(&seen, Utc::now()).await?;
+                            seen.clear();
+                        }
                     }
                     let extension = file.extension();
                     if extension.eq_ignore_ascii_case("mkv") {
@@ -251,6 +252,14 @@ impl ScanService {
                 }
             }
         }
+        self.cache.mark_seen(&seen, Utc::now()).await?;
+        // Files that moved away must not pile up in the cache. Everything found was
+        // just marked seen, so this drops only what has been gone from these roots
+        // for the whole retention.
+        let cutoff = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
+        for root in &enumeration.roots {
+            self.cache.remove_unseen_under(root, cutoff).await?;
+        }
         outcome
             .files
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -262,9 +271,10 @@ impl ScanService {
 mod tests {
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use mkvo_domain::{ContainerMetadata, FileFingerprint, MediaStatus};
     use tokio::sync::RwLock;
 
@@ -283,7 +293,10 @@ mod tests {
         }
     }
 
-    struct Probe;
+    #[derive(Default)]
+    struct Probe {
+        calls: AtomicUsize,
+    }
     #[async_trait]
     impl MediaProbe for Probe {
         async fn inspect(
@@ -291,14 +304,27 @@ mod tests {
             path: &Path,
             _cancel: CancellationToken,
         ) -> Result<MediaFile, PortError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(media(path))
         }
     }
 
+    /// Entries carry the time they were last seen, like `scanned_at_ms`.
     #[derive(Default)]
     struct Cache {
-        files: RwLock<HashMap<PathBuf, MediaFile>>,
-        prune_cutoffs: RwLock<Vec<chrono::DateTime<Utc>>>,
+        files: RwLock<HashMap<PathBuf, (MediaFile, DateTime<Utc>)>>,
+    }
+    impl Cache {
+        async fn seed(&self, path: &str, seen_at: DateTime<Utc>) {
+            let file = media(Path::new(path));
+            self.files
+                .write()
+                .await
+                .insert(file.path.clone(), (file, seen_at));
+        }
+        async fn contains(&self, path: &str) -> bool {
+            self.files.read().await.contains_key(Path::new(path))
+        }
     }
     #[async_trait]
     impl MetadataCache for Cache {
@@ -306,13 +332,14 @@ mod tests {
             &self,
             fingerprint: &FileFingerprint,
         ) -> Result<Option<MediaFile>, PortError> {
-            Ok(self.files.read().await.get(&fingerprint.path).cloned())
+            let files = self.files.read().await;
+            Ok(files.get(&fingerprint.path).map(|(file, _)| file.clone()))
         }
         async fn upsert(&self, file: &MediaFile) -> Result<(), PortError> {
             self.files
                 .write()
                 .await
-                .insert(file.path.clone(), file.clone());
+                .insert(file.path.clone(), (file.clone(), Utc::now()));
             Ok(())
         }
         async fn remove(&self, path: &Path) -> Result<bool, PortError> {
@@ -321,15 +348,43 @@ mod tests {
         async fn remove_under(&self, _root: &Path) -> Result<u64, PortError> {
             Ok(0)
         }
-        async fn remove_older_than(&self, cutoff: chrono::DateTime<Utc>) -> Result<u64, PortError> {
-            self.prune_cutoffs.write().await.push(cutoff);
+        async fn remove_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, PortError> {
+            self.files
+                .write()
+                .await
+                .retain(|_, (_, seen_at)| *seen_at >= cutoff);
+            Ok(0)
+        }
+        async fn mark_seen(
+            &self,
+            paths: &[PathBuf],
+            seen_at: DateTime<Utc>,
+        ) -> Result<(), PortError> {
+            let mut files = self.files.write().await;
+            for path in paths {
+                if let Some(entry) = files.get_mut(path) {
+                    entry.1 = seen_at;
+                }
+            }
+            Ok(())
+        }
+        async fn remove_unseen_under(
+            &self,
+            root: &Path,
+            cutoff: DateTime<Utc>,
+        ) -> Result<u64, PortError> {
+            self.files
+                .write()
+                .await
+                .retain(|path, (_, seen_at)| !path.starts_with(root) || *seen_at >= cutoff);
             Ok(0)
         }
         async fn count(&self) -> Result<u64, PortError> {
             Ok(self.files.read().await.len() as u64)
         }
         async fn list_under(&self, _root: &Path) -> Result<Vec<MediaFile>, PortError> {
-            Ok(self.files.read().await.values().cloned().collect())
+            let files = self.files.read().await;
+            Ok(files.values().map(|(file, _)| file.clone()).collect())
         }
     }
 
@@ -369,37 +424,87 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn scan_uses_cache_and_probes_misses() {
-        let one = fingerprint("one.mkv");
-        let two = fingerprint("two.mp4");
-        let cache = Arc::new(Cache::default());
-        cache.upsert(&media(Path::new("one.mkv"))).await.unwrap();
-        let service = ScanService::new(
-            Arc::new(Catalog(vec![one, two])),
-            Arc::new(Probe),
+    async fn scan(
+        source: &str,
+        found: &[&str],
+        cache: &Arc<Cache>,
+        probe: &Arc<Probe>,
+    ) -> ScanOutcome {
+        let catalog = Catalog(found.iter().map(|path| fingerprint(path)).collect());
+        ScanService::new(
+            Arc::new(catalog),
+            probe.clone(),
             cache.clone(),
             Arc::new(Paths),
             2,
-        );
-        let outcome = service
-            .scan(
-                &ScanRequest {
-                    source_path: Some(".".to_owned()),
-                    ..ScanRequest::default()
-                },
-                CancellationToken::new(),
-                &NoopScanEventSink,
-            )
-            .await
-            .unwrap();
+        )
+        .scan(
+            &ScanRequest {
+                source_path: Some(source.to_owned()),
+                ..ScanRequest::default()
+            },
+            CancellationToken::new(),
+            &NoopScanEventSink,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn days_ago(days: i64) -> DateTime<Utc> {
+        Utc::now() - TimeDelta::days(days)
+    }
+
+    #[tokio::test]
+    async fn scan_uses_cache_and_probes_misses() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        cache.seed("one.mkv", Utc::now()).await;
+        let outcome = scan(".", &["one.mkv", "two.mp4"], &cache, &probe).await;
         assert_eq!(outcome.files.len(), 2);
         assert_eq!(outcome.summary.cached, 1);
         assert_eq!(outcome.summary.mkv, 1);
         assert_eq!(outcome.summary.mp4, 1);
-        let cutoffs = cache.prune_cutoffs.read().await;
-        assert_eq!(cutoffs.len(), 1);
-        let expected = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
-        assert!((cutoffs[0] - expected).num_seconds().abs() <= 1);
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        assert!(cache.contains("two.mp4").await);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_file_is_not_probed_again_however_old_its_entry() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        cache
+            .seed("lib/one.mkv", days_ago(MEDIA_CACHE_RETENTION_DAYS + 1))
+            .await;
+
+        let outcome = scan("lib", &["lib/one.mkv"], &cache, &probe).await;
+        assert_eq!(outcome.summary.cached, 1);
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 0);
+        assert!(cache.contains("lib/one.mkv").await);
+    }
+
+    #[tokio::test]
+    async fn scanning_one_folder_does_not_expire_the_cache_of_another() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        cache
+            .seed("lib/one.mkv", days_ago(MEDIA_CACHE_RETENTION_DAYS + 1))
+            .await;
+
+        scan("work", &["work/two.mkv"], &cache, &probe).await;
+        assert!(cache.contains("lib/one.mkv").await);
+    }
+
+    #[tokio::test]
+    async fn a_file_gone_from_a_scanned_folder_is_pruned_after_the_retention() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        cache
+            .seed("lib/gone.mkv", days_ago(MEDIA_CACHE_RETENTION_DAYS + 1))
+            .await;
+        cache.seed("lib/unreachable-today.mkv", days_ago(1)).await;
+
+        scan("lib", &["lib/one.mkv"], &cache, &probe).await;
+        assert!(!cache.contains("lib/gone.mkv").await);
+        assert!(cache.contains("lib/unreachable-today.mkv").await);
     }
 }

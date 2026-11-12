@@ -49,6 +49,14 @@ pub trait MetadataCache: Send + Sync {
     async fn remove_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, PortError>;
     async fn count(&self) -> Result<u64, PortError>;
     async fn list_under(&self, root: &Path) -> Result<Vec<MediaFile>, PortError>;
+    /// Record that these entries were seen at `seen_at`.
+    async fn mark_seen(&self, paths: &[PathBuf], seen_at: DateTime<Utc>) -> Result<(), PortError>;
+    /// Remove the entries under `root` that were last seen before `cutoff`.
+    async fn remove_unseen_under(
+        &self,
+        root: &Path,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, PortError>;
 }
 
 #[async_trait]
