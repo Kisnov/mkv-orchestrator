@@ -42,8 +42,8 @@ mod rename_workflow;
 mod response_mappers;
 mod shared_workflow;
 use execution_support::{
-    append_propedit_arguments, append_track_selection, backup_path, extraction_temp_path,
-    require_plan_fields, runtime_application_error, validate_idempotent_job,
+    append_propedit_arguments, append_track_selection, extraction_temp_path, require_plan_fields,
+    runtime_application_error, validate_idempotent_job,
 };
 use rename_presentation::{
     file_name, path_key, remux_mode_label, remux_tool_name, same_path, track_kind_label,

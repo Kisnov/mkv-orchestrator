@@ -1023,31 +1023,11 @@ impl MkvoRuntime {
         item: &mkvo_domain::RemuxPlanItem,
     ) -> Result<(), ApplicationError> {
         if same_path(&item.source, &item.final_output) {
-            let backup = backup_path(&item.source);
-            if self.dependencies().file_system.exists(&backup).await? {
-                return Err(ApplicationError::Conflict(format!(
-                    "stale remux backup exists: {}",
-                    backup.display()
-                )));
-            }
+            // One rename: there is no moment without a complete file at this path.
             self.dependencies()
                 .file_system
-                .move_file(&item.source, &backup)
+                .replace_file(&item.temporary_output, &item.final_output)
                 .await?;
-            if let Err(error) = self
-                .dependencies()
-                .file_system
-                .move_file(&item.temporary_output, &item.final_output)
-                .await
-            {
-                let _ = self
-                    .dependencies()
-                    .file_system
-                    .move_file(&backup, &item.source)
-                    .await;
-                return Err(error.into());
-            }
-            self.dependencies().file_system.remove_file(&backup).await?;
         } else {
             self.dependencies()
                 .file_system
@@ -1085,31 +1065,10 @@ impl MkvoRuntime {
                         track.output.display()
                     )));
                 }
-                let backup = backup_path(&track.output);
-                if self.dependencies().file_system.exists(&backup).await? {
-                    return Err(ApplicationError::Conflict(format!(
-                        "stale extraction backup exists: {}",
-                        backup.display()
-                    )));
-                }
                 self.dependencies()
                     .file_system
-                    .move_file(&track.output, &backup)
+                    .replace_file(&temporary, &track.output)
                     .await?;
-                if let Err(error) = self
-                    .dependencies()
-                    .file_system
-                    .move_file(&temporary, &track.output)
-                    .await
-                {
-                    let _ = self
-                        .dependencies()
-                        .file_system
-                        .move_file(&backup, &track.output)
-                        .await;
-                    return Err(error.into());
-                }
-                self.dependencies().file_system.remove_file(&backup).await?;
             } else {
                 self.dependencies()
                     .file_system
@@ -2234,29 +2193,6 @@ pub(super) mod execution_tests {
             names
         }
 
-        /// An in-place remux that drops the audio track of each file.
-        pub fn remux_plan(&self, files: Vec<MediaFile>) -> RemuxPlan {
-            RemuxPlanner
-                .build_plan(RemuxPlanRequest {
-                    mode: RemuxMode::Remux,
-                    files,
-                    options: RemuxOptions {
-                        remove_track_ids: BTreeSet::from([1]),
-                        ..RemuxOptions::default()
-                    },
-                    external_subtitles: BTreeMap::new(),
-                    extractions: BTreeMap::new(),
-                    existing_paths: BTreeSet::new(),
-                    source_access: BTreeMap::new(),
-                    authorized_roots: Vec::new(),
-                    settings_fingerprint: "settings".to_owned(),
-                    tool_fingerprints: BTreeMap::new(),
-                    expires_in_seconds: 60,
-                    idempotency_key: IdempotencyKey::generate(),
-                })
-                .expect("remux plan")
-        }
-
         pub async fn start_job<F, Fut>(&self, kind: JobKind, task: F) -> mkvo_domain::JobId
         where
             F: FnOnce(MkvoRuntime, mkvo_application::JobContext) -> Fut + Send + 'static,
@@ -2308,6 +2244,40 @@ pub(super) mod execution_tests {
         }
     }
 
+    /// An in-place remux that drops the audio track of each file.
+    fn remux_request(files: Vec<MediaFile>) -> RemuxPlanRequest {
+        RemuxPlanRequest {
+            mode: RemuxMode::Remux,
+            files,
+            options: RemuxOptions {
+                remove_track_ids: BTreeSet::from([1]),
+                ..RemuxOptions::default()
+            },
+            external_subtitles: BTreeMap::new(),
+            extractions: BTreeMap::new(),
+            existing_paths: BTreeSet::new(),
+            source_access: BTreeMap::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            tool_fingerprints: BTreeMap::new(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        }
+    }
+
+    fn remux_plan(files: Vec<MediaFile>) -> RemuxPlan {
+        RemuxPlanner
+            .build_plan(remux_request(files))
+            .expect("remux plan")
+    }
+
+    fn writes_output(invocation: &ToolInvocation) -> ToolExecutionResult {
+        for output in &invocation.expected_outputs {
+            std::fs::write(output, "new").expect("output");
+        }
+        exited(invocation, 0, "")
+    }
+
     const WARNED: &str = "mkvmerge v102.0 ('Little Houses') 64-bit\n'a.srt': Using the demultiplexer for the format 'SRT subtitles'.\nWarning: 'a.srt' track 0: The start timestamp is smaller than that of the previous entry.\nThe file has been opened for writing.\nProgress: 96%\rProgress: 100%\rThe cue entries (the index) are being written...\nMultiplexing took 0 seconds.\n";
     const FAILED: &str = "mkvmerge v102.0 ('Little Houses') 64-bit\nError: The file 'Episode 01.mkv' could not be opened for reading: open file error.\n";
 
@@ -2319,9 +2289,7 @@ pub(super) mod execution_tests {
         }));
         let episode = library.media("Episode 01.mkv").await;
 
-        let job = library
-            .run_remux(library.remux_plan(vec![episode.clone()]))
-            .await;
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
 
         assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
         assert_eq!(
@@ -2342,9 +2310,7 @@ pub(super) mod execution_tests {
         }));
         let episode = library.media("Episode 01.mkv").await;
 
-        let job = library
-            .run_remux(library.remux_plan(vec![episode.clone()]))
-            .await;
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
 
         assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(
@@ -2369,7 +2335,7 @@ pub(super) mod execution_tests {
             exited(invocation, 0, "")
         }));
         let episode = library.media("Episode 01.mkv").await;
-        let mut plan = library.remux_plan(vec![episode.clone()]);
+        let mut plan = remux_plan(vec![episode.clone()]);
         plan.context
             .attributes
             .insert("subtitleFontFileName".to_owned(), "font.ttf".to_owned());
@@ -2385,6 +2351,84 @@ pub(super) mod execution_tests {
             job.lines
                 .iter()
                 .any(|line| line.contains("temporary file was left behind"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_left_by_an_older_version_does_not_block_the_remux() {
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        let backup = episode.path.with_file_name(".Episode 01.mkv.mkvo-backup");
+        std::fs::write(&backup, "older").expect("backup");
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "new"
+        );
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), "older");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_original_that_cannot_be_replaced_is_left_untouched() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        // A media server playing the file: others may read it, nobody may replace it.
+        let playing = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&episode.path)
+            .expect("open");
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+        drop(playing);
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.error.expect("error").contains("could not replace"));
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "original"
+        );
+        assert_eq!(library.file_names(), ["Episode 01.mkv"]);
+    }
+
+    #[tokio::test]
+    async fn extraction_replaces_an_existing_subtitle_without_a_backup() {
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        let subtitle = episode.path.with_file_name("Episode 01.eng.srt");
+        std::fs::write(&subtitle, "older").expect("subtitle");
+        let mut plan = RemuxPlanner
+            .build_plan(RemuxPlanRequest {
+                mode: RemuxMode::ExtractSubtitles,
+                extractions: BTreeMap::from([(
+                    episode.path.clone(),
+                    vec![TrackExtraction {
+                        track_id: 2,
+                        kind: TrackKind::Subtitle,
+                        output: subtitle.clone(),
+                    }],
+                )]),
+                ..remux_request(vec![episode])
+            })
+            .expect("extraction plan");
+        plan.context.attributes.insert(
+            "extractOverwriteExistingFiles".to_owned(),
+            "true".to_owned(),
+        );
+
+        let job = library.run_remux(plan).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert_eq!(std::fs::read_to_string(&subtitle).expect("subtitle"), "new");
+        assert_eq!(
+            library.file_names(),
+            ["Episode 01.eng.srt", "Episode 01.mkv"]
         );
     }
 

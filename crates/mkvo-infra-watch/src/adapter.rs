@@ -246,6 +246,27 @@ impl FileSystem for LocalFileSystem {
             PortError::Other(format!("could not remove `{}`: {error}", path.display()))
         })
     }
+
+    async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+        let source = self
+            .authorized_roots
+            .authorize_existing(source, AccessMode::Write)
+            .map_err(path_port_error)?
+            .into_path_buf();
+        let target = self
+            .authorized_roots
+            .authorize_existing(target, AccessMode::Write)
+            .map_err(path_port_error)?
+            .into_path_buf();
+        // A rename onto an existing file swaps it atomically on POSIX and on NTFS.
+        tokio::fs::rename(&source, &target).await.map_err(|error| {
+            PortError::Other(format!(
+                "could not replace `{}` with `{}`: {error}",
+                target.display(),
+                source.display()
+            ))
+        })
+    }
 }
 
 fn fingerprint_file(
