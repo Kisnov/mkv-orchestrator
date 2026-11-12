@@ -1,4 +1,4 @@
-use super::remux_workflow::tool_warning;
+use super::remux_workflow::{batch_failure, tool_warning};
 use super::*;
 
 impl MkvoRuntime {
@@ -193,7 +193,7 @@ impl MkvoRuntime {
                 (key, result)
             })
             .buffer_unordered(workers);
-        let mut first_error = None;
+        let mut failures = Vec::new();
         while let Some((key, result)) = executions.next().await {
             match result {
                 Ok(()) => {
@@ -204,15 +204,19 @@ impl MkvoRuntime {
                 Err(error) => {
                     journal.fail_item(&key, error.to_string());
                     context.record_failed().await?;
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                    if !matches!(error, ApplicationError::Canceled) {
+                        context
+                            .log(JobLogLevel::Error, format!("{key}: {error}"))
+                            .await?;
                     }
+                    failures.push((key, error));
                 }
             }
             journal.updated_utc = Utc::now();
             self.dependencies().journal.advance(&journal).await?;
         }
-        if let Some(error) = first_error {
+        if !failures.is_empty() {
+            let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
             journal.detail = Some(error.to_string());
             journal.updated_utc = Utc::now();
@@ -352,5 +356,43 @@ mod execution_tests {
                 .iter()
                 .any(|line| line.contains("No attachment matched the spec"))
         );
+    }
+
+    #[tokio::test]
+    async fn every_failed_file_is_reported() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            if invocation.arguments[0].contains("Episode 02") {
+                exited(invocation, 0, "Done.\n")
+            } else {
+                let failed = "Error: The file could not be opened for writing.\n";
+                exited(invocation, 2, failed)
+            }
+        }));
+        let mut files = Vec::new();
+        for name in ["Episode 01.mkv", "Episode 02.mkv", "Episode 03.mkv"] {
+            files.push(library.media(name).await);
+        }
+
+        let job = run_title_edit(&library, files).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(job.failed, 2);
+        let error = job.error.expect("error");
+        assert!(error.contains("2 of 3 files failed"), "{error}");
+        assert!(
+            error.contains("Episode 01.mkv: mkvpropedit failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Episode 03.mkv: mkvpropedit failed"),
+            "{error}"
+        );
+        assert!(!error.contains("Episode 02.mkv"), "{error}");
+        let logged = job
+            .lines
+            .iter()
+            .filter(|line| line.contains("could not be opened for writing"))
+            .count();
+        assert_eq!(logged, 2);
     }
 }

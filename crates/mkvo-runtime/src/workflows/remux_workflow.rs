@@ -546,7 +546,7 @@ impl MkvoRuntime {
                 (key, result)
             })
             .buffer_unordered(workers);
-        let mut first_error = None;
+        let mut failures = Vec::new();
         while let Some((key, result)) = executions.next().await {
             match result {
                 Ok(()) => {
@@ -557,15 +557,19 @@ impl MkvoRuntime {
                 Err(error) => {
                     journal.fail_item(&key, error.to_string());
                     context.record_failed().await?;
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                    if !matches!(error, ApplicationError::Canceled) {
+                        context
+                            .log(JobLogLevel::Error, format!("{key}: {error}"))
+                            .await?;
                     }
+                    failures.push((key, error));
                 }
             }
             journal.updated_utc = Utc::now();
             self.dependencies().journal.advance(&journal).await?;
         }
-        if let Some(error) = first_error {
+        if !failures.is_empty() {
+            let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
             journal.detail = Some(error.to_string());
             journal.updated_utc = Utc::now();
@@ -1078,6 +1082,44 @@ impl MkvoRuntime {
         }
         Ok(())
     }
+}
+
+/// One error for a whole batch, naming the files that failed rather than only the first.
+pub(super) fn batch_failure(
+    failures: Vec<(String, ApplicationError)>,
+    total: u64,
+) -> ApplicationError {
+    const LISTED: usize = 5;
+    let mut failed: Vec<_> = failures
+        .into_iter()
+        .filter(|(_, error)| !matches!(error, ApplicationError::Canceled))
+        .collect();
+    if failed.is_empty() {
+        return ApplicationError::Canceled;
+    }
+    if total == 1 {
+        return failed.remove(0).1;
+    }
+    let mut message = format!("{} of {total} files failed: ", failed.len());
+    message += &failed
+        .iter()
+        .take(LISTED)
+        .map(|(key, error)| {
+            let reason = match error {
+                ApplicationError::Internal(reason) => reason.clone(),
+                error => error.to_string(),
+            };
+            format!("{}: {reason}", file_name(Path::new(key)))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failed.len() > LISTED {
+        message += &format!(
+            "; and {} more, listed in the job log",
+            failed.len() - LISTED
+        );
+    }
+    ApplicationError::Internal(message)
 }
 
 /// MKVToolNix exits with 1 when it finished with warnings and with 2 when it failed.
@@ -2430,6 +2472,43 @@ pub(super) mod execution_tests {
             library.file_names(),
             ["Episode 01.eng.srt", "Episode 01.mkv"]
         );
+    }
+
+    #[test]
+    fn a_batch_failure_names_the_failed_files_and_ignores_canceled_ones() {
+        let failed = |name: &str| {
+            (
+                format!("/media/{name}"),
+                ApplicationError::Internal("tool failed".to_owned()),
+            )
+        };
+        let canceled = || ("/media/c.mkv".to_owned(), ApplicationError::Canceled);
+
+        let only = batch_failure(vec![failed("a.mkv")], 1);
+        assert_eq!(only.to_string(), "internal error: tool failed");
+        let mixed = batch_failure(vec![canceled(), failed("a.mkv"), failed("b.mkv")], 4);
+        assert_eq!(
+            mixed.to_string(),
+            "internal error: 2 of 4 files failed: a.mkv: tool failed; b.mkv: tool failed"
+        );
+        let many = batch_failure(
+            (0..7)
+                .map(|index| failed(&format!("{index}.mkv")))
+                .collect(),
+            9,
+        );
+        assert!(
+            many.to_string()
+                .starts_with("internal error: 7 of 9 files failed: 0.mkv: ")
+        );
+        assert!(
+            many.to_string()
+                .ends_with("; and 2 more, listed in the job log")
+        );
+        assert!(matches!(
+            batch_failure(vec![canceled(), canceled()], 4),
+            ApplicationError::Canceled
+        ));
     }
 
     #[test]
