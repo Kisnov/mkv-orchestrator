@@ -18,3 +18,7 @@ it("retries a server or network failure once", async () => {
   expect(await attempts(new ApiError("Unavailable", { status: 503 }))).toBe(2);
   expect(await attempts(new ApiError("Unable to reach the MKVO server.", { code: "TRANSPORT_ERROR" }))).toBe(2);
 });
+
+it("does not send a timed-out request again", async () => {
+  expect(await attempts(new ApiError("The MKVO server took too long to answer.", { code: "TIMEOUT" }))).toBe(1);
+});
