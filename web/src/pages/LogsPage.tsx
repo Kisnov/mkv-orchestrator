@@ -20,6 +20,8 @@ export function LogsPage() {
       logs.refetch();
     }
   });
+  const [exportError, setExportError] = useState<Error | null>(null);
+  const failure = logs.error ?? clear.error ?? exportError;
   const entries = logs.data?.entries ?? [];
   const areas = useMemo(() => ["All", ...Array.from(new Set(entries.map((entry) => entry.area))).sort()], [entries]);
   const visibleEntries = useMemo(() => {
@@ -37,7 +39,9 @@ export function LogsPage() {
   // The whole log is rendered by the backend so the export matches what the
   // server actually recorded, not just the entries this page has fetched.
   async function exportAllLogs() {
-    const exported = await exportOperationLogs();
+    setExportError(null);
+    const exported = await exportOperationLogs().catch((error: Error) => { setExportError(error); return null; });
+    if (!exported) return;
     const blob = new Blob([exported.content], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -101,9 +105,12 @@ export function LogsPage() {
             </label>
           </div>
 
+          {failure ? <div role="alert" className="mt-4 rounded-md border border-warning bg-panel px-3 py-2 text-sm text-warning">{failure.message}</div> : null}
           <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-panel">
             {visibleEntries.length === 0 ? (
-              <div className="flex h-full min-h-[18.75rem] items-center justify-center text-sm text-subtle">No operation logs yet.</div>
+              <div className="flex h-full min-h-[18.75rem] items-center justify-center text-sm text-subtle">
+                {logs.isLoading ? "Loading logs..." : logs.isError ? "Logs could not be loaded." : "No operation logs yet."}
+              </div>
             ) : visibleEntries.map((entry, index) => (
               <button
                 key={`${entry.timestampUtc}-${entry.area}-${index}`}
