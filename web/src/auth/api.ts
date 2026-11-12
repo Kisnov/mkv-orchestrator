@@ -32,7 +32,7 @@ async function request<T>(path: string, method = "GET", body?: unknown): Promise
   // A proxy in front of MKVO answers with an HTML error page, not JSON.
   const payload = await response.json().catch(() => undefined);
   if (!response.ok || payload === undefined) {
-    throw new ApiError(payload?.detail ?? `The MKVO server answered with HTTP ${response.status}.`, { status: response.status });
+    throw new ApiError(payload?.detail ?? `Unexpected response from the MKVO server (HTTP ${response.status}).`, { status: response.status });
   }
   return payload as T;
 }
