@@ -1,5 +1,15 @@
 use super::*;
 
+/// Matches `?1` and everything below it by primary-key range: case-sensitive
+/// and indexed, unlike `LIKE`. `0` and `]` are the characters after `/` and `\`.
+const UNDER_ROOT: &str = "(file_path = ?1
+    OR (file_path >= ?1 || '/' AND file_path < ?1 || '0')
+    OR (file_path >= ?1 || char(92) AND file_path < ?1 || ']'))";
+
+fn subtree_root(root: &Path) -> String {
+    path_text(root).trim_end_matches(['/', '\\']).to_owned()
+}
+
 impl SqliteStore {
     pub fn cache_count(&self) -> StoreResult<u64> {
         let connection = self.connection()?;
@@ -9,19 +19,15 @@ impl SqliteStore {
     }
 
     pub fn list_media_under(&self, root: &Path) -> StoreResult<Vec<CachedMedia>> {
-        let root = path_text(root).trim_end_matches(['/', '\\']).to_owned();
-        let escaped_root = escape_like(&root);
-        let slash = format!("{escaped_root}/%");
-        let backslash = format!("{escaped_root}\\%");
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&format!(
             "SELECT file_path, file_size, modified_at_ns, quick_hash, tool_fingerprint,
                     scanned_at_ms, payload_json
              FROM media_cache
-             WHERE file_path = ?1 OR file_path LIKE ?2 ESCAPE '^' OR file_path LIKE ?3 ESCAPE '^'
-             ORDER BY file_path",
-        )?;
-        let rows = statement.query_map(params![root, slash, backslash], |row| {
+             WHERE {UNDER_ROOT}
+             ORDER BY file_path"
+        ))?;
+        let rows = statement.query_map([subtree_root(root)], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -135,14 +141,10 @@ impl SqliteStore {
     }
 
     pub fn remove_media_under(&self, root: &Path) -> StoreResult<u64> {
-        let root = path_text(root).trim_end_matches(['/', '\\']).to_owned();
-        let escaped_root = escape_like(&root);
-        let slash = format!("{escaped_root}/%");
-        let backslash = format!("{escaped_root}\\%");
         let connection = self.connection()?;
         let removed = connection.execute(
-            "DELETE FROM media_cache WHERE file_path = ?1 OR file_path LIKE ?2 ESCAPE '^' OR file_path LIKE ?3 ESCAPE '^'",
-            params![root, slash, backslash],
+            &format!("DELETE FROM media_cache WHERE {UNDER_ROOT}"),
+            [subtree_root(root)],
         )?;
         u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
     }
@@ -160,5 +162,106 @@ impl SqliteStore {
         let connection = self.connection()?;
         let removed = connection.execute("DELETE FROM media_cache", [])?;
         u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn store_with(paths: &[&str]) -> SqliteStore {
+        let store = SqliteStore::open_in_memory().expect("open store");
+        for path in paths {
+            store
+                .upsert_media(&CachedMedia {
+                    fingerprint: fingerprint(path),
+                    scanned_at_ms: 100,
+                    payload: json!({"tracks": 1}),
+                })
+                .expect("upsert");
+        }
+        store
+    }
+
+    fn fingerprint(path: &str) -> CacheFingerprint {
+        CacheFingerprint {
+            path: PathBuf::from(path),
+            file_size: 10,
+            modified_at_ns: 123,
+            quick_hash: None,
+            tool_fingerprint: String::new(),
+        }
+    }
+
+    fn cached(store: &SqliteStore, path: &str) -> bool {
+        store
+            .get_valid_media(&fingerprint(path))
+            .expect("read")
+            .is_some()
+    }
+
+    #[test]
+    fn subtree_pruning_is_case_sensitive_and_stops_at_the_folder_boundary() {
+        let store = store_with(&[
+            "/media/Anime/a.mkv",
+            "/media/Anime/Show/b.mkv",
+            "/media/anime/c.mkv",
+            "/media/Anime2/d.mkv",
+            "/media/Anime.old/e.mkv",
+        ]);
+
+        assert_eq!(
+            store
+                .remove_media_under(Path::new("/media/Anime/"))
+                .expect("remove under"),
+            2
+        );
+        assert!(cached(&store, "/media/anime/c.mkv"));
+        assert!(cached(&store, "/media/Anime2/d.mkv"));
+        assert!(cached(&store, "/media/Anime.old/e.mkv"));
+    }
+
+    #[test]
+    fn subtree_match_searches_the_primary_key_instead_of_scanning() {
+        let store = store_with(&[]);
+        let connection = store.connection().expect("connection");
+        let plan: Vec<String> = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN DELETE FROM media_cache WHERE {UNDER_ROOT}"
+            ))
+            .expect("prepare")
+            .query_map(["/media"], |row| row.get(3))
+            .expect("plan")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert!(
+            plan.iter().any(|step| step.starts_with("SEARCH")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn subtree_listing_is_case_sensitive_and_treats_wildcards_literally() {
+        let store = store_with(&[
+            "/media/100%_done/a.mkv",
+            "/media/100%_DONE/b.mkv",
+            "/media/100x-done/c.mkv",
+        ]);
+
+        let listed = store
+            .list_media_under(Path::new("/media/100%_done"))
+            .expect("list under");
+        assert_eq!(
+            listed
+                .into_iter()
+                .map(|media| media.fingerprint.path)
+                .collect::<Vec<_>>(),
+            [PathBuf::from("/media/100%_done/a.mkv")]
+        );
     }
 }
