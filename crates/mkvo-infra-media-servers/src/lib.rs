@@ -158,6 +158,9 @@ pub trait MediaServerClient: Send + Sync {
     ) -> Result<ArtworkData, MediaServerError>;
 }
 
+const EMBY_PAGE_SIZE: usize = 500;
+const MAX_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct MediaServerDiscoveryClient {
     client: Client,
@@ -216,11 +219,10 @@ impl MediaServerClient for MediaServerDiscoveryClient {
         server: &MediaServerConfig,
         cancellation: CancellationToken,
     ) -> Result<ConnectionInfo, MediaServerError> {
+        // System/Info/Public and Plex's identity answer without a credential.
         match server.kind {
             MediaServerKind::Emby | MediaServerKind::Jellyfin => {
-                let response = self
-                    .get(server, "System/Info/Public", &cancellation)
-                    .await?;
+                let response = self.get(server, "System/Info", &cancellation).await?;
                 let document: Value = response
                     .json()
                     .await
@@ -232,7 +234,7 @@ impl MediaServerClient for MediaServerDiscoveryClient {
                 })
             }
             MediaServerKind::Plex => {
-                let response = self.get(server, "identity", &cancellation).await?;
+                let response = self.get(server, "", &cancellation).await?;
                 let xml = response
                     .text()
                     .await
@@ -301,17 +303,36 @@ impl MediaServerClient for MediaServerDiscoveryClient {
                             .is_some_and(|name| name.eq_ignore_ascii_case(library_name))
                     })
                     .and_then(|folder| json_string(folder, &["ItemId", "itemId"]));
-                let relative = parent_id.map_or_else(
-                    || "Items?Recursive=true&IncludeItemTypes=Series%2CMovie&Fields=Path%2CProductionYear%2CImageTags&EnableImages=true&Limit=10000".to_owned(),
-                    |id| format!("Items?ParentId={id}&Recursive=true&IncludeItemTypes=Series%2CMovie&Fields=Path%2CProductionYear%2CImageTags&EnableImages=true&Limit=10000"),
-                );
-                let document: Value = self
-                    .get(server, &relative, &cancellation)
-                    .await?
-                    .json()
-                    .await
-                    .map_err(|error| invalid(server.kind, error))?;
-                parse_emby_items(&document, server_paths)
+                let scope = parent_id.map_or_else(String::new, |id| format!("ParentId={id}&"));
+                let mut items = Vec::new();
+                let mut start = 0;
+                loop {
+                    // A fixed sort keeps the pages from overlapping.
+                    let relative = format!(
+                        "Items?{scope}Recursive=true&IncludeItemTypes=Series%2CMovie&Fields=Path%2CProductionYear%2CImageTags&EnableImages=true&SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={EMBY_PAGE_SIZE}"
+                    );
+                    let document: Value = self
+                        .get(server, &relative, &cancellation)
+                        .await?
+                        .json()
+                        .await
+                        .map_err(|error| invalid(server.kind, error))?;
+                    let count = emby_item_rows(&document).len();
+                    items.extend(parse_emby_items(&document, server_paths));
+                    start += count;
+                    // Jellyfin reports 0 when the total count is switched off.
+                    let total = document
+                        .get("TotalRecordCount")
+                        .or_else(|| document.get("totalRecordCount"))
+                        .and_then(Value::as_u64)
+                        .filter(|total| *total > 0);
+                    if count == 0
+                        || total.map_or(count < EMBY_PAGE_SIZE, |total| start as u64 >= total)
+                    {
+                        break;
+                    }
+                }
+                items
             }
             MediaServerKind::Plex => {
                 let sections_xml = self
@@ -371,23 +392,33 @@ impl MediaServerClient for MediaServerDiscoveryClient {
             }
             MediaServerKind::Plex => format!("library/metadata/{item_id}/thumb"),
         };
-        let response = self.get(server, &relative, &cancellation).await?;
+        let mut response = self.get(server, &relative, &cancellation).await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_owned();
-        let bytes = response
-            .bytes()
+        let too_large = || MediaServerError::InvalidResponse {
+            kind: server.kind,
+            message: "poster image exceeded the 10 MiB limit".to_owned(),
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ARTWORK_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
             .map_err(|error| invalid(server.kind, error))?
-            .to_vec();
-        if bytes.len() > 10 * 1024 * 1024 {
-            return Err(MediaServerError::InvalidResponse {
-                kind: server.kind,
-                message: "poster image exceeded the 10 MiB limit".to_owned(),
-            });
+        {
+            if bytes.len() + chunk.len() > MAX_ARTWORK_BYTES {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
         }
         Ok(ArtworkData {
             content_type,
@@ -480,14 +511,17 @@ fn parse_emby_libraries(
         .collect()
 }
 
-fn parse_emby_items(document: &Value, server_paths: &[PathBuf]) -> Vec<DiscoveredItem> {
-    let items = document
+fn emby_item_rows(document: &Value) -> &[Value] {
+    document
         .get("Items")
         .or_else(|| document.get("items"))
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten();
-    items
+        .map_or(&[], Vec::as_slice)
+}
+
+fn parse_emby_items(document: &Value, server_paths: &[PathBuf]) -> Vec<DiscoveredItem> {
+    emby_item_rows(document)
+        .iter()
         .filter(|item| {
             if server_paths.is_empty() {
                 return true;
