@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -109,21 +109,34 @@ impl TvdbClient {
         query: &[(&str, String)],
         cancellation: &CancellationToken,
     ) -> Result<Value, ProviderError> {
-        let bearer = self.bearer(credentials, cancellation).await?;
         let url = self
             .base_url
             .join(path)
             .map_err(|error| ProviderError::invalid(ProviderKind::Tvdb, error))?;
-        let query = query.to_vec();
-        let client = self.client.clone();
-        let response = send_with_retry(ProviderKind::Tvdb, cancellation, move || {
-            client
-                .get(url.clone())
-                .bearer_auth(bearer.expose())
-                .query(&query)
-        })
-        .await?;
-        response_json(ProviderKind::Tvdb, response).await
+        let mut logged_in_again = false;
+        loop {
+            let bearer = self.bearer(credentials, cancellation).await?;
+            let result = send_with_retry(ProviderKind::Tvdb, cancellation, || {
+                self.client
+                    .get(url.clone())
+                    .bearer_auth(bearer.expose())
+                    .query(query)
+            })
+            .await;
+            match result {
+                // TVDB can revoke a token before the cached copy expires.
+                Err(ProviderError::Status { status, .. })
+                    if status == StatusCode::UNAUTHORIZED && !logged_in_again =>
+                {
+                    let mut cached = self.token.write().await;
+                    if cached.as_ref().is_some_and(|cached| cached.token == bearer) {
+                        *cached = None;
+                    }
+                    logged_in_again = true;
+                }
+                result => return response_json(ProviderKind::Tvdb, result?).await,
+            }
+        }
     }
 
     async fn localized_series_name(
@@ -395,8 +408,79 @@ fn value_u64(value: &Value) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
+    };
+
     use super::*;
+    use crate::common::serve_stub;
     use serde_json::json;
+
+    /// A stub whose `/login` hands out `token-1`, `token-2`, … and whose
+    /// `/search` accepts only `accepted`.
+    async fn stub_client(accepted: &'static str) -> (TvdbClient, Arc<AtomicUsize>) {
+        let logins = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&logins);
+        let router = Router::new()
+            .route(
+                "/login",
+                post(move || async move {
+                    let login = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Json(json!({"data": {"token": format!("token-{login}")}}))
+                }),
+            )
+            .route(
+                "/search",
+                get(move |headers: HeaderMap| async move {
+                    if headers["authorization"] == format!("Bearer {accepted}") {
+                        Ok(Json(json!({"data": []})))
+                    } else {
+                        Err(StatusCode::UNAUTHORIZED)
+                    }
+                }),
+            );
+        let base = Url::parse(&format!("{}/", serve_stub(router).await)).expect("stub URL");
+        (
+            TvdbClient::with_client(provider_http_client(), base),
+            logins,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_replaced_by_one_new_login() {
+        let (client, logins) = stub_client("token-2").await;
+        let results = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "show",
+                "eng",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search after a new login");
+        assert!(results.is_empty());
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_token_rejected_twice_is_an_error_not_a_login_loop() {
+        let (client, logins) = stub_client("never").await;
+        let error = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "show",
+                "eng",
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("still unauthorized");
+        assert!(error.to_string().contains("401"), "{error}");
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn normalizes_string_and_numeric_tvdb_ids() {

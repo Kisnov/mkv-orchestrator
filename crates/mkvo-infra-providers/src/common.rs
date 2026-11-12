@@ -195,34 +195,48 @@ where
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
+        let last_attempt = attempt + 1 == MAX_ATTEMPTS;
         let send = build().send();
-        let response = tokio::select! {
+        let result = tokio::select! {
             () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider }),
-            response = send => response.map_err(|error| ProviderError::network(provider, error))?,
+            result = send => result,
         };
-        if response.status().is_success() {
-            return Ok(response);
-        }
-
-        let retryable = response.status() == StatusCode::TOO_MANY_REQUESTS
-            || response.status().is_server_error();
-        if !retryable || attempt + 1 == MAX_ATTEMPTS {
-            return Err(ProviderError::Status {
-                provider,
-                status: response.status(),
-            });
-        }
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_millis(250 * 2_u64.pow(attempt)))
-            .min(Duration::from_secs(10));
-        wait_or_cancel(provider, cancellation, tokio::time::sleep(retry_after)).await?;
+        let retry_after = match result {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let retryable = response.status() == StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error();
+                if !retryable || last_attempt {
+                    return Err(ProviderError::Status {
+                        provider,
+                        status: response.status(),
+                    });
+                }
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+            }
+            // A timeout already cost the caller its full wait, so only failures
+            // that return quickly (refused, reset) are sent again.
+            Err(error) if last_attempt || error.is_timeout() || error.is_builder() => {
+                return Err(ProviderError::network(provider, error));
+            }
+            Err(_) => None,
+        };
+        let delay = retry_delay(retry_after, attempt);
+        wait_or_cancel(provider, cancellation, tokio::time::sleep(delay)).await?;
     }
     unreachable!("retry loop always returns")
+}
+
+/// The server's `Retry-After` when it sends one, else exponential backoff.
+fn retry_delay(retry_after_secs: Option<u64>, attempt: u32) -> Duration {
+    retry_after_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_millis(250 * 2_u64.pow(attempt)))
+        .min(Duration::from_secs(60))
 }
 
 async fn wait_or_cancel<F>(
@@ -273,9 +287,55 @@ pub(crate) async fn response_json(
         .map_err(|error| ProviderError::invalid(provider, error.without_url()))
 }
 
+/// Serve `router` on a loopback port and return its base URL.
+#[cfg(test)]
+pub(crate) async fn serve_stub(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub server");
+    let address = listener.local_addr().expect("stub address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{address}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        tokio::spawn(async move {
+            drop(listener.accept().await);
+            let (mut stream, _) = listener.accept().await.expect("second connection");
+            let _ = stream.read(&mut [0_u8; 1024]).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .await;
+        });
+
+        let client = provider_http_client();
+        let response = send_with_retry(ProviderKind::Tmdb, &CancellationToken::new(), || {
+            client.get(&url)
+        })
+        .await
+        .expect("retried request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn retry_after_is_honoured_up_to_a_minute() {
+        assert_eq!(retry_delay(Some(30), 0), Duration::from_secs(30));
+        assert_eq!(retry_delay(Some(3600), 0), Duration::from_secs(60));
+        assert_eq!(retry_delay(None, 0), Duration::from_millis(250));
+        assert_eq!(retry_delay(None, 1), Duration::from_millis(500));
+    }
 
     #[test]
     fn credentials_are_redacted_from_debug() {
