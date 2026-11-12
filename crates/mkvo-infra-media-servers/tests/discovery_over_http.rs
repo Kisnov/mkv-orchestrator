@@ -76,9 +76,9 @@ async fn jellyfin_connection_and_libraries_round_trip_over_http() {
     let seen = Seen::default();
     let router = Router::new()
         .route(
-            "/System/Info/Public",
+            "/System/Info",
             get(|State(seen): State<Seen>, headers: HeaderMap| async move {
-                seen.record("/System/Info/Public", &headers);
+                seen.record("/System/Info", &headers);
                 axum::Json(serde_json::json!({
                     "ServerName": "Basement Jellyfin",
                     "Version": "10.9.11"
@@ -207,9 +207,9 @@ async fn plex_reads_xml_rather_than_json() {
     let seen = Seen::default();
     let router = Router::new()
         .route(
-            "/identity",
+            "/",
             get(|State(seen): State<Seen>, headers: HeaderMap| async move {
-                seen.record("/identity", &headers);
+                seen.record("/", &headers);
                 (
                     [("content-type", "application/xml")],
                     r#"<MediaContainer machineIdentifier="abc123" version="1.40.0"/>"#,
@@ -251,7 +251,7 @@ async fn plex_reads_xml_rather_than_json() {
 
     // Plex uses its own token header rather than the Emby one.
     assert_eq!(
-        seen.header_for("/identity", "x-plex-token").as_deref(),
+        seen.header_for("/", "x-plex-token").as_deref(),
         Some("token-123")
     );
     server.abort();
@@ -300,7 +300,7 @@ async fn emby_keeps_its_legacy_token_headers() {
 #[tokio::test]
 async fn an_unauthorized_response_is_reported_rather_than_parsed() {
     let router = Router::new().route(
-        "/System/Info/Public",
+        "/System/Info",
         get(|| async { (StatusCode::UNAUTHORIZED, "nope").into_response() }),
     );
     let (base, server) = start_stub(router).await;
@@ -321,7 +321,7 @@ async fn an_unauthorized_response_is_reported_rather_than_parsed() {
 #[tokio::test]
 async fn a_malformed_body_is_reported_as_an_invalid_response() {
     let router = Router::new().route(
-        "/System/Info/Public",
+        "/System/Info",
         get(|| async { ([("content-type", "application/json")], "{ not json") }),
     );
     let (base, server) = start_stub(router).await;
@@ -335,6 +335,69 @@ async fn a_malformed_body_is_reported_as_an_invalid_response() {
         .expect_err("invalid body");
 
     assert!(error.to_string().contains("invalid response"), "{error}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_connection_fails_when_the_server_rejects_the_key() {
+    let has = |headers: &HeaderMap, name: &str, expected: &str| {
+        headers.get(name).and_then(|value| value.to_str().ok()) == Some(expected)
+    };
+    // The public endpoints answer anyone, as on the real servers.
+    let router = Router::new()
+        .route(
+            "/System/Info/Public",
+            get(|| async { axum::Json(serde_json::json!({"ServerName": "Open"})) }),
+        )
+        .route(
+            "/System/Info",
+            get(move |headers: HeaderMap| async move {
+                if has(&headers, "authorization", "MediaBrowser Token=\"token-123\"")
+                    || has(&headers, "x-emby-token", "token-123")
+                {
+                    axum::Json(serde_json::json!({"ServerName": "Private"})).into_response()
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        )
+        .route(
+            "/identity",
+            get(|| async { r#"<MediaContainer machineIdentifier="open"/>"# }),
+        )
+        .route(
+            "/",
+            get(move |headers: HeaderMap| async move {
+                if has(&headers, "x-plex-token", "token-123") {
+                    r#"<MediaContainer machineIdentifier="private"><Directory key="library"/></MediaContainer>"#
+                        .into_response()
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        );
+    let (base, server) = start_stub(router).await;
+    let client = MediaServerDiscoveryClient::new();
+
+    for (kind, name) in [
+        (MediaServerKind::Jellyfin, "Private"),
+        (MediaServerKind::Emby, "Private"),
+        (MediaServerKind::Plex, "private"),
+    ] {
+        let mut config = config(kind, &base);
+        let info = client
+            .test_connection(&config, CancellationToken::new())
+            .await
+            .expect("accepted key");
+        assert_eq!(info.server_name.as_deref(), Some(name));
+
+        config.api_key = SecretString::new("wrong");
+        let error = client
+            .test_connection(&config, CancellationToken::new())
+            .await
+            .expect_err("rejected key");
+        assert!(error.to_string().contains("401"), "{kind}: {error}");
+    }
     server.abort();
 }
 

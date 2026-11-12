@@ -219,11 +219,10 @@ impl MediaServerClient for MediaServerDiscoveryClient {
         server: &MediaServerConfig,
         cancellation: CancellationToken,
     ) -> Result<ConnectionInfo, MediaServerError> {
+        // System/Info/Public and Plex's identity answer without a credential.
         match server.kind {
             MediaServerKind::Emby | MediaServerKind::Jellyfin => {
-                let response = self
-                    .get(server, "System/Info/Public", &cancellation)
-                    .await?;
+                let response = self.get(server, "System/Info", &cancellation).await?;
                 let document: Value = response
                     .json()
                     .await
@@ -235,7 +234,7 @@ impl MediaServerClient for MediaServerDiscoveryClient {
                 })
             }
             MediaServerKind::Plex => {
-                let response = self.get(server, "identity", &cancellation).await?;
+                let response = self.get(server, "", &cancellation).await?;
                 let xml = response
                     .text()
                     .await
