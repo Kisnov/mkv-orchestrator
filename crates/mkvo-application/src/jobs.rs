@@ -171,6 +171,7 @@ impl JobSupervisor {
         };
         let (events, _) = broadcast::channel(256);
         let live = Arc::new(LiveJob {
+            id,
             correlation_id,
             snapshot: Mutex::new(snapshot.clone()),
             cancel: CancellationToken::new(),
@@ -209,82 +210,63 @@ impl JobSupervisor {
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: Future<Output = ApplicationResult<JobCompletion>> + Send + 'static,
     {
-        let id = live.snapshot.lock().await.id;
-        Arc::clone(&self)
+        let id = live.id;
+        // A terminal state the repository refused is only readable from memory.
+        if Arc::clone(&self)
             .run_to_completion(live, resources, task)
-            .await;
+            .await
+            .is_err()
+        {
+            return;
+        }
         tokio::time::sleep(self.completed_job_retention).await;
         self.live.write().await.remove(&id);
     }
 
+    /// Runs the job to a terminal state. An error means that state could not
+    /// be written to the repository.
     async fn run_to_completion<F, Fut>(
         self: Arc<Self>,
         live: Arc<LiveJob>,
         resources: Vec<ResourceClaim>,
         task: F,
-    ) where
+    ) -> ApplicationResult<()>
+    where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: Future<Output = ApplicationResult<JobCompletion>> + Send + 'static,
     {
         if !resources.is_empty()
-            && live
-                .transition(JobStatus::WaitingForResources, None)
-                .await
-                .is_err()
+            && let Err(error) = live.transition(JobStatus::WaitingForResources).await
         {
-            return;
+            return live.finish_unstarted(error).await;
         }
 
         let lease = match self.leases.acquire(&resources, live.cancel.clone()).await {
             Ok(lease) => lease,
             Err(ApplicationError::Canceled) => {
-                let _ = live
+                return live
                     .finish_canceled("Canceled before resources became available")
                     .await;
-                return;
             }
-            Err(error) => {
-                let _ = live.finish_failed(error.to_string()).await;
-                return;
-            }
+            Err(error) => return live.finish_failed(error.to_string()).await,
         };
 
-        if live.cancel.is_cancelled() {
-            let _ = live.finish_canceled("Canceled before execution").await;
-            drop(lease);
-            return;
-        }
-        if live.transition(JobStatus::Running, None).await.is_err() {
-            drop(lease);
-            return;
+        if let Err(error) = live.transition(JobStatus::Running).await {
+            return live.finish_unstarted(error).await;
         }
 
         let context = JobContext {
             live: Arc::clone(&live),
         };
-        let result = task(context).await;
-        match result {
-            Ok(completion) if live.cancel.is_cancelled() => {
-                let _ = live
-                    .finish_canceled(
-                        completion
-                            .message
-                            .as_deref()
-                            .unwrap_or("Canceled during execution"),
-                    )
-                    .await;
-            }
-            Ok(completion) => {
-                let _ = live.finish_completed(completion).await;
-            }
-            Err(ApplicationError::Canceled) => {
-                let _ = live.finish_canceled("Canceled").await;
-            }
-            Err(error) => {
-                let _ = live.finish_failed(error.to_string()).await;
-            }
-        }
+        // Spawned so a panic in the task is seen here instead of leaving the
+        // job running forever.
+        let outcome = match tokio::spawn(async move { task(context).await }).await {
+            Ok(outcome) => outcome,
+            Err(error) => Err(ApplicationError::Internal(format!("job {error}"))),
+        };
+        let finished = live.finish(outcome).await;
         drop(lease);
+        finished
     }
 
     pub async fn get(&self, id: JobId) -> ApplicationResult<Option<JobSnapshot>> {
@@ -309,12 +291,7 @@ impl JobSupervisor {
             .get(&id)
             .cloned()
             .ok_or_else(|| ApplicationError::NotFound(format!("job {id}")))?;
-        let snapshot = live.snapshot.lock().await.clone();
-        if snapshot.status.is_terminal() {
-            return Ok(snapshot);
-        }
-        live.cancel.cancel();
-        live.transition(JobStatus::Canceling, None).await
+        live.request_cancel().await
     }
 
     pub async fn subscribe(
@@ -331,6 +308,7 @@ impl JobSupervisor {
 }
 
 struct LiveJob {
+    id: JobId,
     /// Duplicated from the snapshot so a running task can correlate its log
     /// entries without taking the snapshot lock on every write.
     correlation_id: CorrelationId,
@@ -343,112 +321,157 @@ struct LiveJob {
 }
 
 impl LiveJob {
-    async fn transition(
-        &self,
-        status: JobStatus,
-        error: Option<String>,
-    ) -> ApplicationResult<JobSnapshot> {
+    async fn transition(&self, status: JobStatus) -> ApplicationResult<()> {
         let now = Utc::now();
-        let snapshot = self
-            .update(|snapshot| {
-                if !snapshot.status.can_transition_to(status) {
-                    return Err(ApplicationError::Conflict(format!(
-                        "invalid job transition {:?} -> {status:?}",
-                        snapshot.status
-                    )));
-                }
-                snapshot.status = status;
-                if status == JobStatus::Running && snapshot.started_utc.is_none() {
-                    snapshot.started_utc = Some(now);
-                }
-                if status.is_terminal() {
-                    snapshot.completed_utc = Some(now);
-                    snapshot.current_file.clear();
-                    snapshot.current_file_percent = 0;
-                }
-                if error.is_some() {
-                    snapshot.error = error;
-                }
-                Ok(())
-            })
-            .await?;
-        self.publish(JobEvent::StatusChanged { status }).await?;
-        Ok(snapshot)
+        self.update(|snapshot| {
+            if !snapshot.status.can_transition_to(status) {
+                return Err(ApplicationError::Conflict(format!(
+                    "invalid job transition {:?} -> {status:?}",
+                    snapshot.status
+                )));
+            }
+            snapshot.status = status;
+            if status == JobStatus::Running && snapshot.started_utc.is_none() {
+                snapshot.started_utc = Some(now);
+            }
+            Ok(())
+        })
+        .await?;
+        self.publish(JobEvent::StatusChanged { status }).await
     }
 
     async fn update(
         &self,
         mutate: impl FnOnce(&mut JobSnapshot) -> ApplicationResult<()>,
     ) -> ApplicationResult<JobSnapshot> {
-        let snapshot = {
+        {
             let mut snapshot = self.snapshot.lock().await;
             mutate(&mut snapshot)?;
             snapshot.revision = snapshot.revision.saturating_add(1);
-            snapshot.clone()
-        };
+        }
+        self.persist().await
+    }
+
+    async fn persist(&self) -> ApplicationResult<JobSnapshot> {
+        let snapshot = self.snapshot.lock().await.clone();
         self.repository.update(&snapshot).await?;
         Ok(snapshot)
     }
 
-    async fn publish(&self, event: JobEvent) -> ApplicationResult<()> {
-        let snapshot = self.snapshot.lock().await;
-        let envelope = JobEventEnvelope {
-            job_id: snapshot.id,
-            correlation_id: snapshot.correlation_id,
+    fn envelope(&self, event: JobEvent) -> JobEventEnvelope {
+        JobEventEnvelope {
+            job_id: self.id,
+            correlation_id: self.correlation_id,
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
             emitted_utc: Utc::now(),
             event,
-        };
-        drop(snapshot);
+        }
+    }
+
+    async fn publish(&self, event: JobEvent) -> ApplicationResult<()> {
+        let envelope = self.envelope(event);
         self.repository.append_event(&envelope).await?;
         let _ = self.events.send(envelope);
         Ok(())
     }
 
-    async fn finish_completed(&self, completion: JobCompletion) -> ApplicationResult<JobSnapshot> {
-        let result_for_event = completion.result.clone();
-        let snapshot = self
-            .update(|snapshot| {
-                if !snapshot.status.can_transition_to(JobStatus::Completed) {
-                    return Err(ApplicationError::Conflict(format!(
-                        "cannot complete job in {:?}",
-                        snapshot.status
-                    )));
-                }
-                snapshot.status = JobStatus::Completed;
-                snapshot.completed_utc = Some(Utc::now());
-                snapshot.current_file.clear();
-                snapshot.current_file_percent = 0;
-                snapshot.result = completion.result;
-                if let Some(message) = completion.message {
-                    snapshot.lines.push(message);
-                }
-                Ok(())
-            })
-            .await?;
-        self.publish(JobEvent::Completed {
-            summary: snapshot.summary(),
-            result: result_for_event,
+    /// Cancel under the snapshot lock, where the runner also decides how the
+    /// job ends, so neither can act on a status the other is about to change.
+    async fn request_cancel(&self) -> ApplicationResult<JobSnapshot> {
+        {
+            let mut snapshot = self.snapshot.lock().await;
+            if snapshot.status.is_terminal() {
+                return Ok(snapshot.clone());
+            }
+            self.cancel.cancel();
+            snapshot.status = JobStatus::Canceling;
+            snapshot.revision = snapshot.revision.saturating_add(1);
+        }
+        let snapshot = self.persist().await?;
+        self.publish(JobEvent::StatusChanged {
+            status: JobStatus::Canceling,
         })
         .await?;
         Ok(snapshot)
     }
 
-    async fn finish_failed(&self, message: String) -> ApplicationResult<JobSnapshot> {
-        let snapshot = self
-            .transition(JobStatus::Failed, Some(message.clone()))
-            .await?;
-        self.publish(JobEvent::Failed { message }).await?;
-        Ok(snapshot)
+    /// Reach a terminal state. Subscribers are told even when the repository
+    /// write fails; that error is returned so the job can stay in memory.
+    async fn terminate(
+        &self,
+        apply: impl FnOnce(&mut JobSnapshot) -> JobEvent,
+    ) -> ApplicationResult<()> {
+        let event = {
+            let mut snapshot = self.snapshot.lock().await;
+            let event = apply(&mut snapshot);
+            snapshot.completed_utc = Some(Utc::now());
+            snapshot.current_file.clear();
+            snapshot.current_file_percent = 0;
+            snapshot.revision = snapshot.revision.saturating_add(1);
+            event
+        };
+        let persisted = self.persist().await.map(drop);
+        let envelope = self.envelope(event);
+        let stored = self.repository.append_event(&envelope).await;
+        let _ = self.events.send(envelope);
+        persisted.and(stored.map_err(Into::into))
     }
 
-    async fn finish_canceled(&self, message: &str) -> ApplicationResult<JobSnapshot> {
-        let snapshot = self.transition(JobStatus::Canceled, None).await?;
-        self.publish(JobEvent::Canceled {
-            message: message.to_owned(),
+    async fn finish(&self, outcome: ApplicationResult<JobCompletion>) -> ApplicationResult<()> {
+        match outcome {
+            Ok(completion) => {
+                self.terminate(|snapshot| {
+                    // A cancel that arrived while the task was returning.
+                    if self.cancel.is_cancelled() {
+                        snapshot.status = JobStatus::Canceled;
+                        return JobEvent::Canceled {
+                            message: completion
+                                .message
+                                .unwrap_or_else(|| "Canceled during execution".to_owned()),
+                        };
+                    }
+                    snapshot.status = JobStatus::Completed;
+                    snapshot.result.clone_from(&completion.result);
+                    snapshot.lines.extend(completion.message);
+                    JobEvent::Completed {
+                        summary: snapshot.summary(),
+                        result: completion.result,
+                    }
+                })
+                .await
+            }
+            Err(ApplicationError::Canceled) => self.finish_canceled("Canceled").await,
+            Err(error) => self.finish_failed(error.to_string()).await,
+        }
+    }
+
+    /// The job could not move towards running: a cancel got there first, or
+    /// the repository refused the write.
+    async fn finish_unstarted(&self, error: ApplicationError) -> ApplicationResult<()> {
+        if self.cancel.is_cancelled() {
+            self.finish_canceled("Canceled before execution").await
+        } else {
+            self.finish_failed(error.to_string()).await
+        }
+    }
+
+    async fn finish_failed(&self, message: String) -> ApplicationResult<()> {
+        self.terminate(|snapshot| {
+            snapshot.status = JobStatus::Failed;
+            snapshot.error = Some(message.clone());
+            JobEvent::Failed { message }
         })
-        .await?;
-        Ok(snapshot)
+        .await
+    }
+
+    async fn finish_canceled(&self, message: &str) -> ApplicationResult<()> {
+        self.terminate(|snapshot| {
+            snapshot.status = JobStatus::Canceled;
+            JobEvent::Canceled {
+                message: message.to_owned(),
+            }
+        })
+        .await
     }
 }
 
@@ -886,6 +909,136 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("job did not reach canceled state");
+    }
+
+    async fn wait_for_status(supervisor: &JobSupervisor, id: JobId, status: JobStatus) {
+        for _ in 0..50 {
+            if supervisor.get(id).await.unwrap().unwrap().status == status {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = supervisor.get(id).await.unwrap().unwrap();
+        panic!("job stayed {:?} instead of {status:?}", snapshot.status);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_the_runner_starts_ends_canceled() {
+        let supervisor = JobSupervisor::in_memory();
+        let accepted = supervisor
+            .start(
+                spec("early-cancel", vec![ResourceClaim::read("library/show")]),
+                |_| async move { panic!("canceled task must not run") },
+            )
+            .await
+            .unwrap();
+        // The runner has not been polled yet, so it finds the job Canceling.
+        supervisor.cancel(accepted.id).await.unwrap();
+        wait_for_status(&supervisor, accepted.id, JobStatus::Canceled).await;
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_fails_the_job_and_frees_its_resources() {
+        let supervisor = JobSupervisor::in_memory();
+        let claim = vec![ResourceClaim::write("library/show")];
+        let accepted = supervisor
+            .start(spec("panic-key", claim.clone()), |_| async move {
+                panic!("probe exploded")
+            })
+            .await
+            .unwrap();
+        wait_for_status(&supervisor, accepted.id, JobStatus::Failed).await;
+        let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
+        assert!(snapshot.error.unwrap().contains("panicked"));
+
+        let next = supervisor
+            .start(spec("after-panic", claim), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        wait_for_status(&supervisor, next.id, JobStatus::Completed).await;
+    }
+
+    /// Counts snapshot writes and can refuse the terminal one.
+    #[derive(Default)]
+    struct ObservedRepository {
+        inner: InMemoryJobRepository,
+        updates: AtomicUsize,
+        refuse_terminal: bool,
+    }
+
+    #[async_trait]
+    impl JobRepository for ObservedRepository {
+        async fn insert(&self, snapshot: &JobSnapshot) -> Result<(), PortError> {
+            self.inner.insert(snapshot).await
+        }
+
+        async fn update(&self, snapshot: &JobSnapshot) -> Result<(), PortError> {
+            if self.refuse_terminal && snapshot.status.is_terminal() {
+                return Err(PortError::Other("disk full".to_owned()));
+            }
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            self.inner.update(snapshot).await
+        }
+
+        async fn get(&self, id: JobId) -> Result<Option<JobSnapshot>, PortError> {
+            self.inner.get(id).await
+        }
+
+        async fn find_by_idempotency(
+            &self,
+            key: &IdempotencyKey,
+        ) -> Result<Option<JobSnapshot>, PortError> {
+            self.inner.find_by_idempotency(key).await
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError> {
+            self.inner.list_recent(limit).await
+        }
+
+        async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError> {
+            self.inner.list_unfinished().await
+        }
+
+        async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
+            self.inner.append_event(event).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_terminal_state_is_still_announced_and_readable() {
+        let repository = Arc::new(ObservedRepository {
+            refuse_terminal: true,
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(
+            JobSupervisor::new(repository.clone())
+                .with_completed_job_retention(Duration::from_millis(5)),
+        );
+        let accepted = supervisor
+            .start(spec("unsaved-key", Vec::new()), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+
+        let announced = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let JobEvent::Completed { .. } = events.recv().await.unwrap().event {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(announced.is_ok(), "subscribers never saw the job finish");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::Running);
+        let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, JobStatus::Completed);
     }
 
     #[tokio::test]
