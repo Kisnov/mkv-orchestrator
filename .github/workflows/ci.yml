@@ -142,7 +142,7 @@ jobs:
         run: |
           mkdir -p config
           docker run -d --name mkvo-ci -p 8886:8080 \
-            -e MKVO_AUTH_USERNAME=mkvo-ci -e MKVO_AUTH_PASSWORD=mkvo-ci-password \
+            -e MKVO_AUTH_ENABLED=true -e MKVO_USERNAME=mkvo-ci -e MKVO_PASSWORD=mkvo-ci-password \
             -v "$PWD/media:/media" -v "$PWD/config:/config" mkvo:ci
       - name: Wait for the health check
         run: |
@@ -155,9 +155,15 @@ jobs:
           echo "container never became healthy"
           docker logs mkvo-ci
           exit 1
+      # The server only accepts a session cookie; HTTP basic auth returns 401.
+      - name: Sign in
+        run: |
+          curl -fsS -c cookies.txt -H 'Content-Type: application/json' \
+            -d '{"username":"mkvo-ci","password":"mkvo-ci-password"}' \
+            http://127.0.0.1:8886/api/auth/login
       - name: Every external tool resolves inside the container
         run: |
-          curl -fsS -u mkvo-ci:mkvo-ci-password http://127.0.0.1:8886/api/status > status.json
+          curl -fsS -b cookies.txt http://127.0.0.1:8886/api/status > status.json
           python3 - <<'PY'
           import json, sys
           tools = json.load(open("status.json"))["tools"]
@@ -168,11 +174,11 @@ jobs:
           PY
       - name: A scan of mounted media returns real tracks
         run: |
-          job=$(curl -fsS -u mkvo-ci:mkvo-ci-password -X POST http://127.0.0.1:8886/api/scans \
+          job=$(curl -fsS -b cookies.txt -X POST http://127.0.0.1:8886/api/scans \
             -H 'Content-Type: application/json' \
             -d '{"roots":["/media"],"recursive":true}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
           for _ in $(seq 1 30); do
-            curl -fsS -u mkvo-ci:mkvo-ci-password "http://127.0.0.1:8886/api/scans/$job" > scan.json
+            curl -fsS -b cookies.txt "http://127.0.0.1:8886/api/scans/$job" > scan.json
             status=$(python3 -c 'import json; print(json.load(open("scan.json"))["status"])')
             case "$status" in Completed|Failed|Canceled) break ;; esac
             sleep 2
