@@ -73,13 +73,13 @@ export function LogsPage() {
           <div className="flex items-center justify-between">
             <h2 className="text-base font-semibold">Recent Operations</h2>
             <div className="flex gap-2">
-              <button onClick={() => logs.refetch()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Refresh">
+              <button onClick={() => logs.refetch()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Refresh" aria-label="Refresh logs">
                 <RefreshCw size={15} />
               </button>
-              <button onClick={exportAllLogs} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Export all logs">
+              <button onClick={exportAllLogs} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Export all logs" aria-label="Export all logs">
                 <FileDown size={15} />
               </button>
-              <button onClick={() => setIsClearConfirmOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Clear">
+              <button onClick={() => setIsClearConfirmOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Clear" aria-label="Clear logs">
                 <Trash2 size={15} />
               </button>
             </div>

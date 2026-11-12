@@ -130,4 +130,14 @@ describe("Logs page", () => {
     await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear Logs" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("log store is read-only");
   });
+
+  it("names the icon-only buttons for assistive technology", async () => {
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] })
+    });
+
+    expect(await screen.findByTitle("Refresh")).toHaveAttribute("aria-label", "Refresh logs");
+    expect(screen.getByTitle("Export all logs")).toHaveAttribute("aria-label", "Export all logs");
+    expect(screen.getByTitle("Clear")).toHaveAttribute("aria-label", "Clear logs");
+  });
 });
