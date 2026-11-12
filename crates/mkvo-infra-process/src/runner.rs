@@ -11,6 +11,31 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 
+// Everything else, such as the server password and provider API keys, stays out of child tools.
+#[cfg(windows)]
+const INHERITED_ENVIRONMENT: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+];
+#[cfg(not(windows))]
+const INHERITED_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TZ",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputStream {
     Stdout,
@@ -133,6 +158,12 @@ impl ProcessRunner {
         let mut command = Command::new(&spec.executable);
         command
             .args(&spec.args)
+            .env_clear()
+            .envs(
+                INHERITED_ENVIRONMENT
+                    .iter()
+                    .filter_map(|name| Some((name, std::env::var_os(name)?))),
+            )
             // Media paths and mkvmerge's JSON diagnostics are UTF-8. The
             // Debian slim image may otherwise inherit a C locale, which can
             // truncate non-ASCII filenames such as "Bon Appétit".
@@ -289,6 +320,33 @@ mod tests {
 
         assert_eq!(spec.args.len(), 2);
         assert_eq!(spec.args[1], OsString::from("a file; rm -rf never.mkv"));
+    }
+
+    #[cfg(windows)]
+    fn shell(script: &str) -> ProcessSpec {
+        ProcessSpec::new(std::env::var_os("ComSpec").expect("ComSpec")).args(["/C", script])
+    }
+
+    #[cfg(not(windows))]
+    fn shell(script: &str) -> ProcessSpec {
+        ProcessSpec::new("/bin/sh").args(["-c", script])
+    }
+
+    #[tokio::test]
+    async fn child_tools_do_not_inherit_the_host_environment() {
+        // cargo exports this to the test process; it stands in for MKVO_* secrets.
+        assert!(std::env::var_os("CARGO_PKG_NAME").is_some());
+        let list_environment = if cfg!(windows) { "set" } else { "env" };
+
+        let output = ProcessRunner
+            .run(shell(list_environment), CancellationToken::new())
+            .await
+            .expect("run");
+
+        assert!(output.success());
+        assert!(!output.stdout.contains("CARGO_PKG_NAME"));
+        assert!(output.stdout.contains("LANG=C.UTF-8"));
+        assert!(output.stdout.to_ascii_uppercase().contains("PATH="));
     }
 
     #[test]
