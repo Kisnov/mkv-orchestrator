@@ -311,7 +311,21 @@ docker exec mkvo mkvo scan /media --json
 
 The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image.
 
-Build and run:
+CI publishes the image to GHCR from every commit on `main` whose CI run passed:
+
+```text
+ghcr.io/kisnov/mkv-orchestrator:latest
+ghcr.io/kisnov/mkv-orchestrator:sha-<short commit>
+```
+
+Run the published image:
+
+```powershell
+docker compose pull
+docker compose up -d
+```
+
+Or build and run from source:
 
 ```powershell
 docker compose up --build

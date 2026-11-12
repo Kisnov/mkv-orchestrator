@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>MKV Orchestrator</Name>
-  <Repository>ghcr.io/bamcel/mkv-orchestrator:latest</Repository>
-  <Registry>https://github.com/bamcel/mkv-orchestrator/pkgs/container/mkv-orchestrator</Registry>
+  <Repository>ghcr.io/kisnov/mkv-orchestrator:latest</Repository>
+  <Registry>https://github.com/Kisnov/mkv-orchestrator/pkgs/container/mkv-orchestrator</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
