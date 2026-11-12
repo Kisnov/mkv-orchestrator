@@ -36,6 +36,7 @@ COPY tools/ tools/
 # works without a second image.
 RUN cargo build --locked --release --package mkvo-server --package mkvo-cli
 
+# ffmpeg and mkvtoolnix are the versions Debian bookworm ships, not pinned ones.
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg mkvtoolnix ca-certificates curl gosu passwd libdbus-1-3 \

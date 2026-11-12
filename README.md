@@ -309,7 +309,7 @@ docker exec mkvo mkvo scan /media --json
 
 ## Docker Web Container
 
-The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image.
+The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image. Those are the versions Debian bookworm packages (currently MKVToolNix 74 and FFmpeg 5.1), not the latest upstream releases.
 
 CI publishes the image to GHCR from every commit on `main` whose CI run passed:
 
