@@ -264,10 +264,11 @@ impl MkvoRuntime {
             )
             .await?;
         let invocation = self.propedit_invocation(item).await?;
+        // mkvpropedit rewrites the file in place; a cancel waits for it rather than kill it mid-write.
         let execution = self
             .dependencies()
             .tool_executor
-            .execute(&invocation, context.cancellation_token())
+            .execute(&invocation, tokio_util::sync::CancellationToken::new())
             .await?;
         if let Some(warning) = tool_warning(&invocation.tool, &execution)? {
             context
@@ -304,7 +305,13 @@ impl MkvoRuntime {
 
 #[cfg(test)]
 mod execution_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use mkvo_application::{PortError, ToolExecutionResult, ToolExecutor};
     use mkvo_contracts::{JobSnapshot, JobStatus};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
 
     use super::super::remux_workflow::execution_tests::{Library, ScriptedTools, exited, library};
     use super::*;
@@ -356,6 +363,45 @@ mod execution_tests {
                 .iter()
                 .any(|line| line.contains("No attachment matched the spec"))
         );
+    }
+
+    /// An edit that stays in flight until released, and stops early if it is told to.
+    #[derive(Clone, Default)]
+    struct HeldEdit {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for HeldEdit {
+        async fn execute(
+            &self,
+            invocation: &ToolInvocation,
+            cancel: CancellationToken,
+        ) -> Result<ToolExecutionResult, PortError> {
+            self.started.notify_one();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(PortError::Canceled),
+                () = self.release.notified() => Ok(exited(invocation, 0, "Done.\n")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_lets_the_edit_in_flight_finish() {
+        let tools = HeldEdit::default();
+        let library = library(tools.clone());
+        let episode = library.media("Episode 01.mkv").await;
+
+        let id = start_title_edit(&library, vec![episode]).await;
+        tools.started.notified().await;
+        library.runtime.jobs().cancel(id).await.expect("cancel");
+        tools.release.notify_one();
+        let job = library.finished_job(id).await;
+
+        assert_eq!(job.status, JobStatus::Canceled);
+        assert_eq!((job.completed, job.failed), (1, 0));
     }
 
     #[tokio::test]
