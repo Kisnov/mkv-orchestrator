@@ -249,6 +249,16 @@ cargo test --workspace
 npm --prefix web test
 ```
 
+Run the other checks CI runs (formatting, lints, and drift in the generated TypeScript contracts):
+
+```powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --exclude mkvo-desktop -- -D warnings
+cargo run --locked --package mkvo-contract-gen -- --check
+```
+
+`.\scripts\verify.ps1` runs these together with the web build and the Rust tests.
+
 ## Command Line
 
 The `mkvo` binary drives the same runtime as the app, against whichever
