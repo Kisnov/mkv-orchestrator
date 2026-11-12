@@ -17,6 +17,8 @@ pub enum PortError {
     InvalidData(String),
     #[error("operation was canceled")]
     Canceled,
+    #[error("{0}")]
+    CredentialRejected(String),
     #[error("adapter failure: {0}")]
     Other(String),
 }
@@ -58,6 +60,8 @@ pub enum ApplicationError {
     Plan(#[from] PlanValidationError),
     #[error("{message}")]
     DependencyUnavailable { message: String, retryable: bool },
+    #[error("{0}")]
+    CredentialRejected(String),
     #[error("adapter failure: {0}")]
     AdapterFailure(String),
     #[error("internal error: {0}")]
@@ -88,6 +92,8 @@ impl ApplicationError {
             // Collapsing them all to `Internal` tells the user to report a bug
             // when they should be opening Settings.
             Self::DependencyUnavailable { .. } => ApiErrorCode::ProviderUnavailable,
+            // The service answered and refused the key: fix the key, do not wait.
+            Self::CredentialRejected(_) => ApiErrorCode::CredentialRejected,
             Self::AdapterFailure(_) | Self::Internal(_) => ApiErrorCode::Internal,
         };
         ApiError::new(code, self.to_string(), correlation_id).retryable(retryable)
@@ -104,6 +110,7 @@ impl From<PortError> for ApplicationError {
             PortError::Conflict(message) => Self::Conflict(message),
             PortError::InvalidData(message) => Self::InvalidRequest(message),
             PortError::Canceled => Self::Canceled,
+            PortError::CredentialRejected(message) => Self::CredentialRejected(message),
             PortError::Other(message) => Self::AdapterFailure(message),
         }
     }
@@ -123,6 +130,10 @@ mod tests {
             (
                 PortError::unavailable("AniDB credentials are not configured", false),
                 ApiErrorCode::ProviderUnavailable,
+            ),
+            (
+                PortError::CredentialRejected("Jellyfin returned HTTP 401".to_owned()),
+                ApiErrorCode::CredentialRejected,
             ),
             (
                 PortError::NotFound("plan".to_owned()),

@@ -157,6 +157,10 @@ fn server_port_error(error: MediaServerError) -> PortError {
         {
             PortError::unavailable(error.to_string(), true)
         }
+        MediaServerError::Status {
+            status: reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN,
+            ..
+        } => PortError::CredentialRejected(error.to_string()),
         MediaServerError::Status { .. } => PortError::unavailable(error.to_string(), false),
         error => PortError::InvalidData(error.to_string()),
     }
@@ -174,5 +178,32 @@ mod tests {
             MediaServerKind::Jellyfin
         );
         assert_eq!(local_kind(DomainServerKind::Plex), MediaServerKind::Plex);
+    }
+
+    #[test]
+    fn a_refused_key_is_not_reported_as_an_unavailable_server() {
+        let status = |status| MediaServerError::Status {
+            kind: MediaServerKind::Jellyfin,
+            status,
+            path: "Items/show-1/Images/Primary".to_owned(),
+        };
+        for refused in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            assert_eq!(
+                server_port_error(status(refused)),
+                PortError::CredentialRejected(format!(
+                    "Jellyfin returned HTTP {refused} for Items/show-1/Images/Primary"
+                ))
+            );
+        }
+        assert!(matches!(
+            server_port_error(status(reqwest::StatusCode::NOT_FOUND)),
+            PortError::Unavailable {
+                retryable: false,
+                ..
+            }
+        ));
     }
 }

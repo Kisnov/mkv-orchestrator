@@ -1,5 +1,7 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use mkvo_application::PortError;
+use mkvo_contracts::ApiErrorCode;
 
 impl MkvoRuntime {
     pub async fn get_library_catalog(
@@ -43,7 +45,9 @@ impl MkvoRuntime {
                 &server_paths,
                 CancellationToken::new(),
             )
-            .await?
+            .await;
+        let items = self
+            .credential_rejection(server, &connection, items)?
             .into_iter()
             .map(|item| LibraryCatalogItem {
                 id: item.id,
@@ -87,7 +91,8 @@ impl MkvoRuntime {
         let artwork = self
             .media_server_client(server.kind, &loaded.settings)
             .fetch_artwork(&connection, &request.item_id, CancellationToken::new())
-            .await?;
+            .await;
+        let artwork = self.credential_rejection(server, &connection, artwork)?;
         if !artwork
             .content_type
             .to_ascii_lowercase()
@@ -185,6 +190,36 @@ impl MkvoRuntime {
             base_url: server.server_url.clone(),
             credential,
         })
+    }
+
+    /// Reports a key the media server refused as its own error, naming the server.
+    fn credential_rejection<T>(
+        &self,
+        server: &MediaServerSettings,
+        connection: &MediaServerConnection,
+        result: Result<T, PortError>,
+    ) -> RuntimeResult<T> {
+        match result {
+            Err(PortError::CredentialRejected(detail)) => {
+                tracing::warn!(
+                    server = %server.name,
+                    server_id = %server.id,
+                    kind = server_kind_name(server.kind),
+                    url = %connection.base_url,
+                    key_length = connection.credential.trim().len(),
+                    detail = %detail,
+                    "media server rejected the stored credential"
+                );
+                Err(RuntimeError::new(
+                    ApiErrorCode::CredentialRejected,
+                    format!(
+                        "{} rejected the stored API key ({detail}). Enter the key again in Settings.",
+                        server.name
+                    ),
+                ))
+            }
+            other => Ok(other?),
+        }
     }
 
     pub async fn test_media_server_connection(
@@ -292,10 +327,11 @@ impl MkvoRuntime {
             base_url: server.server_url.clone(),
             credential,
         };
-        let mut libraries = self
+        let libraries = self
             .media_server_client(server.kind, &settings)
             .discover_libraries(&connection, CancellationToken::new())
-            .await?;
+            .await;
+        let mut libraries = self.credential_rejection(&server, &connection, libraries)?;
         resolve_media_server_local_paths(&mut libraries, &self.inner.config.media_root);
         settings.media_servers[index]
             .libraries
@@ -655,6 +691,43 @@ mod media_server_credential_tests {
             .await
             .expect("artwork");
         assert_eq!(artwork.content_type, "image/jpeg");
+    }
+
+    fn artwork_request(server: &WebMediaServer) -> LibraryArtworkRequest {
+        LibraryArtworkRequest {
+            server_id: server.id.clone(),
+            item_id: "show-1".to_owned(),
+        }
+    }
+
+    /// A refused key is the user's to fix, so it must not look like an outage,
+    /// and it has to say which server and which endpoint refused it.
+    #[tokio::test]
+    async fn a_refused_key_names_the_server_and_the_endpoint() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("wrong")).await;
+
+        let error = host
+            .runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect_err("refused key");
+
+        assert_eq!(error.code, ApiErrorCode::CredentialRejected);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .starts_with("Home rejected the stored API key"),
+            "{error}"
+        );
+        assert!(
+            error
+                .message
+                .contains("HTTP 401 Unauthorized for Items/show-1/Images/Primary"),
+            "{error}"
+        );
     }
 }
 
