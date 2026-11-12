@@ -408,7 +408,7 @@ export function SettingsPage() {
         name: server.name,
         type: server.type,
         serverUrl: server.serverUrl,
-        apiKey: server.apiKey
+        apiKey: server.apiKey || undefined
       });
       setSettingsStatus(result.status);
     } catch (error) {
@@ -970,13 +970,13 @@ export function SettingsPage() {
                         <label className="block min-w-0">
                           <span className="text-[0.6875rem] font-semibold text-muted">Type</span>
                             <select
-                              value={server.type}
+                              value={server.type.toLowerCase()}
                               onChange={(event) => updateMediaServer(server.id, { type: event.target.value })}
                             className="mt-1 h-9 w-full rounded-md border border-border bg-card px-3 text-sm text-text outline-none focus:border-accent"
                             >
-                              <option value="Emby">Emby</option>
-                              <option value="Jellyfin">Jellyfin</option>
-                              <option value="Plex">Plex</option>
+                              <option value="emby">Emby</option>
+                              <option value="jellyfin">Jellyfin</option>
+                              <option value="plex">Plex</option>
                             </select>
                         </label>
                         <label className="block min-w-0">
