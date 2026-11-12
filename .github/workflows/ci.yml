@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -209,3 +210,13 @@ jobs:
       - name: Container logs
         if: always()
         run: docker logs mkvo-ci || true
+
+  publish:
+    # The image is only published from a commit whose whole CI run is green.
+    name: Publish Docker image
+    if: github.event_name == 'push'
+    needs: [web, rust-core, tauri-windows, tauri-cross-platform, docker]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
