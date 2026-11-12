@@ -108,6 +108,16 @@ impl SqliteStore {
             .collect()
     }
 
+    pub fn count_job_events(&self, job_id: &str) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM job_events WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StoreError::NumericOverflow)
+    }
+
     pub fn find_job_by_idempotency_key(&self, key: &str) -> StoreResult<Option<StoredJob>> {
         self.query_job("idempotency_key", key)
     }

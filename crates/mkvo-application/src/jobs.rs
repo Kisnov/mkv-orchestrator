@@ -519,6 +519,11 @@ impl JobContext {
     }
 
     #[must_use]
+    pub fn job_id(&self) -> JobId {
+        self.live.id
+    }
+
+    #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.live.cancel.clone()
     }
