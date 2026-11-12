@@ -7,7 +7,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM rust:1.88-bookworm AS rust-build
+FROM rust:1.88-bookworm AS rust-base
 WORKDIR /src
 # libdbus is needed to build, not to work: the keyring crate reaches the Linux
 # secret service over D-Bus. A container has no session bus, so the store
@@ -16,6 +16,17 @@ WORKDIR /src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev libdbus-1-dev \
     && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+# The recipe only changes when a manifest or Cargo.lock does.
+FROM rust-base AS rust-plan
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM rust-base AS rust-build
+COPY --from=rust-plan /src/recipe.json recipe.json
+# Dependencies build in their own layer, so a source edit does not recompile them.
+RUN cargo chef cook --locked --release --package mkvo-server --package mkvo-cli --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY .cargo/ .cargo/
 COPY crates/ crates/
