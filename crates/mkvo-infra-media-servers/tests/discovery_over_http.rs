@@ -9,6 +9,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use axum::{
@@ -22,6 +23,7 @@ use mkvo_infra_media_servers::{
     DiscoveredItem, MediaServerClient, MediaServerConfig, MediaServerDiscoveryClient,
     MediaServerKind, MediaServerPathMapping, SecretString,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default)]
@@ -470,4 +472,66 @@ async fn paging_follows_the_total_when_the_server_returns_smaller_pages() {
 
     assert_eq!(discover_catalog(&catalog).await.len(), 450);
     assert_eq!(catalog.requests(), [(0, 500), (200, 500), (400, 500)]);
+}
+
+/// Answers one request with `head`, then either streams zeroes forever or stalls.
+async fn start_poster_stub(
+    head: &'static str,
+    endless_body: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub server");
+    let address = listener.local_addr().expect("stub address");
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let _ = socket.write_all(head.as_bytes()).await;
+        // One 64 KiB chunk in chunked transfer encoding.
+        let mut chunk = b"10000\r\n".to_vec();
+        chunk.resize(chunk.len() + 0x10000, 0);
+        chunk.extend_from_slice(b"\r\n");
+        while endless_body && socket.write_all(&chunk).await.is_ok() {}
+        std::future::pending::<()>().await;
+    });
+    (format!("http://{address}"), handle)
+}
+
+async fn oversized_poster_error(head: &'static str, endless_body: bool) -> String {
+    let (base, server) = start_poster_stub(head, endless_body).await;
+    let client = MediaServerDiscoveryClient::new();
+    let config = config(MediaServerKind::Jellyfin, &base);
+    // Half the client's own 20 s timeout, which is what used to end these downloads.
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.fetch_artwork(&config, "show-1", CancellationToken::new()),
+    )
+    .await
+    .expect("an oversized poster must be rejected before it is downloaded");
+    server.abort();
+    result.expect_err("oversized poster").to_string()
+}
+
+#[tokio::test]
+async fn an_oversized_poster_is_rejected_while_it_streams() {
+    let error = oversized_poster_error(
+        "HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ntransfer-encoding: chunked\r\n\r\n",
+        true,
+    )
+    .await;
+
+    assert!(error.contains("10 MiB limit"), "{error}");
+}
+
+#[tokio::test]
+async fn an_oversized_poster_is_rejected_from_its_content_length() {
+    // One byte over the limit is announced and the body never arrives.
+    let error = oversized_poster_error(
+        "HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ncontent-length: 10485761\r\n\r\n",
+        false,
+    )
+    .await;
+
+    assert!(error.contains("10 MiB limit"), "{error}");
 }

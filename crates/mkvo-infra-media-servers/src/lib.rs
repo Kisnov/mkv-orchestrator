@@ -159,6 +159,7 @@ pub trait MediaServerClient: Send + Sync {
 }
 
 const EMBY_PAGE_SIZE: usize = 500;
+const MAX_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MediaServerDiscoveryClient {
@@ -392,23 +393,33 @@ impl MediaServerClient for MediaServerDiscoveryClient {
             }
             MediaServerKind::Plex => format!("library/metadata/{item_id}/thumb"),
         };
-        let response = self.get(server, &relative, &cancellation).await?;
+        let mut response = self.get(server, &relative, &cancellation).await?;
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_owned();
-        let bytes = response
-            .bytes()
+        let too_large = || MediaServerError::InvalidResponse {
+            kind: server.kind,
+            message: "poster image exceeded the 10 MiB limit".to_owned(),
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ARTWORK_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
             .map_err(|error| invalid(server.kind, error))?
-            .to_vec();
-        if bytes.len() > 10 * 1024 * 1024 {
-            return Err(MediaServerError::InvalidResponse {
-                kind: server.kind,
-                message: "poster image exceeded the 10 MiB limit".to_owned(),
-            });
+        {
+            if bytes.len() + chunk.len() > MAX_ARTWORK_BYTES {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
         }
         Ok(ArtworkData {
             content_type,
