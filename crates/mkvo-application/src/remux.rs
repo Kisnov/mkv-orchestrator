@@ -112,9 +112,9 @@ impl RemuxPlanner {
         if request.options.preserve_source
             && matches!(request.mode, RemuxMode::Remux | RemuxMode::MuxSubtitles)
             && (output_suffix.is_empty()
-                || !output_suffix
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')))
+                || !output_suffix.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+                }))
         {
             return Err(ApplicationError::InvalidRequest(
                 "remux output suffix must contain only letters, numbers, dots, dashes, or underscores"
@@ -137,9 +137,7 @@ impl RemuxPlanner {
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
                     .to_owned(),
-                RemuxMode::Remux | RemuxMode::MuxSubtitles
-                    if request.options.preserve_source =>
-                {
+                RemuxMode::Remux | RemuxMode::MuxSubtitles if request.options.preserve_source => {
                     preserved_output_for(file, output_suffix)
                 }
                 RemuxMode::Remux | RemuxMode::MuxSubtitles => file.path.clone(),
@@ -235,9 +233,7 @@ impl RemuxPlanner {
                     Some(final_output.clone()),
                 ));
             }
-            if request.mode == RemuxMode::Remux
-                && selected_track_ids.len() == file.tracks.len()
-            {
+            if request.mode == RemuxMode::Remux && selected_track_ids.len() == file.tracks.len() {
                 conflicts.push(PlanConflict::informational(
                     PlanConflictKind::NoChange,
                     "Requested filters do not remove any tracks from this file",
@@ -311,29 +307,31 @@ impl RemuxPlanner {
             .items
             .iter()
             .flat_map(|item| {
-                std::iter::once(if same_path(&item.source, &item.final_output)
-                    || item.delete_source_after_success
-                {
-                    ResourceClaim::write(item.source.clone())
-                } else {
-                    ResourceClaim::read(item.source.clone())
-                })
-                    .chain(std::iter::once(ResourceClaim::write(
-                        item.temporary_output.clone(),
-                    )))
-                    .chain(std::iter::once(ResourceClaim::write(
-                        item.final_output.clone(),
-                    )))
-                    .chain(
-                        item.external_subtitles
-                            .iter()
-                            .map(|subtitle| ResourceClaim::read(subtitle.path.clone())),
-                    )
-                    .chain(
-                        item.extract_tracks
-                            .iter()
-                            .map(|track| ResourceClaim::write(track.output.clone())),
-                    )
+                std::iter::once(
+                    if same_path(&item.source, &item.final_output)
+                        || item.delete_source_after_success
+                    {
+                        ResourceClaim::write(item.source.clone())
+                    } else {
+                        ResourceClaim::read(item.source.clone())
+                    },
+                )
+                .chain(std::iter::once(ResourceClaim::write(
+                    item.temporary_output.clone(),
+                )))
+                .chain(std::iter::once(ResourceClaim::write(
+                    item.final_output.clone(),
+                )))
+                .chain(
+                    item.external_subtitles
+                        .iter()
+                        .map(|subtitle| ResourceClaim::read(subtitle.path.clone())),
+                )
+                .chain(
+                    item.extract_tracks
+                        .iter()
+                        .map(|track| ResourceClaim::write(track.output.clone())),
+                )
             })
             .collect();
         let context = PlanContext {
@@ -528,10 +526,21 @@ mod tests {
 
         let plan = RemuxPlanner.build_plan(request).unwrap();
         let item = &plan.payload.items[0];
-        assert_eq!(item.final_output, PathBuf::from("show/Episode 01.filtered.mkv"));
+        assert_eq!(
+            item.final_output,
+            PathBuf::from("show/Episode 01.filtered.mkv")
+        );
         assert!(item.can_apply());
-        assert!(plan.context.resources.contains(&ResourceClaim::read("show/Episode 01.mkv")));
-        assert!(plan.context.resources.contains(&ResourceClaim::write("show/Episode 01.filtered.mkv")));
+        assert!(
+            plan.context
+                .resources
+                .contains(&ResourceClaim::read("show/Episode 01.mkv"))
+        );
+        assert!(
+            plan.context
+                .resources
+                .contains(&ResourceClaim::write("show/Episode 01.filtered.mkv"))
+        );
     }
 
     #[test]
@@ -558,10 +567,12 @@ mod tests {
 
         let plan = RemuxPlanner.build_plan(request).unwrap();
         assert!(!plan.payload.items[0].can_apply());
-        assert!(plan.payload.items[0]
-            .conflicts
-            .iter()
-            .any(|conflict| conflict.kind == PlanConflictKind::ExistingTarget));
+        assert!(
+            plan.payload.items[0]
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.kind == PlanConflictKind::ExistingTarget)
+        );
     }
 
     #[test]

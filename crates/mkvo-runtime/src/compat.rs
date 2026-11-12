@@ -6,9 +6,9 @@
 
 use chrono::{DateTime, Utc};
 use mkvo_contracts::{
-    JobSnapshot, JobStatus, ManualSubtitleSelection, MediaFileRow, MuxActionRow,
-    PropEditActionRow, PropEditNoChangeRow, PropEditSkippedRow, PropEditTrackConfigRow,
-    RenamePreviewRow, RenameScopeRow, TitleEditMode,
+    JobSnapshot, JobStatus, ManualSubtitleSelection, MediaFileRow, MuxActionRow, PropEditActionRow,
+    PropEditNoChangeRow, PropEditSkippedRow, PropEditTrackConfigRow, RenamePreviewRow,
+    RenameScopeRow, TitleEditMode,
 };
 use mkvo_domain::{IdempotencyKey, PlanId};
 use serde::{Deserialize, Serialize};
@@ -203,10 +203,18 @@ fn default_remux_output_suffix() -> String {
     ".remuxed".to_owned()
 }
 
-fn default_subtitle_primary_color() -> String { "#FFFFFF".to_owned() }
-fn default_subtitle_outline_color() -> String { "#000000".to_owned() }
-fn default_subtitle_outline_size() -> String { "2".to_owned() }
-fn default_subtitle_font_size() -> String { "48".to_owned() }
+fn default_subtitle_primary_color() -> String {
+    "#FFFFFF".to_owned()
+}
+fn default_subtitle_outline_color() -> String {
+    "#000000".to_owned()
+}
+fn default_subtitle_outline_size() -> String {
+    "2".to_owned()
+}
+fn default_subtitle_font_size() -> String {
+    "48".to_owned()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

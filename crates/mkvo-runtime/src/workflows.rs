@@ -6,8 +6,7 @@ use futures::{StreamExt, stream};
 use mkvo_application::{
     ApplicationError, FileAccessState, JobSpec, LibraryAuditService, PropertyEditPlanRequest,
     PropertyEditPlanner, RemuxOptions, RemuxPlanRequest, RemuxPlanner, RenamePlanRequest,
-    RenamePlanner, RequiredAccess, TextEdit, ToolInvocation, TrackEditIntent,
-    match_by_list_order,
+    RenamePlanner, RequiredAccess, TextEdit, ToolInvocation, TrackEditIntent, match_by_list_order,
 };
 use mkvo_contracts::{
     JobCompletion, JobKind, JobLogLevel, LibraryAuditResponse, LibraryAuditRow,
@@ -735,8 +734,14 @@ mod tests {
             file.tracks.push(track);
         }
         let files = [file];
-        assert_eq!(build_extractions(&files, "all", false)[&files[0].path].len(), 3);
-        assert_eq!(build_extractions(&files, "eng", false)[&files[0].path].len(), 1);
+        assert_eq!(
+            build_extractions(&files, "all", false)[&files[0].path].len(),
+            3
+        );
+        assert_eq!(
+            build_extractions(&files, "eng", false)[&files[0].path].len(),
+            1
+        );
     }
 
     fn mux_request(plan: Option<&RemuxPlan>) -> MuxPreviewRequest {
@@ -848,7 +853,10 @@ mod tests {
         assert_eq!(edits[0].default, Some(true));
         assert_eq!(edits[0].forced, None);
         request.audio_tracks[0].name_from_channels = Some(true);
-        assert_eq!(build_track_edits(&request)[0].name, TextEdit::FromTrackChannels);
+        assert_eq!(
+            build_track_edits(&request)[0].name,
+            TextEdit::FromTrackChannels
+        );
         request.audio_tracks[0].name_from_channels = None;
         request.audio_tracks[0].name_from_codec_channels = Some(true);
         assert_eq!(

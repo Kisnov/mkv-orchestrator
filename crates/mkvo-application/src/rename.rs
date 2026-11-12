@@ -614,11 +614,15 @@ mod tests {
 
         assert_eq!(matched.len(), 74);
         assert_eq!(
-            matched.first().map(|item| (item.episode.season, item.episode.episode)),
+            matched
+                .first()
+                .map(|item| (item.episode.season, item.episode.episode)),
             Some((1, 1))
         );
         assert_eq!(
-            matched.last().map(|item| (item.episode.season, item.episode.episode)),
+            matched
+                .last()
+                .map(|item| (item.episode.season, item.episode.episode)),
             Some((5, 15))
         );
     }

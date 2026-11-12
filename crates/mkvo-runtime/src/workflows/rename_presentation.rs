@@ -1,9 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use mkvo_application::{
-    parse_episode_number, parse_season_episode, try_match_absolute_episode,
-};
+use mkvo_application::{parse_episode_number, parse_season_episode, try_match_absolute_episode};
 use mkvo_contracts::RenameScopeRow;
 use mkvo_domain::{EpisodeMetadata, ExternalSubtitle, RemuxMode, RemuxPlanItem, TrackKind};
 
@@ -131,15 +129,28 @@ pub(super) fn remux_description(item: &RemuxPlanItem) -> String {
         ),
         RemuxMode::ConvertToMkv => "Losslessly copy streams into MKV".to_owned(),
         RemuxMode::Remux if !item.subtitle_transforms.is_empty() => {
-            let converted = item.subtitle_transforms.iter().filter(|track| track.source_format.eq_ignore_ascii_case("srt")).count();
+            let converted = item
+                .subtitle_transforms
+                .iter()
+                .filter(|track| track.source_format.eq_ignore_ascii_case("srt"))
+                .count();
             if converted > 0 {
-                format!("Format {} text subtitle track(s), converting {converted} SRT track(s) to ASS", item.subtitle_transforms.len())
+                format!(
+                    "Format {} text subtitle track(s), converting {converted} SRT track(s) to ASS",
+                    item.subtitle_transforms.len()
+                )
             } else {
-                format!("Restyle {} ASS/SSA subtitle track(s)", item.subtitle_transforms.len())
+                format!(
+                    "Restyle {} ASS/SSA subtitle track(s)",
+                    item.subtitle_transforms.len()
+                )
             }
         }
         RemuxMode::Remux if !item.track_order_ids.is_empty() => {
-            format!("Reorder {} track(s) to match the template", item.track_order_ids.len())
+            format!(
+                "Reorder {} track(s) to match the template",
+                item.track_order_ids.len()
+            )
         }
         RemuxMode::Remux => format!("Keep {} selected track(s)", item.selected_track_ids.len()),
     };
@@ -237,12 +248,9 @@ mod tests {
     #[test]
     fn episode_only_filename_must_be_unambiguous_in_scope() {
         let episodes = vec![episode(1, 1, "Pilot"), episode(6, 1, "Essential")];
-        let release_order = match_episode_for_file(
-            "Superstore - Episode 1.mkv",
-            &episodes,
-            &BTreeSet::new(),
-        )
-        .expect("first regular episode by release order");
+        let release_order =
+            match_episode_for_file("Superstore - Episode 1.mkv", &episodes, &BTreeSet::new())
+                .expect("first regular episode by release order");
         assert_eq!((release_order.season, release_order.episode), (1, 1));
 
         let selected = BTreeSet::from([6]);
@@ -260,12 +268,8 @@ mod tests {
             episode(1, 1, "First"),
         ];
 
-        let matched = match_episode_for_file(
-            "Example Show - 3.mkv",
-            &episodes,
-            &BTreeSet::new(),
-        )
-        .expect("third regular episode");
+        let matched = match_episode_for_file("Example Show - 3.mkv", &episodes, &BTreeSet::new())
+            .expect("third regular episode");
 
         assert_eq!((matched.season, matched.episode), (2, 1));
         assert_eq!(matched.title, "Third");
@@ -275,12 +279,9 @@ mod tests {
     fn explicit_season_episode_still_wins_over_release_order() {
         let episodes = vec![episode(1, 1, "First"), episode(2, 1, "Second season")];
 
-        let matched = match_episode_for_file(
-            "Example Show - S02E01.mkv",
-            &episodes,
-            &BTreeSet::new(),
-        )
-        .expect("explicit season match");
+        let matched =
+            match_episode_for_file("Example Show - S02E01.mkv", &episodes, &BTreeSet::new())
+                .expect("explicit season match");
 
         assert_eq!((matched.season, matched.episode), (2, 1));
     }
