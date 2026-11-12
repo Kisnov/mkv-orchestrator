@@ -90,24 +90,6 @@ impl SqliteStore {
         self.query_job("id", id)
     }
 
-    pub fn list_recent_jobs(&self, limit: usize) -> StoreResult<Vec<StoredJob>> {
-        let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
-        let connection = self.connection()?;
-        let mut statement =
-            connection.prepare("SELECT id FROM jobs ORDER BY updated_at_ms DESC LIMIT ?1")?;
-        let ids = statement
-            .query_map([limit], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        drop(connection);
-        ids.into_iter()
-            .map(|id| {
-                self.get_job(&id)?
-                    .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
-            })
-            .collect()
-    }
-
     pub fn count_job_events(&self, job_id: &str) -> StoreResult<u64> {
         let connection = self.connection()?;
         let count: i64 = connection.query_row(

@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mkvo_contracts::{JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, ToolStatus};
+use mkvo_contracts::{
+    JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, RecentJob, ToolStatus,
+};
 use mkvo_domain::{
     AppSettings, EpisodeMetadata, FileFingerprint, IdempotencyKey, MediaFile, MediaServerKind,
     MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchId,
@@ -170,7 +172,8 @@ pub trait JobRepository: Send + Sync {
         &self,
         key: &IdempotencyKey,
     ) -> Result<Option<JobSnapshot>, PortError>;
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError>;
+    /// The most recently updated jobs, without their result payloads.
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError>;
     /// Jobs that have not reached a terminal status.
     async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError>;
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError>;

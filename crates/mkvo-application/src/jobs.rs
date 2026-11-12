@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use mkvo_contracts::{
     JobAccepted, JobCompletion, JobEvent, JobEventEnvelope, JobKind, JobLogLevel, JobSnapshot,
-    JobStatus,
+    JobStatus, RecentJob,
 };
 use mkvo_domain::{CorrelationId, IdempotencyKey, JobId, PlanId, ResourceAccess, ResourceClaim};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast};
@@ -281,11 +281,16 @@ impl JobSupervisor {
         self.repository.get(id).await.map_err(Into::into)
     }
 
-    pub async fn list_recent(&self, limit: usize) -> ApplicationResult<Vec<JobSnapshot>> {
-        self.repository
-            .list_recent(limit.clamp(1, 1_000))
-            .await
-            .map_err(Into::into)
+    pub async fn list_recent(&self, limit: usize) -> ApplicationResult<Vec<RecentJob>> {
+        let mut jobs = self.repository.list_recent(limit.clamp(1, 1_000)).await?;
+        // A running job's progress reaches the repository at a limited rate.
+        let live = self.live.read().await;
+        for job in &mut jobs {
+            if let Some(live) = live.get(&job.id) {
+                *job = RecentJob::from(&*live.snapshot.lock().await);
+            }
+        }
+        Ok(jobs)
     }
 
     pub async fn cancel(&self, id: JobId) -> ApplicationResult<JobSnapshot> {
@@ -796,8 +801,14 @@ impl JobRepository for InMemoryJobRepository {
         })
     }
 
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError> {
-        let mut jobs: Vec<_> = self.jobs.read().await.values().cloned().collect();
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError> {
+        let mut jobs: Vec<_> = self
+            .jobs
+            .read()
+            .await
+            .values()
+            .map(RecentJob::from)
+            .collect();
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_utc));
         jobs.truncate(limit);
         Ok(jobs)
@@ -1021,7 +1032,7 @@ mod tests {
             self.inner.find_by_idempotency(key).await
         }
 
-        async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError> {
+        async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError> {
             self.inner.list_recent(limit).await
         }
 
@@ -1157,6 +1168,30 @@ mod tests {
         assert_eq!(stored.completed, 2);
         let live = supervisor.get(accepted.id).await.unwrap().unwrap();
         assert_eq!(live.current_file, "b.mkv");
+    }
+
+    #[tokio::test]
+    async fn recent_jobs_show_progress_the_repository_has_not_seen_yet() {
+        let repository = Arc::new(ObservedRepository::default());
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let (step, mut steps) = tokio::sync::mpsc::channel::<()>(1);
+        let accepted = supervisor
+            .start(spec("listed-key", Vec::new()), |context| async move {
+                context.progress(2, 3, "b.mkv", 100).await?;
+                step.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        steps.recv().await.unwrap();
+
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.completed, 0);
+        let recent = supervisor.list_recent(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!((recent[0].id, recent[0].completed), (accepted.id, 2));
+        assert_eq!(recent[0].current_file, "b.mkv");
     }
 
     #[tokio::test]

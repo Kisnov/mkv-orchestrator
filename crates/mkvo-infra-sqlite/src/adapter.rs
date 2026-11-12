@@ -6,7 +6,9 @@ use mkvo_application::{
     JobRepository, JournalRecord, MetadataCache, OperationJournal, OperationLog, PlanRepository,
     PortError, RenameHistoryRepository, SettingsRepository,
 };
-use mkvo_contracts::{JobEventEnvelope, JobSnapshot, LogLevel, LogQuery, OperationLogEntry};
+use mkvo_contracts::{
+    JobEventEnvelope, JobSnapshot, LogLevel, LogQuery, OperationLogEntry, RecentJob,
+};
 use mkvo_domain::{
     AppSettings, FileFingerprint, IdempotencyKey, JobId, MediaFile, PlanId, RenameBatchId,
     RenameBatchRecord, StoredPlan as DomainStoredPlan,
@@ -219,13 +221,21 @@ impl JobRepository for SqliteRepositories {
             .await
     }
 
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError> {
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError> {
         self.blocking(move |store| {
-            store
-                .list_recent_jobs(limit)?
-                .into_iter()
-                .map(|job| decode_job(Some(job)).map(Option::unwrap))
-                .collect()
+            let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
+            let connection = store.connection()?;
+            // SQLite drops the result payload, so it is never loaded here.
+            let mut statement = connection.prepare(
+                "SELECT json_remove(result_json, '$.result') FROM jobs
+                 ORDER BY updated_at_ms DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit], |row| row.get::<_, String>(0))?;
+            rows.map(|row| {
+                let snapshot: JobSnapshot = serde_json::from_str(&row?)?;
+                Ok(RecentJob::from(&snapshot))
+            })
+            .collect()
         })
         .await
     }
@@ -681,6 +691,59 @@ mod tests {
             .collect();
         assert_eq!(unfinished.len(), expected.len());
         assert_eq!(found, expected);
+    }
+
+    fn job(status: mkvo_contracts::JobStatus) -> JobSnapshot {
+        JobSnapshot {
+            id: JobId::new(),
+            kind: mkvo_contracts::JobKind::Scan,
+            status,
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            idempotency_key: IdempotencyKey::generate(),
+            request_fingerprint: String::new(),
+            plan_id: None,
+            created_utc: Utc::now(),
+            started_utc: None,
+            completed_utc: None,
+            completed: 0,
+            failed: 0,
+            skipped: 0,
+            total: 0,
+            current_file: String::new(),
+            current_file_percent: 0,
+            lines: Vec::new(),
+            result: None,
+            error: None,
+            revision: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_jobs_are_listed_without_their_results() {
+        use mkvo_contracts::JobStatus;
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let mut failed = job(JobStatus::Failed);
+        failed.lines = vec!["first".to_owned(), "Skipped a.mkv: unreadable".to_owned()];
+        failed.error = Some("mkvmerge exited with 2".to_owned());
+        failed.result = Some(serde_json::json!({ "files": ["a".repeat(100_000)] }));
+        failed.completed = 4;
+        failed.total = 9;
+        JobRepository::insert(&repositories, &failed)
+            .await
+            .expect("insert");
+
+        let recent = JobRepository::list_recent(&repositories, 10)
+            .await
+            .expect("list");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, failed.id);
+        assert_eq!(recent[0].status, JobStatus::Failed);
+        assert_eq!((recent[0].completed, recent[0].total), (4, 9));
+        assert_eq!(recent[0].summary, "Skipped a.mkv: unreadable");
+        assert_eq!(recent[0].error.as_deref(), Some("mkvmerge exited with 2"));
+        assert!(serde_json::to_string(&recent).expect("json").len() < 1_000);
     }
 
     #[tokio::test]
