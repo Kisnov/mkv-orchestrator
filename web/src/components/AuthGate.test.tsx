@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AuthGate from "./AuthGate";
 import { api } from "../auth/api";
+import { ApiError } from "../backend/error";
 import { initialUsername, setRememberUsername } from "../lib/rememberUsername";
 
 vi.mock("../auth/api", () => ({
@@ -53,6 +54,33 @@ describe("AuthGate", () => {
     await act(async () => finish({ authenticated: true }));
     expect(screen.queryByText("Protected library")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Password")).toBeInTheDocument();
+  });
+
+  it("offers a retry instead of the login form when the server cannot be reached", async () => {
+    vi.mocked(api.authStatus).mockRejectedValueOnce(new ApiError("Unable to reach the MKVO server.", { code: "TRANSPORT_ERROR" }));
+    vi.mocked(api.authStatus).mockResolvedValue({ authenticated: true });
+    render(<AuthGate><div>Protected library</div></AuthGate>);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to reach the MKVO server.");
+    expect(screen.queryByLabelText("Password")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Protected library")).toBeInTheDocument();
+  });
+
+  it("shows the login form when the status check is rejected with a 401", async () => {
+    vi.mocked(api.authStatus).mockRejectedValue(new ApiError("Authentication required.", { status: 401 }));
+    render(<AuthGate><div>Protected library</div></AuthGate>);
+    expect(await screen.findByLabelText("Password")).toBeInTheDocument();
+  });
+
+  it("keeps a signed-in session open when a later status check fails", async () => {
+    vi.mocked(api.authStatus).mockResolvedValueOnce({ authenticated: true });
+    render(<AuthGate><div>Protected library</div></AuthGate>);
+    await screen.findByText("Protected library");
+    vi.mocked(api.authStatus).mockRejectedValue(new ApiError("Bad Gateway", { status: 502 }));
+    fireEvent(window, new Event("mkvo:security-changed"));
+    await waitFor(() => expect(api.authStatus).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(screen.getByText("Protected library")).toBeInTheDocument();
   });
 
   it("renders protected content for an authenticated session", async () => {
