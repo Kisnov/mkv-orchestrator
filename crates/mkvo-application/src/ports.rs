@@ -22,6 +22,17 @@ pub struct MediaEnumerationRequest {
     pub supported_extensions: BTreeSet<String>,
 }
 
+/// One result of a streamed enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnumeratedMedia {
+    File(FileFingerprint),
+    /// A folder or file that could not be read.
+    Skipped {
+        path: PathBuf,
+        reason: String,
+    },
+}
+
 #[async_trait]
 pub trait MediaCatalog: Send + Sync {
     async fn enumerate(
@@ -29,6 +40,20 @@ pub trait MediaCatalog: Send + Sync {
         request: &MediaEnumerationRequest,
         cancel: CancellationToken,
     ) -> Result<Vec<FileFingerprint>, PortError>;
+
+    /// Send entries as they are found, and what cannot be read as `Skipped`
+    /// instead of failing.
+    async fn enumerate_streaming(
+        &self,
+        request: &MediaEnumerationRequest,
+        cancel: CancellationToken,
+        entries: tokio::sync::mpsc::UnboundedSender<EnumeratedMedia>,
+    ) -> Result<(), PortError> {
+        for file in self.enumerate(request, cancel).await? {
+            let _ = entries.send(EnumeratedMedia::File(file));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

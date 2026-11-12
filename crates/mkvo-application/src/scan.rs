@@ -1,18 +1,19 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
-use futures::{StreamExt, stream};
+use futures::{StreamExt, stream::FuturesUnordered};
 use mkvo_contracts::{MediaFileDto, ScanRequest, ScanResponse, ScanSummary};
-use mkvo_domain::MediaFile;
+use mkvo_domain::{FileFingerprint, MediaFile};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ApplicationError, ApplicationResult, AuthorizedPathPolicy, JobContext, MediaCatalog,
-    MediaEnumerationRequest, MediaProbe, MetadataCache,
+    ApplicationError, ApplicationResult, AuthorizedPathPolicy, EnumeratedMedia, JobContext,
+    MediaCatalog, MediaEnumerationRequest, MediaProbe, MetadataCache,
 };
 
 const MEDIA_CACHE_RETENTION_DAYS: i64 = 7;
@@ -224,85 +225,126 @@ impl ScanService {
         outcome: &mut ScanOutcome,
         writes: &mut CacheWrites,
     ) -> ApplicationResult<()> {
-        let fingerprints = self.catalog.enumerate(enumeration, cancel.clone()).await?;
-        let total = u64::try_from(fingerprints.len()).unwrap_or(u64::MAX);
         let workers = request
             .max_workers
             .unwrap_or(self.default_workers)
             .clamp(1, 8);
-
-        let cache = Arc::clone(&self.cache);
-        let probe = Arc::clone(&self.probe);
-        let force_refresh = request.force_refresh;
-        let child_cancel = cancel.clone();
-        let mut work = stream::iter(fingerprints.into_iter().map(move |fingerprint| {
-            let cache = Arc::clone(&cache);
-            let probe = Arc::clone(&probe);
-            let cancel = child_cancel.clone();
-            async move {
-                if cancel.is_cancelled() {
-                    return Err((fingerprint.path.clone(), ApplicationError::Canceled));
+        let (entries, mut found) = mpsc::unbounded_channel();
+        let enumerating = async {
+            self.catalog
+                .enumerate_streaming(enumeration, cancel.clone(), entries)
+                .await
+                .map_err(ApplicationError::from)
+        };
+        // Probing starts on the first file found; `discovered` is the total so far.
+        let probing = async {
+            let mut queued = VecDeque::new();
+            let mut work = FuturesUnordered::new();
+            let mut discovered = 0_u64;
+            let mut enumerated = false;
+            loop {
+                while work.len() < workers
+                    && let Some(fingerprint) = queued.pop_front()
+                {
+                    work.push(self.resolve(fingerprint, request.force_refresh, cancel));
                 }
-                if !force_refresh {
-                    match cache.get_valid(&fingerprint).await {
-                        Ok(Some(file)) => return Ok((file, true)),
-                        Ok(None) => {}
-                        Err(error) => return Err((fingerprint.path.clone(), error.into())),
-                    }
+                if enumerated && work.is_empty() {
+                    return Ok(());
                 }
-                match probe.inspect(&fingerprint.path, cancel).await {
-                    Ok(mut file) => {
-                        file.fingerprint = fingerprint;
-                        Ok((file, false))
-                    }
-                    Err(error) => Err((fingerprint.path.clone(), error.into())),
-                }
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(ApplicationError::Canceled),
+                    entry = found.recv(), if !enumerated => match entry {
+                        Some(EnumeratedMedia::File(fingerprint)) => {
+                            discovered += 1;
+                            queued.push_back(fingerprint);
+                            continue;
+                        }
+                        Some(EnumeratedMedia::Skipped { path, reason }) => {
+                            discovered += 1;
+                            Err((path, ApplicationError::AdapterFailure(reason)))
+                        }
+                        None => {
+                            enumerated = true;
+                            continue;
+                        }
+                    },
+                    Some(result) = work.next() => result,
+                };
+                self.record(result, discovered, sink, outcome, writes)
+                    .await?;
             }
-        }))
-        .buffer_unordered(workers);
+        };
+        tokio::try_join!(enumerating, probing).map(|_| ())
+    }
 
-        while let Some(result) = work.next().await {
-            if cancel.is_cancelled() {
+    async fn resolve(
+        &self,
+        fingerprint: FileFingerprint,
+        force_refresh: bool,
+        cancel: &CancellationToken,
+    ) -> Result<(MediaFile, bool), (PathBuf, ApplicationError)> {
+        if !force_refresh {
+            match self.cache.get_valid(&fingerprint).await {
+                Ok(Some(file)) => return Ok((file, true)),
+                Ok(None) => {}
+                Err(error) => return Err((fingerprint.path, error.into())),
+            }
+        }
+        match self.probe.inspect(&fingerprint.path, cancel.clone()).await {
+            Ok(mut file) => {
+                file.fingerprint = fingerprint;
+                Ok((file, false))
+            }
+            Err(error) => Err((fingerprint.path, error.into())),
+        }
+    }
+
+    async fn record(
+        &self,
+        result: Result<(MediaFile, bool), (PathBuf, ApplicationError)>,
+        total: u64,
+        sink: &dyn ScanEventSink,
+        outcome: &mut ScanOutcome,
+        writes: &mut CacheWrites,
+    ) -> ApplicationResult<()> {
+        match result {
+            Ok((file, cached)) => {
+                outcome.summary.total += 1;
+                if cached {
+                    outcome.summary.cached += 1;
+                    writes.seen.push(file.fingerprint.path.clone());
+                } else {
+                    writes.probed.push(file.clone());
+                    writes.probed_since.get_or_insert_with(Instant::now);
+                }
+                let extension = file.extension();
+                if extension.eq_ignore_ascii_case("mkv") {
+                    outcome.summary.mkv += 1;
+                } else if extension.eq_ignore_ascii_case("mp4")
+                    || extension.eq_ignore_ascii_case("m4v")
+                {
+                    outcome.summary.mp4 += 1;
+                }
+                let completed = outcome.summary.total + outcome.summary.failed;
+                sink.progress(completed, total, &file.file_name()).await?;
+                outcome.files.push(file);
+            }
+            Err((_path, ApplicationError::Canceled)) => {
                 return Err(ApplicationError::Canceled);
             }
-            match result {
-                Ok((file, cached)) => {
-                    outcome.summary.total += 1;
-                    if cached {
-                        outcome.summary.cached += 1;
-                        writes.seen.push(file.fingerprint.path.clone());
-                    } else {
-                        writes.probed.push(file.clone());
-                        writes.probed_since.get_or_insert_with(Instant::now);
-                    }
-                    let extension = file.extension();
-                    if extension.eq_ignore_ascii_case("mkv") {
-                        outcome.summary.mkv += 1;
-                    } else if extension.eq_ignore_ascii_case("mp4")
-                        || extension.eq_ignore_ascii_case("m4v")
-                    {
-                        outcome.summary.mp4 += 1;
-                    }
-                    let completed = outcome.summary.total + outcome.summary.failed;
-                    sink.progress(completed, total, &file.file_name()).await?;
-                    outcome.files.push(file);
-                }
-                Err((_path, ApplicationError::Canceled)) => {
-                    return Err(ApplicationError::Canceled);
-                }
-                Err((path, error)) => {
-                    outcome.summary.failed += 1;
-                    let reason = error.to_string();
-                    sink.skipped(&path.to_string_lossy(), &reason).await?;
-                    let completed = outcome.summary.total + outcome.summary.failed;
-                    sink.progress(completed, total, &path.to_string_lossy())
-                        .await?;
-                    outcome.skipped.push(ScanSkip { path, reason });
-                }
+            Err((path, error)) => {
+                outcome.summary.failed += 1;
+                let reason = error.to_string();
+                sink.skipped(&path.to_string_lossy(), &reason).await?;
+                let completed = outcome.summary.total + outcome.summary.failed;
+                sink.progress(completed, total, &path.to_string_lossy())
+                    .await?;
+                outcome.skipped.push(ScanSkip { path, reason });
             }
-            if writes.is_due() {
-                self.flush(writes).await?;
-            }
+        }
+        if writes.is_due() {
+            self.flush(writes).await?;
         }
         Ok(())
     }
@@ -317,7 +359,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use mkvo_domain::{ContainerMetadata, FileFingerprint, MediaStatus};
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
 
     use super::*;
     use crate::PortError;
@@ -334,10 +376,39 @@ mod tests {
         }
     }
 
+    /// Withholds the rest of the listing until the first file is being probed.
+    struct SlowCatalog(Arc<Probe>);
+    #[async_trait]
+    impl MediaCatalog for SlowCatalog {
+        async fn enumerate(
+            &self,
+            _request: &MediaEnumerationRequest,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<FileFingerprint>, PortError> {
+            unreachable!("the scan streams")
+        }
+        async fn enumerate_streaming(
+            &self,
+            _request: &MediaEnumerationRequest,
+            _cancel: CancellationToken,
+            entries: mpsc::UnboundedSender<EnumeratedMedia>,
+        ) -> Result<(), PortError> {
+            let _ = entries.send(EnumeratedMedia::File(fingerprint("lib/1.mkv")));
+            self.0.started.notified().await;
+            let _ = entries.send(EnumeratedMedia::Skipped {
+                path: PathBuf::from("lib/locked"),
+                reason: "denied".to_owned(),
+            });
+            let _ = entries.send(EnumeratedMedia::File(fingerprint("lib/2.mkv")));
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct Probe {
         calls: AtomicUsize,
         delay: Duration,
+        started: Notify,
     }
     #[async_trait]
     impl MediaProbe for Probe {
@@ -347,6 +418,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<MediaFile, PortError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.started.notify_one();
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -562,6 +634,35 @@ mod tests {
 
         scan("lib", &found, &cache, &probe).await;
         assert_eq!(cache.writes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn probing_starts_while_enumeration_runs_and_unreadable_folders_are_skipped() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        let service = ScanService::new(
+            Arc::new(SlowCatalog(probe.clone())),
+            probe,
+            cache,
+            Arc::new(Paths),
+            2,
+        );
+
+        let request = request("lib");
+        let scan = service.scan(&request, CancellationToken::new(), &NoopScanEventSink);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("probing must not wait for the enumeration to end")
+            .unwrap();
+        assert_eq!(outcome.files.len(), 2);
+        assert_eq!(outcome.summary.failed, 1);
+        assert_eq!(
+            outcome.skipped,
+            [ScanSkip {
+                path: PathBuf::from("lib/locked"),
+                reason: "adapter failure: denied".to_owned(),
+            }]
+        );
     }
 
     #[tokio::test]

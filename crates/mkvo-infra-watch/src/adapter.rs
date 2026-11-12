@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
@@ -9,13 +9,13 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mkvo_application::{
-    AuthorizedPathPolicy, FileAccessState, FileSystem, MediaCatalog, MediaEnumerationRequest,
-    PortError, RequiredAccess, WatchBackend, WatchBackendKind, WatchChange, WatchChangeKind,
-    WatchHealth,
+    AuthorizedPathPolicy, EnumeratedMedia, FileAccessState, FileSystem, MediaCatalog,
+    MediaEnumerationRequest, PortError, RequiredAccess, WatchBackend, WatchBackendKind,
+    WatchChange, WatchChangeKind, WatchHealth,
 };
 use mkvo_domain::{FileFingerprint, WatchSettings};
 use tokio::{
-    sync::{Mutex, broadcast},
+    sync::{Mutex, broadcast, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,19 @@ impl LocalMediaCatalog {
             quick_hash,
         }
     }
+
+    fn authorize(&self, request: &MediaEnumerationRequest) -> Result<Vec<PathBuf>, PortError> {
+        request
+            .roots
+            .iter()
+            .map(|root| {
+                self.authorized_roots
+                    .authorize_existing(root, AccessMode::Read)
+                    .map(|path| path.into_path_buf())
+                    .map_err(path_port_error)
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -45,16 +58,7 @@ impl MediaCatalog for LocalMediaCatalog {
         request: &MediaEnumerationRequest,
         cancel: CancellationToken,
     ) -> Result<Vec<FileFingerprint>, PortError> {
-        let roots = request
-            .roots
-            .iter()
-            .map(|root| {
-                self.authorized_roots
-                    .authorize_existing(root, AccessMode::Read)
-                    .map(|path| path.into_path_buf())
-                    .map_err(path_port_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let roots = self.authorize(request)?;
         let ignored = request.ignored_folder_names.clone();
         let extensions = request.supported_extensions.clone();
         let quick_hash = self.quick_hash;
@@ -64,8 +68,34 @@ impl MediaCatalog for LocalMediaCatalog {
         .await
         .map_err(|error| PortError::Other(format!("media enumeration task failed: {error}")))?
     }
+
+    async fn enumerate_streaming(
+        &self,
+        request: &MediaEnumerationRequest,
+        cancel: CancellationToken,
+        entries: mpsc::UnboundedSender<EnumeratedMedia>,
+    ) -> Result<(), PortError> {
+        let roots = self.authorize(request)?;
+        let ignored = request.ignored_folder_names.clone();
+        let extensions = request.supported_extensions.clone();
+        let quick_hash = self.quick_hash;
+        tokio::task::spawn_blocking(move || {
+            walk_media(
+                &roots,
+                &ignored,
+                &extensions,
+                quick_hash,
+                &cancel,
+                |entry| entries.send(entry).is_ok(),
+            )
+        })
+        .await
+        .map_err(|error| PortError::Other(format!("media enumeration task failed: {error}")))?
+    }
 }
 
+/// Fails on the first entry that cannot be read: callers that prune what is
+/// missing from the result must not mistake unreadable for gone.
 fn enumerate_files(
     roots: &[PathBuf],
     ignored: &BTreeSet<String>,
@@ -73,6 +103,33 @@ fn enumerate_files(
     quick_hash: bool,
     cancel: &CancellationToken,
 ) -> Result<Vec<FileFingerprint>, PortError> {
+    let mut files = Vec::new();
+    let mut failure = None;
+    walk_media(roots, ignored, extensions, quick_hash, cancel, |entry| {
+        match entry {
+            EnumeratedMedia::File(file) => files.push(file),
+            EnumeratedMedia::Skipped { path, reason } => {
+                failure = Some(format!("could not read `{}`: {reason}", path.display()));
+            }
+        }
+        failure.is_none()
+    })?;
+    if let Some(failure) = failure {
+        return Err(PortError::Other(failure));
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+/// Hands every media file to `found` until it returns `false`.
+fn walk_media(
+    roots: &[PathBuf],
+    ignored: &BTreeSet<String>,
+    extensions: &BTreeSet<String>,
+    quick_hash: bool,
+    cancel: &CancellationToken,
+    mut found: impl FnMut(EnumeratedMedia) -> bool,
+) -> Result<(), PortError> {
     let ignored: BTreeSet<_> = ignored
         .iter()
         .map(|value| value.to_ascii_lowercase())
@@ -81,7 +138,8 @@ fn enumerate_files(
         .iter()
         .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
         .collect();
-    let mut files = Vec::new();
+    // Roots may overlap.
+    let mut seen = HashSet::new();
     for root in roots {
         let walker = WalkDir::new(root)
             .follow_links(false)
@@ -91,30 +149,43 @@ fn enumerate_files(
             if cancel.is_cancelled() {
                 return Err(PortError::Canceled);
             }
-            let entry = entry.map_err(|error| PortError::Other(error.to_string()))?;
-            if !entry.file_type().is_file() {
-                continue;
+            let entry = match entry {
+                Ok(entry)
+                    if !is_media_file(&entry, &extensions)
+                        || !seen.insert(entry.path().to_path_buf()) =>
+                {
+                    continue;
+                }
+                Ok(entry) => match fingerprint_entry(&entry, quick_hash) {
+                    Ok(file) => EnumeratedMedia::File(file),
+                    Err(error) => EnumeratedMedia::Skipped {
+                        path: entry.into_path(),
+                        reason: error.to_string(),
+                    },
+                },
+                Err(error) => EnumeratedMedia::Skipped {
+                    path: error.path().unwrap_or(root).to_path_buf(),
+                    reason: error
+                        .io_error()
+                        .map_or_else(|| error.to_string(), ToString::to_string),
+                },
+            };
+            if !found(entry) {
+                return Ok(());
             }
-            let extension = entry
-                .path()
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if !extensions.contains(&extension) {
-                continue;
-            }
-            files.push(fingerprint_entry(&entry, quick_hash).map_err(|error| {
-                PortError::Other(format!(
-                    "could not fingerprint `{}`: {error}",
-                    entry.path().display()
-                ))
-            })?);
         }
     }
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    files.dedup_by(|left, right| left.path == right.path);
-    Ok(files)
+    Ok(())
+}
+
+fn is_media_file(entry: &DirEntry, extensions: &BTreeSet<String>) -> bool {
+    let extension = entry
+        .path()
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    entry.file_type().is_file() && extensions.contains(&extension)
 }
 
 fn is_ignored_directory(entry: &DirEntry, ignored: &BTreeSet<String>) -> bool {
@@ -492,14 +563,29 @@ mod tests {
         path
     }
 
-    fn enumerate(roots: &[PathBuf]) -> Result<Vec<FileFingerprint>, PortError> {
-        enumerate_files(
+    fn walk(roots: &[PathBuf]) -> Vec<EnumeratedMedia> {
+        let mut entries = Vec::new();
+        walk_media(
             roots,
             &BTreeSet::new(),
             &BTreeSet::from(["mkv".to_owned()]),
             false,
             &CancellationToken::new(),
+            |entry| {
+                entries.push(entry);
+                true
+            },
         )
+        .expect("walk");
+        entries
+    }
+
+    fn is_file(entry: &EnumeratedMedia, path: &Path) -> bool {
+        matches!(entry, EnumeratedMedia::File(file) if file.path == path)
+    }
+
+    fn is_skipped(entry: &EnumeratedMedia, path: &Path) -> bool {
+        matches!(entry, EnumeratedMedia::Skipped { path: skipped, .. } if skipped == path)
     }
 
     #[cfg(unix)]
@@ -535,14 +621,73 @@ mod tests {
             .expect("file symlink");
 
         let root = std::fs::canonicalize(root).expect("canonical root");
-        let files = enumerate(std::slice::from_ref(&root));
+        let found = walk(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&tree);
-        let paths: Vec<_> = files
-            .expect("enumerate")
-            .into_iter()
-            .map(|file| file.path)
-            .collect();
-        assert_eq!(paths, [root.join("season").join("a.mkv")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(is_file(&found[0], &root.join("season").join("a.mkv")));
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_skipped_and_the_walk_goes_on() {
+        let tree = temp_tree("skip");
+        std::fs::write(tree.join("a.mkv"), b"media").expect("file");
+        let root = std::fs::canonicalize(&tree).expect("canonical root");
+        let roots = [root.join("missing"), root.clone()];
+
+        let found = walk(&roots);
+        let listed = enumerate_files(
+            &roots,
+            &BTreeSet::new(),
+            &BTreeSet::from(["mkv".to_owned()]),
+            false,
+            &CancellationToken::new(),
+        );
+        let _ = std::fs::remove_dir_all(&tree);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(is_skipped(&found[0], &roots[0]));
+        assert!(is_file(&found[1], &root.join("a.mkv")));
+        assert!(listed.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_without_read_permission_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !access_probe_tests::permissions_are_enforced_for_this_user() {
+            return;
+        }
+        let tree = temp_tree("locked");
+        for folder in ["open", "locked"] {
+            std::fs::create_dir(tree.join(folder)).expect("folder");
+            std::fs::write(tree.join(folder).join("a.mkv"), b"media").expect("file");
+        }
+        let root = std::fs::canonicalize(&tree).expect("canonical root");
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+
+        let found = walk(std::slice::from_ref(&root));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+        let _ = std::fs::remove_dir_all(&tree);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|entry| is_skipped(entry, &locked)));
+        assert!(
+            found
+                .iter()
+                .any(|entry| is_file(entry, &root.join("open").join("a.mkv")))
+        );
+    }
+
+    #[test]
+    fn overlapping_roots_report_a_file_once() {
+        let tree = temp_tree("overlap");
+        std::fs::create_dir(tree.join("season")).expect("folder");
+        std::fs::write(tree.join("season").join("a.mkv"), b"media").expect("file");
+        let root = std::fs::canonicalize(&tree).expect("canonical root");
+
+        let found = walk(&[root.clone(), root.join("season")]);
+        let _ = std::fs::remove_dir_all(&tree);
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     /// Cache rows are keyed by these values, so they must stay what
@@ -556,16 +701,16 @@ mod tests {
         let canonical = std::fs::canonicalize(&file).expect("canonical file");
         let metadata = std::fs::metadata(&file).expect("metadata");
 
-        let files = enumerate(&[std::fs::canonicalize(&tree).expect("canonical root")]);
+        let found = walk(&[std::fs::canonicalize(&tree).expect("canonical root")]);
         let _ = std::fs::remove_dir_all(&tree);
         assert_eq!(
-            files.expect("enumerate"),
-            [FileFingerprint {
+            found,
+            [EnumeratedMedia::File(FileFingerprint {
                 path: canonical,
                 size_bytes: metadata.len(),
                 modified_at: metadata.modified().expect("modified").into(),
                 quick_hash: None,
-            }]
+            })]
         );
     }
 
@@ -694,7 +839,7 @@ mod access_probe_tests {
     /// tests in a root container, so this is a normal environment rather than
     /// an exotic one.
     #[cfg(unix)]
-    fn permissions_are_enforced_for_this_user() -> bool {
+    pub(super) fn permissions_are_enforced_for_this_user() -> bool {
         // `id -u` rather than /proc, which macOS does not have. If the uid
         // cannot be determined, assume permissions are enforced: that is the
         // stricter assertion, so an unknown environment fails loudly instead of
