@@ -2,6 +2,48 @@ use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mkvo_application::PortError;
 use mkvo_contracts::ApiErrorCode;
+use std::time::{Duration, Instant};
+
+/// How long a refused credential is remembered before the server is asked again.
+const CREDENTIAL_REJECTION_MEMORY: Duration = Duration::from_secs(5 * 60);
+
+/// A credential a media server refused, kept so it is not retried per poster.
+pub(super) struct CredentialRejection {
+    connection: MediaServerConnection,
+    message: String,
+    at: Instant,
+}
+
+impl CredentialRejection {
+    /// A new key or URL is a different connection, so saving one needs no reset.
+    fn covers(&self, connection: &MediaServerConnection) -> bool {
+        self.connection == *connection && self.at.elapsed() < CREDENTIAL_REJECTION_MEMORY
+    }
+}
+
+/// Records a refusal. False when this credential's refusal was already known.
+fn remember_rejection(
+    rejections: &mut HashMap<MediaServerId, CredentialRejection>,
+    id: MediaServerId,
+    connection: &MediaServerConnection,
+    message: &str,
+) -> bool {
+    if rejections
+        .get(&id)
+        .is_some_and(|rejection| rejection.covers(connection))
+    {
+        return false;
+    }
+    rejections.insert(
+        id,
+        CredentialRejection {
+            connection: connection.clone(),
+            message: message.to_owned(),
+            at: Instant::now(),
+        },
+    );
+    true
+}
 
 impl MkvoRuntime {
     pub async fn get_library_catalog(
@@ -37,6 +79,7 @@ impl MkvoRuntime {
             )));
         }
         let connection = self.media_server_connection(server).await?;
+        self.known_credential_rejection(server, &connection).await?;
         let client = self.media_server_client(server.kind, &loaded.settings);
         let items = client
             .discover_items(
@@ -47,7 +90,8 @@ impl MkvoRuntime {
             )
             .await;
         let items = self
-            .credential_rejection(server, &connection, items)?
+            .credential_rejection(server, &connection, items)
+            .await?
             .into_iter()
             .map(|item| LibraryCatalogItem {
                 id: item.id,
@@ -88,11 +132,14 @@ impl MkvoRuntime {
                 RuntimeError::not_found(format!("media server {}", request.server_id))
             })?;
         let connection = self.media_server_connection(server).await?;
+        self.known_credential_rejection(server, &connection).await?;
         let artwork = self
             .media_server_client(server.kind, &loaded.settings)
             .fetch_artwork(&connection, &request.item_id, CancellationToken::new())
             .await;
-        let artwork = self.credential_rejection(server, &connection, artwork)?;
+        let artwork = self
+            .credential_rejection(server, &connection, artwork)
+            .await?;
         if !artwork
             .content_type
             .to_ascii_lowercase()
@@ -192,8 +239,34 @@ impl MkvoRuntime {
         })
     }
 
-    /// Reports a key the media server refused as its own error, naming the server.
-    fn credential_rejection<T>(
+    /// Fails without a request while the server is known to refuse this credential.
+    async fn known_credential_rejection(
+        &self,
+        server: &MediaServerSettings,
+        connection: &MediaServerConnection,
+    ) -> RuntimeResult<()> {
+        match self
+            .inner
+            .media_server_rejections
+            .read()
+            .await
+            .get(&server.id)
+        {
+            Some(rejection) if rejection.covers(connection) => Err(RuntimeError::new(
+                ApiErrorCode::CredentialRejected,
+                rejection.message.clone(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    async fn forget_credential_rejection(&self, id: MediaServerId) {
+        self.inner.media_server_rejections.write().await.remove(&id);
+    }
+
+    /// Reports a key the media server refused as its own error, naming the
+    /// server, and remembers the refusal. Logs it once, not once per request.
+    async fn credential_rejection<T>(
         &self,
         server: &MediaServerSettings,
         connection: &MediaServerConnection,
@@ -201,15 +274,6 @@ impl MkvoRuntime {
     ) -> RuntimeResult<T> {
         match result {
             Err(PortError::CredentialRejected(detail)) => {
-                tracing::warn!(
-                    server = %server.name,
-                    server_id = %server.id,
-                    kind = server_kind_name(server.kind),
-                    url = %connection.base_url,
-                    key_length = connection.credential.trim().len(),
-                    detail = %detail,
-                    "media server rejected the stored credential"
-                );
                 let message = if connection.credential.trim().is_empty() {
                     format!(
                         "No API key is stored for {} ({detail}). Enter it in Settings.",
@@ -221,6 +285,22 @@ impl MkvoRuntime {
                         server.name
                     )
                 };
+                if remember_rejection(
+                    &mut *self.inner.media_server_rejections.write().await,
+                    server.id,
+                    connection,
+                    &message,
+                ) {
+                    tracing::warn!(
+                        server = %server.name,
+                        server_id = %server.id,
+                        kind = server_kind_name(server.kind),
+                        url = %connection.base_url,
+                        key_length = connection.credential.trim().len(),
+                        detail = %detail,
+                        "media server rejected the stored credential; not asking it again for 5 minutes"
+                    );
+                }
                 Err(RuntimeError::new(ApiErrorCode::CredentialRejected, message))
             }
             other => Ok(other?),
@@ -281,10 +361,13 @@ impl MkvoRuntime {
             base_url: url,
             credential,
         };
-        match client
+        let result = client
             .discover_libraries(&connection, CancellationToken::new())
-            .await
-        {
+            .await;
+        if let (Ok(_), Some(stored)) = (&result, stored) {
+            self.forget_credential_rejection(stored.id).await;
+        }
+        match result {
             Ok(libraries) => Ok(MediaServerTestResponse {
                 success: true,
                 status: if libraries.is_empty() {
@@ -347,7 +430,10 @@ impl MkvoRuntime {
             .media_server_client(server.kind, &settings)
             .discover_libraries(&connection, CancellationToken::new())
             .await;
-        let mut libraries = self.credential_rejection(&server, &connection, libraries)?;
+        let mut libraries = self
+            .credential_rejection(&server, &connection, libraries)
+            .await?;
+        self.forget_credential_rejection(server.id).await;
         resolve_media_server_local_paths(&mut libraries, &self.inner.config.media_root);
         settings.media_servers[index]
             .libraries
@@ -502,6 +588,7 @@ mod media_server_credential_tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use mkvo_contracts::{ApiErrorCode, WebMediaServerLibraryPath, WebMediaServerRequest};
 
@@ -512,6 +599,7 @@ mod media_server_credential_tests {
     struct FakeJellyfin {
         url: String,
         paths: Arc<Mutex<Vec<String>>>,
+        refuse_everything: Arc<AtomicBool>,
     }
 
     impl FakeJellyfin {
@@ -520,6 +608,8 @@ mod media_server_credential_tests {
             let url = format!("http://{}", listener.local_addr().expect("fake address"));
             let paths = Arc::new(Mutex::new(Vec::new()));
             let seen = Arc::clone(&paths);
+            let refuse_everything = Arc::new(AtomicBool::new(false));
+            let refusing = Arc::clone(&refuse_everything);
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let mut reader = BufReader::new(stream);
@@ -539,7 +629,9 @@ mod media_server_credential_tests {
                         line.clear();
                     }
                     seen.lock().expect("path log").push(path.clone());
-                    let (status, content_type, body) = if !authorized {
+                    let (status, content_type, body) = if !authorized
+                        || refusing.load(Ordering::SeqCst)
+                    {
                         ("401 Unauthorized", "text/plain", "")
                     } else if path.starts_with("/Library/VirtualFolders") {
                         (
@@ -565,7 +657,11 @@ mod media_server_credential_tests {
                     );
                 }
             });
-            Self { url, paths }
+            Self {
+                url,
+                paths,
+                refuse_everything,
+            }
         }
 
         fn paths(&self) -> Vec<String> {
@@ -777,6 +873,107 @@ mod media_server_credential_tests {
             error.message.starts_with("No API key is stored for Home"),
             "{error}"
         );
+    }
+
+    /// The refusal is logged when it is recorded, so recording it once per
+    /// credential is what keeps a poster grid from writing a line per card.
+    #[test]
+    fn a_refusal_is_recorded_once_per_credential() {
+        let id = MediaServerId::default();
+        let connection = |credential: &str| MediaServerConnection {
+            kind: MediaServerKind::Jellyfin,
+            base_url: "http://media.local".to_owned(),
+            credential: credential.to_owned(),
+        };
+        let mut rejections = HashMap::new();
+
+        assert!(remember_rejection(
+            &mut rejections,
+            id,
+            &connection("wrong"),
+            "refused"
+        ));
+        assert!(!remember_rejection(
+            &mut rejections,
+            id,
+            &connection("wrong"),
+            "refused"
+        ));
+        assert!(remember_rejection(
+            &mut rejections,
+            id,
+            &connection("other"),
+            "refused"
+        ));
+    }
+
+    /// One poster per Library card used to mean one failing request and one
+    /// error line per card, on every visit, for as long as the key was wrong.
+    #[tokio::test]
+    async fn a_refused_key_is_asked_once_until_it_changes() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("wrong")).await;
+
+        let first = host
+            .runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect_err("refused key");
+        let second = host
+            .runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect_err("remembered refusal");
+        let catalog = host
+            .runtime
+            .get_library_catalog(LibraryCatalogRequest {
+                server_id: server.id.clone(),
+                library_name: "Shows".to_owned(),
+            })
+            .await
+            .expect_err("remembered refusal");
+
+        assert_eq!(second.code, ApiErrorCode::CredentialRejected);
+        assert_eq!(second.message, first.message);
+        assert_eq!(catalog.message, first.message);
+        assert_eq!(jellyfin.paths().len(), 1, "{:?}", jellyfin.paths());
+
+        // Saving a different key is a different credential: ask again.
+        let server = save_server(&host.runtime, Some(&server.id), &jellyfin.url, Some("k")).await;
+        host.runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect("artwork with the new key");
+    }
+
+    #[tokio::test]
+    async fn a_successful_test_forgets_the_refusal() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("k")).await;
+
+        jellyfin.refuse_everything.store(true, Ordering::SeqCst);
+        host.runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect_err("refused key");
+        jellyfin.refuse_everything.store(false, Ordering::SeqCst);
+        host.runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect_err("remembered refusal");
+
+        let result = host
+            .runtime
+            .test_media_server_connection(test_request(&server, &jellyfin.url, ""))
+            .await
+            .expect("test");
+        assert!(result.success, "{}", result.status);
+        host.runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect("artwork after a successful test");
     }
 }
 

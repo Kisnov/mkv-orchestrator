@@ -5,7 +5,7 @@ use axum::{
 };
 use mkvo_contracts::ApiErrorCode;
 use mkvo_runtime::RuntimeError;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::request_id::{CORRELATION_ID_HEADER, REQUEST_CORRELATION_ID};
 
@@ -34,6 +34,13 @@ impl IntoResponse for HttpError {
                 retryable = error.retryable,
                 message = %error.message,
                 "runtime request failed"
+            );
+        } else if error.code == ApiErrorCode::CredentialRejected {
+            // The runtime logs a refused key once, naming the server; not per poster.
+            debug!(
+                correlation_id = %error.correlation_id,
+                message = %error.message,
+                "media server credential rejected"
             );
         } else {
             warn!(
