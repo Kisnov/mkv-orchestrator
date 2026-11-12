@@ -1,3 +1,4 @@
+import { StrictMode, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 
@@ -161,6 +162,30 @@ describe("working set persistence", () => {
 
     expect(result.current.selectedPaths).toEqual(["/media/b.mkv"]);
     expect(setFileSelection).not.toHaveBeenCalled();
+  });
+
+  /// StrictMode invokes state updaters twice, so the push must not live in one.
+  it("pushes a toggled selection once under StrictMode", async () => {
+    const setFileSelection = vi.fn().mockResolvedValue({
+      updatedUtc: null,
+      files: [],
+      summary: emptySummary,
+      selectedPaths: ["/media/a.mkv"]
+    });
+    setBackendClient(createMockBackendClient({ setFileSelection }));
+
+    const { result } = renderHook(() => useMediaLibrary(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <StrictMode><MediaLibraryProvider>{children}</MediaLibraryProvider></StrictMode>
+      )
+    });
+    act(() => result.current.setFiles([file("/media/a.mkv")]));
+    act(() => result.current.toggleSelectedPath("/media/a.mkv"));
+    // Pushes are chained, so a duplicate only goes out after the first settles.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+    expect(setFileSelection).toHaveBeenCalledWith(["/media/a.mkv"]);
   });
 
   it("toggles a path on and off", () => {
