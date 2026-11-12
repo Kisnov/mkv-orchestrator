@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) fn provider_http_client() -> reqwest::Client {
@@ -185,9 +186,48 @@ pub trait MetadataProviderClient: Send + Sync {
     ) -> Result<Vec<EpisodeMetadata>, ProviderError>;
 }
 
+/// Spaces requests at least `interval` apart across every clone of a client.
+#[derive(Debug)]
+pub(crate) struct RateLimiter {
+    interval: Duration,
+    next: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    async fn acquire(&self) {
+        let slot = {
+            let mut next = self.next.lock().await;
+            let slot = (*next).max(Instant::now());
+            *next = slot + self.interval;
+            slot
+        };
+        tokio::time::sleep_until(slot).await;
+    }
+}
+
 pub(crate) async fn send_with_retry<F>(
     provider: ProviderKind,
     cancellation: &CancellationToken,
+    build: F,
+) -> Result<Response, ProviderError>
+where
+    F: FnMut() -> RequestBuilder,
+{
+    send_rate_limited(provider, cancellation, None, build).await
+}
+
+/// `send_with_retry`, with every attempt waiting for its turn in `limiter`.
+pub(crate) async fn send_rate_limited<F>(
+    provider: ProviderKind,
+    cancellation: &CancellationToken,
+    limiter: Option<&RateLimiter>,
     mut build: F,
 ) -> Result<Response, ProviderError>
 where
@@ -196,6 +236,9 @@ where
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
         let last_attempt = attempt + 1 == MAX_ATTEMPTS;
+        if let Some(limiter) = limiter {
+            wait_or_cancel(provider, cancellation, limiter.acquire()).await?;
+        }
         let send = build().send();
         let result = tokio::select! {
             () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider }),
@@ -327,6 +370,17 @@ mod tests {
         .await
         .expect("retried request");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limiter_spaces_requests_by_its_interval() {
+        let limiter = RateLimiter::new(Duration::from_secs(2));
+        let started = Instant::now();
+        limiter.acquire().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        limiter.acquire().await;
+        limiter.acquire().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
     }
 
     #[test]

@@ -11,25 +11,30 @@
 
 use std::{
     io::Read,
+    path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{
     EpisodeMetadata, MediaKind, MetadataProviderClient, ProviderCredentials, ProviderError,
-    ProviderKind, SearchResult, SelectedMedia, provider_http_client, send_with_retry,
+    ProviderKind, RateLimiter, SearchResult, SelectedMedia, provider_http_client,
+    send_rate_limited,
 };
 
 const TITLES_URL: &str = "https://anidb.net/api/anime-titles.xml.gz";
 const HTTP_API: &str = "http://api.anidb.net:9001/httpapi";
 const KIND: ProviderKind = ProviderKind::AniDb;
+const TITLES_FILE: &str = "anidb-titles.xml.gz";
 /// AniDB asks clients not to fetch the title dump more than once a day.
 const TITLE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// AniDB bans clients that send more than one request every two seconds.
+const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESULTS: usize = 50;
 /// The dump is a few megabytes; far more than that is not the dump.
 const MAX_TITLES_BYTES: usize = 64 * 1024 * 1024;
@@ -42,17 +47,15 @@ struct AnimeTitle {
     kind: String,
 }
 
+/// Dated by wall clock so the copy on disk keeps its age across restarts.
 #[derive(Debug, Default)]
 struct TitleCache {
-    titles: Vec<AnimeTitle>,
-    fetched_at: Option<Instant>,
+    titles: Arc<[AnimeTitle]>,
+    fetched_at: Option<SystemTime>,
 }
 
-impl TitleCache {
-    fn is_fresh(&self) -> bool {
-        self.fetched_at
-            .is_some_and(|at| at.elapsed() < TITLE_CACHE_TTL)
-    }
+fn is_fresh(fetched_at: SystemTime) -> bool {
+    fetched_at.elapsed().is_ok_and(|age| age < TITLE_CACHE_TTL)
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +63,9 @@ pub struct AniDbClient {
     http: reqwest::Client,
     titles_url: String,
     api_url: String,
-    cache: Arc<RwLock<TitleCache>>,
+    titles_path: Option<PathBuf>,
+    cache: Arc<Mutex<TitleCache>>,
+    limiter: Arc<RateLimiter>,
 }
 
 impl Default for AniDbClient {
@@ -81,20 +86,41 @@ impl AniDbClient {
             http: provider_http_client(),
             titles_url: titles_url.into(),
             api_url: api_url.into(),
-            cache: Arc::new(RwLock::new(TitleCache::default())),
+            titles_path: None,
+            cache: Arc::default(),
+            limiter: Arc::new(RateLimiter::new(REQUEST_INTERVAL)),
         }
+    }
+
+    /// Keep the title dump in `directory` so a restart does not download it again.
+    #[must_use]
+    pub fn with_cache_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.titles_path = Some(directory.into().join(TITLES_FILE));
+        self
     }
 
     async fn titles(
         &self,
         cancellation: CancellationToken,
-    ) -> Result<Vec<AnimeTitle>, ProviderError> {
-        if let Some(cached) = self.cached_titles().await {
-            return Ok(cached);
+    ) -> Result<Arc<[AnimeTitle]>, ProviderError> {
+        // Held across the download so concurrent searches share one fetch.
+        let mut cache = tokio::select! {
+            () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider: KIND }),
+            cache = self.cache.lock() => cache,
+        };
+        if !cache.fetched_at.is_some_and(is_fresh)
+            && let Some(stored) = self.stored_titles().await
+        {
+            *cache = stored;
+        }
+        if cache.fetched_at.is_some_and(is_fresh) {
+            return Ok(Arc::clone(&cache.titles));
         }
 
-        let mut response =
-            send_with_retry(KIND, &cancellation, || self.http.get(&self.titles_url)).await?;
+        let mut response = send_rate_limited(KIND, &cancellation, Some(&self.limiter), || {
+            self.http.get(&self.titles_url)
+        })
+        .await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -107,17 +133,31 @@ impl AniDbClient {
             bytes.extend_from_slice(&chunk);
         }
         let xml = decompress(&bytes, MAX_TITLES_BYTES)?;
-        let titles = parse_titles(&xml)?;
-
-        let mut cache = self.cache.write().await;
-        cache.titles = titles.clone();
-        cache.fetched_at = Some(Instant::now());
-        Ok(titles)
+        cache.titles = parse_titles(&xml)?.into();
+        cache.fetched_at = Some(SystemTime::now());
+        if let Some(path) = &self.titles_path {
+            // A copy that cannot be written only costs one download after a restart.
+            if let Some(directory) = path.parent() {
+                let _ = tokio::fs::create_dir_all(directory).await;
+            }
+            let _ = tokio::fs::write(path, &bytes).await;
+        }
+        Ok(Arc::clone(&cache.titles))
     }
 
-    async fn cached_titles(&self) -> Option<Vec<AnimeTitle>> {
-        let cache = self.cache.read().await;
-        cache.is_fresh().then(|| cache.titles.clone())
+    /// The dump an earlier run saved, while it is still less than a day old.
+    async fn stored_titles(&self) -> Option<TitleCache> {
+        let path = self.titles_path.as_ref()?;
+        let fetched_at = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+        if !is_fresh(fetched_at) {
+            return None;
+        }
+        let bytes = tokio::fs::read(path).await.ok()?;
+        let xml = decompress(&bytes, MAX_TITLES_BYTES).ok()?;
+        Some(TitleCache {
+            titles: parse_titles(&xml).ok()?.into(),
+            fetched_at: Some(fetched_at),
+        })
     }
 }
 
@@ -172,6 +212,10 @@ fn parse_titles(xml: &str) -> Result<Vec<AnimeTitle>, ProviderError> {
                     .to_ascii_lowercase(),
             });
         }
+    }
+    // An error page or a ban notice must not be cached as an empty dump.
+    if titles.is_empty() {
+        return Err(ProviderError::invalid(KIND, "title dump has no titles"));
     }
     Ok(titles)
 }
@@ -375,7 +419,7 @@ impl MetadataProviderClient for AniDbClient {
         let titles = self.titles(cancellation).await?;
 
         let mut matches: Vec<u64> = Vec::new();
-        for title in &titles {
+        for title in titles.iter() {
             if search_key(&title.text).contains(&key) && !matches.contains(&title.aid) {
                 matches.push(title.aid);
                 if matches.len() >= MAX_RESULTS {
@@ -420,7 +464,7 @@ impl MetadataProviderClient for AniDbClient {
         }
 
         let url = self.api_url.clone();
-        let response = send_with_retry(KIND, &cancellation, || {
+        let response = send_rate_limited(KIND, &cancellation, Some(&self.limiter), || {
             self.http.get(&url).query(&[
                 ("request", "anime"),
                 ("client", client_name.as_str()),
@@ -455,7 +499,12 @@ fn split_client(value: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{Router, routing::get};
+
     use super::*;
+    use crate::common::serve_stub;
 
     const TITLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <animetitles>
@@ -467,6 +516,139 @@ mod tests {
     <title xml:lang="x-jat" type="main">Cowboy Bebop</title>
   </anime>
 </animetitles>"#;
+
+    /// A stub AniDB that counts how often the title dump is downloaded. Each
+    /// call to the returned closure is a client as a restarted process has it.
+    async fn stub() -> (impl Fn() -> AniDbClient, Arc<AtomicUsize>) {
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&downloads);
+        let router = Router::new()
+            .route(
+                "/titles",
+                get(move || async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    TITLES_XML
+                }),
+            )
+            .route(
+                "/httpapi",
+                get(|| async { "<anime><episodecount>1</episodecount></anime>" }),
+            );
+        let base = serve_stub(router).await;
+        let client = move || {
+            AniDbClient::with_endpoints(format!("{base}/titles"), format!("{base}/httpapi"))
+        };
+        (client, downloads)
+    }
+
+    struct CacheDir(PathBuf);
+
+    impl CacheDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mkvo-anidb-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn search(client: &AniDbClient) -> Vec<SearchResult> {
+        client
+            .search(
+                &ProviderCredentials::api_key(""),
+                "bebop",
+                "eng",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search")
+    }
+
+    #[tokio::test]
+    async fn a_saved_dump_survives_a_restart() {
+        let (client, downloads) = stub().await;
+        let directory = CacheDir::new("restart");
+
+        assert_eq!(
+            search(&client().with_cache_dir(&directory.0)).await[0].id,
+            2
+        );
+        assert_eq!(
+            search(&client().with_cache_dir(&directory.0)).await[0].id,
+            2
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_saved_dump_older_than_a_day_is_downloaded_again() {
+        let (client, downloads) = stub().await;
+        let directory = CacheDir::new("stale");
+        let path = directory.0.join(TITLES_FILE);
+        std::fs::create_dir_all(&directory.0).expect("cache directory");
+        std::fs::write(&path, TITLES_XML).expect("saved dump");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(SystemTime::now() - 2 * TITLE_CACHE_TTL))
+            .expect("age the saved dump");
+
+        search(&client().with_cache_dir(&directory.0)).await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        let saved = std::fs::metadata(&path).expect("saved dump");
+        assert!(is_fresh(saved.modified().expect("modified")));
+    }
+
+    #[tokio::test]
+    async fn requests_wait_for_their_turn_in_the_rate_limiter() {
+        let (client, _) = stub().await;
+        let mut client = client();
+        client.limiter = Arc::new(RateLimiter::new(Duration::from_millis(300)));
+        let selected = SelectedMedia {
+            id: 2,
+            kind: MediaKind::Series,
+            name: String::new(),
+        };
+
+        let started = std::time::Instant::now();
+        for _ in 0..2 {
+            client
+                .episodes(
+                    &ProviderCredentials::api_key("mkvo/1"),
+                    &selected,
+                    "eng",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("episodes");
+        }
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn a_dump_without_titles_is_an_error() {
+        let error = parse_titles("<animetitles/>").expect_err("empty dump");
+        assert!(error.to_string().contains("no titles"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_searches_share_one_download() {
+        let (client, downloads) = stub().await;
+        let client = client();
+        let (first, second, third) =
+            tokio::join!(search(&client), search(&client), search(&client));
+        for results in [first, second, third] {
+            assert_eq!(results[0].id, 2);
+        }
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn titles_parse_with_language_and_type() {
