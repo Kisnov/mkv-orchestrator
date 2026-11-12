@@ -25,12 +25,14 @@ impl MediaProbePort for MediaScanAdapter {
         let scanned = crate::MediaProbe::inspect(self, path, cancel)
             .await
             .map_err(probe_port_error)?;
-        scanned_to_domain(scanned).map_err(|error| PortError::InvalidData(error.to_string()))
+        let metadata = tokio::fs::metadata(&scanned.path)
+            .await
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        Ok(scanned_to_domain(scanned, &metadata))
     }
 }
 
-fn scanned_to_domain(scanned: ScannedMedia) -> Result<MediaFile, std::io::Error> {
-    let metadata = std::fs::metadata(&scanned.path)?;
+fn scanned_to_domain(scanned: ScannedMedia, metadata: &std::fs::Metadata) -> MediaFile {
     let modified_at: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
     let status = if scanned.warning.is_some() {
         MediaStatus::Warning
@@ -49,7 +51,7 @@ fn scanned_to_domain(scanned: ScannedMedia) -> Result<MediaFile, std::io::Error>
         Some(value) => ContainerKind::Other(value.to_owned()),
         None => ContainerKind::Unknown,
     };
-    Ok(MediaFile {
+    MediaFile {
         path: scanned.path.clone(),
         original_file_name: scanned
             .path
@@ -119,7 +121,7 @@ fn scanned_to_domain(scanned: ScannedMedia) -> Result<MediaFile, std::io::Error>
         episode: None,
         provider_match: None,
         status,
-    })
+    }
 }
 
 fn hdr_label(transfer: Option<&str>, primaries: Option<&str>) -> Option<String> {
