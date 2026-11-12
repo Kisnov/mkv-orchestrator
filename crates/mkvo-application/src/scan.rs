@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
 use futures::{StreamExt, stream};
-use mkvo_contracts::{JobEvent, MediaFileDto, ScanRequest, ScanResponse, ScanSummary};
+use mkvo_contracts::{MediaFileDto, ScanRequest, ScanResponse, ScanSummary};
 use mkvo_domain::MediaFile;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -49,7 +49,6 @@ impl ScanOutcome {
 
 #[async_trait]
 pub trait ScanEventSink: Send + Sync {
-    async fn file_discovered(&self, file: &MediaFile) -> ApplicationResult<()>;
     async fn progress(&self, completed: u64, total: u64, current: &str) -> ApplicationResult<()>;
     async fn skipped(&self, path: &str, reason: &str) -> ApplicationResult<()>;
 }
@@ -58,10 +57,6 @@ pub struct NoopScanEventSink;
 
 #[async_trait]
 impl ScanEventSink for NoopScanEventSink {
-    async fn file_discovered(&self, _file: &MediaFile) -> ApplicationResult<()> {
-        Ok(())
-    }
-
     async fn progress(
         &self,
         _completed: u64,
@@ -78,13 +73,6 @@ impl ScanEventSink for NoopScanEventSink {
 
 #[async_trait]
 impl ScanEventSink for JobContext {
-    async fn file_discovered(&self, file: &MediaFile) -> ApplicationResult<()> {
-        self.emit(JobEvent::MediaDiscovered {
-            file: MediaFileDto::from(file),
-        })
-        .await
-    }
-
     async fn progress(&self, completed: u64, total: u64, current: &str) -> ApplicationResult<()> {
         JobContext::progress(self, completed, total, current, 100).await
     }
@@ -295,7 +283,6 @@ impl ScanService {
                     {
                         outcome.summary.mp4 += 1;
                     }
-                    sink.file_discovered(&file).await?;
                     let completed = outcome.summary.total + outcome.summary.failed;
                     sink.progress(completed, total, &file.file_name()).await?;
                     outcome.files.push(file);
@@ -524,9 +511,6 @@ mod tests {
     struct CancelOnProgress(CancellationToken);
     #[async_trait]
     impl ScanEventSink for CancelOnProgress {
-        async fn file_discovered(&self, _file: &MediaFile) -> ApplicationResult<()> {
-            Ok(())
-        }
         async fn progress(&self, _done: u64, _total: u64, _current: &str) -> ApplicationResult<()> {
             self.0.cancel();
             Ok(())
