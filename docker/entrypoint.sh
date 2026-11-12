@@ -25,5 +25,6 @@ if ! id mkvo >/dev/null 2>&1; then
         || true
 fi
 
-chown -R "${PUID}:${PGID}" /config 2>/dev/null || true
+# Only entries with the wrong owner are changed, so a normal start writes nothing.
+find /config \( ! -user "${PUID}" -o ! -group "${PGID}" \) -exec chown -h "${PUID}:${PGID}" {} + 2>/dev/null || true
 exec gosu "${PUID}:${PGID}" /app/mkvo-server "$@"
