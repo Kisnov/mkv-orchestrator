@@ -210,13 +210,18 @@ impl MkvoRuntime {
                     detail = %detail,
                     "media server rejected the stored credential"
                 );
-                Err(RuntimeError::new(
-                    ApiErrorCode::CredentialRejected,
+                let message = if connection.credential.trim().is_empty() {
+                    format!(
+                        "No API key is stored for {} ({detail}). Enter it in Settings.",
+                        server.name
+                    )
+                } else {
                     format!(
                         "{} rejected the stored API key ({detail}). Enter the key again in Settings.",
                         server.name
-                    ),
-                ))
+                    )
+                };
+                Err(RuntimeError::new(ApiErrorCode::CredentialRejected, message))
             }
             other => Ok(other?),
         }
@@ -292,6 +297,17 @@ impl MkvoRuntime {
                 },
                 library_count: libraries.len(),
             }),
+            Err(PortError::CredentialRejected(detail))
+                if connection.credential.trim().is_empty() =>
+            {
+                Ok(MediaServerTestResponse {
+                    success: false,
+                    status: format!(
+                        "No API key was entered and none is stored for this server ({detail})."
+                    ),
+                    library_count: 0,
+                })
+            }
             Err(error) => Ok(MediaServerTestResponse {
                 success: false,
                 status: error.to_string(),
@@ -726,6 +742,39 @@ mod media_server_credential_tests {
             error
                 .message
                 .contains("HTTP 401 Unauthorized for Items/show-1/Images/Primary"),
+            "{error}"
+        );
+    }
+
+    /// With nothing to send, the server's 401 is about a missing key, not a wrong one.
+    #[tokio::test]
+    async fn a_missing_key_is_reported_as_missing() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, None).await;
+
+        let result = host
+            .runtime
+            .test_media_server_connection(test_request(&server, &jellyfin.url, ""))
+            .await
+            .expect("test");
+        assert!(!result.success);
+        assert!(
+            result
+                .status
+                .starts_with("No API key was entered and none is stored for this server"),
+            "{}",
+            result.status
+        );
+
+        let error = host
+            .runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect_err("no key");
+        assert_eq!(error.code, ApiErrorCode::CredentialRejected);
+        assert!(
+            error.message.starts_with("No API key is stored for Home"),
             "{error}"
         );
     }
