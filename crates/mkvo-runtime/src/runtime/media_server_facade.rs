@@ -211,7 +211,9 @@ impl MkvoRuntime {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if request.api_key.is_none()
+        // A blank key means "use the stored one": the form reloads blank after a save.
+        let api_key = request.api_key.filter(|value| !value.trim().is_empty());
+        if api_key.is_none()
             && let (Some(requested_url), Some(stored)) = (requested_url, stored)
             && !media_server_urls_equivalent(requested_url, &stored.server_url)
         {
@@ -224,7 +226,7 @@ impl MkvoRuntime {
             .or_else(|| stored.map(|server| server.server_url.clone()))
             .ok_or_else(|| RuntimeError::invalid("Enter a server URL."))?;
         validate_media_server_url(&url)?;
-        let credential = match request.api_key {
+        let credential = match api_key {
             Some(value) => value,
             None => {
                 let key = stored
@@ -440,6 +442,219 @@ fn local_poster_content_type(path: &Path) -> &'static str {
     {
         Some("png") => "image/png",
         _ => "image/jpeg",
+    }
+}
+
+#[cfg(test)]
+mod media_server_credential_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    use mkvo_contracts::{ApiErrorCode, WebMediaServerLibraryPath, WebMediaServerRequest};
+
+    use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// A Jellyfin stand-in that only answers requests carrying the key `k`.
+    struct FakeJellyfin {
+        url: String,
+        paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeJellyfin {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+            let url = format!("http://{}", listener.local_addr().expect("fake address"));
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&paths);
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream);
+                    let mut path = String::new();
+                    let mut authorized = false;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                        if path.is_empty() {
+                            path = line.split(' ').nth(1).unwrap_or_default().to_owned();
+                        } else if let Some((name, value)) = line.split_once(':') {
+                            authorized |= name.eq_ignore_ascii_case("authorization")
+                                && value.trim() == r#"MediaBrowser Token="k""#;
+                        }
+                        line.clear();
+                    }
+                    seen.lock().expect("path log").push(path.clone());
+                    let (status, content_type, body) = if !authorized {
+                        ("401 Unauthorized", "text/plain", "")
+                    } else if path.starts_with("/Library/VirtualFolders") {
+                        (
+                            "200 OK",
+                            "application/json",
+                            r#"[{"Name":"Shows","ItemId":"lib-1","CollectionType":"tvshows","Locations":["/data/tv"]}]"#,
+                        )
+                    } else if path.contains("/Images/") {
+                        ("200 OK", "image/jpeg", "poster")
+                    } else {
+                        (
+                            "200 OK",
+                            "application/json",
+                            r#"{"Items":[{"Id":"show-1","Name":"Example Show","Type":"Series","Path":"/data/tv/Example Show","ImageTags":{"Primary":"tag"}}]}"#,
+                        )
+                    };
+                    let _ = reader.get_mut().write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+            Self { url, paths }
+        }
+
+        fn paths(&self) -> Vec<String> {
+            self.paths.lock().expect("path log").clone()
+        }
+    }
+
+    struct Host {
+        _directory: tempfile::TempDir,
+        runtime: MkvoRuntime,
+    }
+
+    fn host() -> Host {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let media = directory.path().join("media");
+        std::fs::create_dir_all(&media).expect("media root");
+        let runtime = MkvoRuntimeBuilder::new(&media, directory.path().join("config"))
+            .app_name("test")
+            .disable_legacy_migration()
+            .authorized_root(&media, true)
+            .build()
+            .expect("runtime");
+        Host {
+            _directory: directory,
+            runtime,
+        }
+    }
+
+    /// Saves one Jellyfin server the way the Settings page does.
+    async fn save_server(
+        runtime: &MkvoRuntime,
+        id: Option<&str>,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> WebMediaServer {
+        let saved = runtime
+            .save_web_settings(WebSettingsRequest {
+                media_servers: Some(vec![WebMediaServerRequest {
+                    id: id.map(str::to_owned),
+                    name: Some("Home".to_owned()),
+                    server_type: Some("jellyfin".to_owned()),
+                    server_url: Some(url.to_owned()),
+                    api_key: api_key.map(str::to_owned),
+                    is_default: true,
+                    libraries: Some(vec![WebMediaServerLibraryPath {
+                        id: "library-1".to_owned(),
+                        name: "Shows".to_owned(),
+                        media_type: "tvshows".to_owned(),
+                        server_path: "/data/tv".to_owned(),
+                        container_path: "/media/tv".to_owned(),
+                        is_enabled: true,
+                    }]),
+                }]),
+                ..WebSettingsRequest::default()
+            })
+            .await
+            .expect("save settings");
+        saved
+            .media_servers
+            .into_iter()
+            .next()
+            .expect("saved server")
+    }
+
+    fn test_request(
+        server: &WebMediaServer,
+        url: &str,
+        api_key: &str,
+    ) -> MediaServerConnectionRequest {
+        MediaServerConnectionRequest {
+            id: Some(server.id.clone()),
+            name: Some(server.name.clone()),
+            server_type: Some(server.server_type.clone()),
+            server_url: Some(url.to_owned()),
+            api_key: Some(api_key.to_owned()),
+        }
+    }
+
+    /// The Settings form reloads with a blank key field after a save, so Test
+    /// sends `""`. That is "use the stored key", not a credential.
+    #[tokio::test]
+    async fn test_with_a_blank_key_uses_the_stored_one() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("k")).await;
+
+        let result = host
+            .runtime
+            .test_media_server_connection(test_request(&server, &jellyfin.url, ""))
+            .await
+            .expect("test");
+
+        assert!(result.success, "{}", result.status);
+        assert_eq!(result.library_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_with_a_blank_key_never_sends_the_stored_one_to_another_url() {
+        let jellyfin = FakeJellyfin::start();
+        let other = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("k")).await;
+
+        let error = host
+            .runtime
+            .test_media_server_connection(test_request(&server, &other.url, ""))
+            .await
+            .expect_err("a changed URL needs the key again");
+
+        assert_eq!(error.code, ApiErrorCode::InvalidRequest);
+        assert!(other.paths().is_empty());
+    }
+
+    /// The whole stored-key path: saved through Settings (with the non-UUID id
+    /// a browser without `crypto.randomUUID` sends and stray whitespace around
+    /// the key), read back, and sent as the Jellyfin header on every endpoint.
+    #[tokio::test]
+    async fn a_saved_key_authorizes_catalog_and_artwork_requests() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, Some("local-1"), &jellyfin.url, Some(" k\n")).await;
+
+        let catalog = host
+            .runtime
+            .get_library_catalog(LibraryCatalogRequest {
+                server_id: server.id.clone(),
+                library_name: "Shows".to_owned(),
+            })
+            .await
+            .expect("catalog");
+        assert_eq!(catalog.items.len(), 1);
+
+        let artwork = host
+            .runtime
+            .get_library_artwork(LibraryArtworkRequest {
+                server_id: server.id,
+                item_id: catalog.items[0].id.clone(),
+            })
+            .await
+            .expect("artwork");
+        assert_eq!(artwork.content_type, "image/jpeg");
     }
 }
 
