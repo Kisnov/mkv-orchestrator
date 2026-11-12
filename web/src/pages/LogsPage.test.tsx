@@ -131,6 +131,31 @@ describe("Logs page", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("log store is read-only");
   });
 
+  it("keeps a later failure visible while the list still cannot be loaded", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.reject(new Error("log store unavailable")),
+      clearOperationLogs: () => Promise.reject(new Error("log store is read-only"))
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("log store unavailable");
+
+    await user.click(screen.getByTitle("Clear"));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear Logs" }));
+    expect(await screen.findByText("log store is read-only")).toBeInTheDocument();
+    expect(screen.getByText("log store unavailable")).toBeInTheDocument();
+  });
+
+  it("describes a failure that is not an Error", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] }),
+      exportOperationLogs: () => Promise.reject("boom")
+    });
+
+    await user.click(await screen.findByTitle(/export all logs/i));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Logs could not be exported.");
+  });
+
   it("names the icon-only buttons for assistive technology", async () => {
     renderWithBackend(<LogsPage />, {
       getOperationLogs: () => Promise.resolve({ entries: [entry] })

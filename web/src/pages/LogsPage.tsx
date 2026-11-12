@@ -20,8 +20,11 @@ export function LogsPage() {
       logs.refetch();
     }
   });
-  const [exportError, setExportError] = useState<Error | null>(null);
-  const failure = logs.error ?? clear.error ?? exportError;
+  const [exportError, setExportError] = useState<unknown>(null);
+  // One line per failing source, so a standing load error does not hide a later one.
+  const failures = ([[logs.error, "Logs could not be loaded."], [clear.error, "Logs could not be cleared."], [exportError, "Logs could not be exported."]] as const)
+    .filter(([error]) => error !== null)
+    .map(([error, fallback]) => (error instanceof Error && error.message) || fallback);
   const entries = logs.data?.entries ?? [];
   const areas = useMemo(() => ["All", ...Array.from(new Set(entries.map((entry) => entry.area))).sort()], [entries]);
   const visibleEntries = useMemo(() => {
@@ -40,7 +43,7 @@ export function LogsPage() {
   // server actually recorded, not just the entries this page has fetched.
   async function exportAllLogs() {
     setExportError(null);
-    const exported = await exportOperationLogs().catch((error: Error) => { setExportError(error); return null; });
+    const exported = await exportOperationLogs().catch((error: unknown) => { setExportError(error); return null; });
     if (!exported) return;
     const blob = new Blob([exported.content], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -105,7 +108,7 @@ export function LogsPage() {
             </label>
           </div>
 
-          {failure ? <div role="alert" className="mt-4 rounded-md border border-warning bg-panel px-3 py-2 text-sm text-warning">{failure.message}</div> : null}
+          {failures.map((failure, index) => <div key={index} role="alert" className="mt-4 rounded-md border border-warning bg-panel px-3 py-2 text-sm text-warning">{failure}</div>)}
           <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-panel">
             {visibleEntries.length === 0 ? (
               <div className="flex h-full min-h-[18.75rem] items-center justify-center text-sm text-subtle">
