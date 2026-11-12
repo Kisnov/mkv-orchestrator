@@ -1,5 +1,6 @@
 import { useEffect } from "react";
-import { screen, waitFor } from "@testing-library/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, it, vi } from "vitest";
 
@@ -53,4 +54,34 @@ it("builds a batch request from the user-arranged template order", async () => {
     selectedPaths: ["/media/01.mkv", "/media/02.mkv"],
     preserveOriginal: false
   });
+});
+
+function Rescan() {
+  const queryClient = useQueryClient();
+  return <button type="button" onClick={() => void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] })}>Rescan</button>;
+}
+
+it("keeps the user's batch when the scan changes", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  const files = [file("01.mkv"), file("02.mkv"), file("03.mkv")];
+  const summary = { total: 3, mkv: 3, mp4: 0, failed: 0, cached: 0 };
+  let selected: string[] = [];
+  const getCurrentScanFiles = vi.fn(() => Promise.resolve({ updatedUtc: `2026-11-12T10:00:0${getCurrentScanFiles.mock.calls.length}Z`, files, selectedPaths: selected, summary }));
+  const user = userEvent.setup();
+  renderWithBackend(
+    <MediaLibraryProvider><Rescan/><ReorderTracksPage/></MediaLibraryProvider>,
+    { getCurrentScanFiles, setFileSelection: (paths) => { selected = paths; return Promise.resolve({ files, selectedPaths: paths, updatedUtc: null, summary }); } }
+  );
+
+  // Nothing selected yet, so the page still starts with every MKV.
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select 03.mkv" })).toBeChecked());
+  await user.click(screen.getByRole("checkbox", { name: "Select 03.mkv" }));
+  await waitFor(() => expect(selected).toEqual(["/media/01.mkv", "/media/02.mkv"]));
+
+  await user.click(screen.getByRole("button", { name: "Rescan" }));
+  await waitFor(() => expect(getCurrentScanFiles).toHaveBeenCalledTimes(2));
+  await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+
+  expect(screen.getByRole("checkbox", { name: "Select 03.mkv" })).not.toBeChecked();
+  expect(selected).toEqual(["/media/01.mkv", "/media/02.mkv"]);
 });

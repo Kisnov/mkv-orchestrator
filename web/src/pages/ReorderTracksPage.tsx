@@ -40,7 +40,10 @@ export function ReorderTracksPage() {
       setSelectedDetailPath("");
     } else if (initializedSelectionScope.current !== scope) {
       initializedSelectionScope.current = scope;
-      setSelectedPaths((isWorkingView ? files : scan.files).filter((file) => file.extension.toLowerCase() === ".mkv").map((file) => file.path));
+      const mkvPaths = (isWorkingView ? files : scan.files).filter((file) => file.extension.toLowerCase() === ".mkv").map((file) => file.path);
+      const known = new Set(mkvPaths.map(normalizePath));
+      // A new scan only starts as the full batch when nothing is selected yet.
+      if (!selectedPaths.some((path) => known.has(normalizePath(path)))) setSelectedPaths(mkvPaths);
     }
   }, [currentScan.data, isWorkingView]);
 
@@ -131,7 +134,7 @@ export function ReorderTracksPage() {
                 const isTemplate = normalizePath(file.path) === normalizePath(templatePath);
                 const selected = selectedMkvPaths.some((path) => normalizePath(path) === normalizePath(file.path));
                 return <tr key={file.path} onClick={() => setSelectedDetailPath(file.path)} className={normalizePath(selectedDetailPath) === normalizePath(file.path) ? "cursor-pointer bg-selected" : "cursor-pointer bg-card hover:bg-selected"}>
-                  <td className="border-b border-border px-3 py-2"><div className="flex min-w-0 items-center gap-3"><input aria-label={`Select ${file.fileName}`} type="checkbox" checked={selected} disabled={isTemplate} onClick={(event) => event.stopPropagation()} onChange={() => toggleSelectedPath(file.path)} /><FileName value={file.fileName} /></div></td>
+                  <td className="border-b border-border px-3 py-2"><div className="flex min-w-0 items-center gap-3"><input aria-label={`Select ${file.fileName}`} type="checkbox" checked={selected} disabled={isTemplate && selected} onClick={(event) => event.stopPropagation()} onChange={() => toggleSelectedPath(file.path)} /><FileName value={file.fileName} /></div></td>
                   <td className="border-b border-border px-3 py-2">{file.reader}</td><td className="border-b border-border px-3 py-2">{file.codec || "Unknown"}</td><td className="max-w-[14rem] truncate border-b border-border px-3 py-2" title={file.audioSummary}>{file.audioSummary || "None"}</td><td className="max-w-[14rem] truncate border-b border-border px-3 py-2" title={file.subtitleSummary}>{file.subtitleSummary || "None"}</td><td className={["border-b border-border px-3 py-2", isTemplate ? "text-template" : selected ? "text-success" : "text-muted"].join(" ")}>{isTemplate ? "Template" : selected ? "Selected" : "Not selected"}</td>
                 </tr>;
               })}</tbody>
