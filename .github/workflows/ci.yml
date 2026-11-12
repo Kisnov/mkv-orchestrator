@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -21,6 +22,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Lint
+        run: npm run lint
       - name: Type-check and build
         run: npm run build
       - name: Test web UI
@@ -142,7 +145,7 @@ jobs:
         run: |
           mkdir -p config
           docker run -d --name mkvo-ci -p 8886:8080 \
-            -e MKVO_AUTH_USERNAME=mkvo-ci -e MKVO_AUTH_PASSWORD=mkvo-ci-password \
+            -e MKVO_AUTH_ENABLED=true -e MKVO_USERNAME=mkvo-ci -e MKVO_PASSWORD=mkvo-ci-password \
             -v "$PWD/media:/media" -v "$PWD/config:/config" mkvo:ci
       - name: Wait for the health check
         run: |
@@ -155,9 +158,15 @@ jobs:
           echo "container never became healthy"
           docker logs mkvo-ci
           exit 1
+      # The server only accepts a session cookie; HTTP basic auth returns 401.
+      - name: Sign in
+        run: |
+          curl -fsS -c cookies.txt -H 'Content-Type: application/json' \
+            -d '{"username":"mkvo-ci","password":"mkvo-ci-password"}' \
+            http://127.0.0.1:8886/api/auth/login
       - name: Every external tool resolves inside the container
         run: |
-          curl -fsS -u mkvo-ci:mkvo-ci-password http://127.0.0.1:8886/api/status > status.json
+          curl -fsS -b cookies.txt http://127.0.0.1:8886/api/status > status.json
           python3 - <<'PY'
           import json, sys
           tools = json.load(open("status.json"))["tools"]
@@ -168,11 +177,11 @@ jobs:
           PY
       - name: A scan of mounted media returns real tracks
         run: |
-          job=$(curl -fsS -u mkvo-ci:mkvo-ci-password -X POST http://127.0.0.1:8886/api/scans \
+          job=$(curl -fsS -b cookies.txt -X POST http://127.0.0.1:8886/api/scans \
             -H 'Content-Type: application/json' \
             -d '{"roots":["/media"],"recursive":true}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
           for _ in $(seq 1 30); do
-            curl -fsS -u mkvo-ci:mkvo-ci-password "http://127.0.0.1:8886/api/scans/$job" > scan.json
+            curl -fsS -b cookies.txt "http://127.0.0.1:8886/api/scans/$job" > scan.json
             status=$(python3 -c 'import json; print(json.load(open("scan.json"))["status"])')
             case "$status" in Completed|Failed|Canceled) break ;; esac
             sleep 2
@@ -202,30 +211,12 @@ jobs:
         if: always()
         run: docker logs mkvo-ci || true
 
-  audit:
-    name: Dependency audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.88"
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      # Fails on vulnerabilities. Unmaintained and unsound advisories are
-      # reported but not fatal: the current ones are all in Tauri's GTK
-      # dependency tree, which this repository cannot upgrade on its own, and a
-      # permanently red job is one people learn to ignore.
-      - name: Audit Rust dependencies
-        run: cargo audit
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Audit npm dependencies
-        working-directory: web
-        run: |
-          npm ci
-          npm audit --audit-level=high
+  publish:
+    # The image is only published from a commit whose whole CI run is green.
+    name: Publish Docker image
+    if: github.event_name == 'push'
+    needs: [web, rust-core, tauri-windows, tauri-cross-platform, docker]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml

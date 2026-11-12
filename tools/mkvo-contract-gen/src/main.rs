@@ -1189,12 +1189,10 @@ fn render_readme(definitions: &BTreeMap<String, Definition>) -> String {
          `contracts.ts` is generated from the serde-annotated Rust DTOs in `crates/mkvo-contracts`. It currently contains {compatibility_count} boundary DTOs and {dependency_count} referenced domain enums. It also includes zero-dependency runtime validators.\n\n\
          Generate bindings:\n\n\
          ```powershell\n\
-         ./scripts/generate-contracts.ps1\n\
+         cargo run --locked -p mkvo-contract-gen -- write\n\
          ```\n\n\
          Check drift without writing:\n\n\
          ```powershell\n\
-         ./scripts/generate-contracts.ps1 -Check\n\
-         # Cross-platform CI equivalent:\n\
          cargo run --locked -p mkvo-contract-gen -- --check\n\
          ```\n\n\
          ## Wire-shape rules\n\n\

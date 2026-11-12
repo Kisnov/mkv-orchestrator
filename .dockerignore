@@ -18,3 +18,4 @@ metadata_cache*.db
 *.db-wal
 settings.json
 appsettings*.json
+.env*

@@ -249,6 +249,16 @@ cargo test --workspace
 npm --prefix web test
 ```
 
+Run the other checks CI runs (formatting, lints, and drift in the generated TypeScript contracts):
+
+```powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --exclude mkvo-desktop -- -D warnings
+cargo run --locked --package mkvo-contract-gen -- --check
+```
+
+`.\scripts\verify.ps1` runs these together with the web build and the Rust tests.
+
 ## Command Line
 
 The `mkvo` binary drives the same runtime as the app, against whichever
@@ -299,9 +309,23 @@ docker exec mkvo mkvo scan /media --json
 
 ## Docker Web Container
 
-The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image.
+The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image. Those are the versions Debian bookworm packages (currently MKVToolNix 74 and FFmpeg 5.1), not the latest upstream releases.
 
-Build and run:
+CI publishes the image to GHCR from every commit on `main` whose CI run passed:
+
+```text
+ghcr.io/kisnov/mkv-orchestrator:latest
+ghcr.io/kisnov/mkv-orchestrator:sha-<short commit>
+```
+
+Run the published image:
+
+```powershell
+docker compose pull
+docker compose up -d
+```
+
+Or build and run from source:
 
 ```powershell
 docker compose up --build

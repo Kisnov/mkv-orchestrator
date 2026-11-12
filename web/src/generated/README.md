@@ -5,14 +5,12 @@
 Generate bindings:
 
 ```powershell
-./scripts/generate-contracts.ps1
+cargo run --locked -p mkvo-contract-gen -- write
 ```
 
 Check drift without writing:
 
 ```powershell
-./scripts/generate-contracts.ps1 -Check
-# Cross-platform CI equivalent:
 cargo run --locked -p mkvo-contract-gen -- --check
 ```
 

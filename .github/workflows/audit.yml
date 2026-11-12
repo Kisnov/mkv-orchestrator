@@ -1,0 +1,51 @@
+name: Dependency audit
+
+# Advisories are published independently of commits, so this runs weekly and
+# whenever a lockfile changes instead of on every CI run.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  push:
+    branches: [main]
+    paths: [Cargo.lock, web/package-lock.json, .github/workflows/audit.yml]
+  pull_request:
+    paths: [Cargo.lock, web/package-lock.json, .github/workflows/audit.yml]
+  workflow_dispatch:
+
+env:
+  CARGO_AUDIT_VERSION: "0.23.0"
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - name: Cache cargo-audit
+        id: cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ runner.os }}
+      - name: Install cargo-audit
+        if: steps.cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+      # Fails on vulnerabilities. Unmaintained and unsound advisories are
+      # reported but not fatal: the current ones are all in Tauri's GTK
+      # dependency tree, which this repository cannot upgrade on its own, and a
+      # permanently red job is one people learn to ignore.
+      - name: Audit Rust dependencies
+        run: cargo audit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Audit npm dependencies
+        working-directory: web
+        run: |
+          npm ci
+          npm audit --audit-level=high

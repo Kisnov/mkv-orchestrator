@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: mkvo:local
+    image: ghcr.io/kisnov/mkv-orchestrator:latest
     container_name: mkvo
     ports:
       - "8886:8080"
