@@ -86,6 +86,7 @@ export function TrackPropertiesPage() {
   const [statusText, setStatusText] = useState("Load scanned files from Dashboard, then select a template.");
   const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
   const [configurationReady, setConfigurationReady] = useState(false);
+  const lastPreview = useRef<{ request: string; plan: PropEditPreviewResponse } | null>(null);
 
   useEffect(() => {
     if (!currentScan.data) return;
@@ -200,7 +201,8 @@ export function TrackPropertiesPage() {
 
   const preview = useMutation({
     mutationFn: buildPropEditPreview,
-    onSuccess: (response) => {
+    onSuccess: (response, request) => {
+      lastPreview.current = { request: JSON.stringify(request), plan: response };
       setPreviewResult(response);
       setStatusText(response.status);
     },
@@ -284,8 +286,12 @@ export function TrackPropertiesPage() {
     if (selectedMkvPaths.length === 0 || !template) return;
     const request = buildRequest();
     try {
-      const plan = await preview.mutateAsync(request);
+      // Apply the plan that was previewed unless the request has changed since.
+      const previewed = lastPreview.current?.request === JSON.stringify(request) ? lastPreview.current.plan : null;
+      const plan = previewed ?? await preview.mutateAsync(request);
       if (!plan.actions.length) { setStatusText("No changes are needed for the selected files."); return; }
+      // A plan runs once: applying it again would only replay the finished job.
+      lastPreview.current = null;
       await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
     } catch { /* Mutation handlers display the error. */ }
   }

@@ -1,6 +1,6 @@
 import { useMediaLibrary, MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
+import type { MediaFileRow, PropEditPreviewRequest, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -175,6 +175,51 @@ describe("Track Properties template synchronization", () => {
     await user.selectOptions(videoDefault, "None");
     await user.click(screen.getByRole("button", { name: "Preview Summary" }));
     await waitFor(() => expect(buildPropEditPreview).toHaveBeenLastCalledWith(expect.objectContaining({ selectedDefaultVideo: "None" })));
+  });
+
+  it("applies the plan that was previewed while the request is unchanged", async () => {
+    const user = userEvent.setup();
+    const scannedFile = file("Episode 01.mkv");
+    const buildPropEditPreview = vi.fn((_request: PropEditPreviewRequest) => Promise.resolve({
+      actions: [{ index: 0, filePath: scannedFile.path, fileName: scannedFile.fileName, description: "Apply 1 property mutation(s)", command: "" }],
+      skipped: [], noChange: [], summary: "ready", status: "ready",
+      planId: `plan-${buildPropEditPreview.mock.calls.length}`, planFingerprint: "fingerprint", idempotencyKey: `key-${buildPropEditPreview.mock.calls.length}`
+    }));
+    const startPropEditApply = vi.fn((_request: PropEditPreviewRequest) => Promise.reject(new Error("Test stops before tracking a job")));
+
+    renderWithBackend(
+      <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
+      {
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-25T20:00:00Z", files: [scannedFile], selectedPaths: [scannedFile.path], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
+        getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
+        loadPropEditTemplate: () => Promise.resolve(template(scannedFile.path)),
+        buildPropEditPreview,
+        startPropEditApply
+      }
+    );
+
+    await screen.findByText(`Template loaded: ${scannedFile.fileName}`);
+    const applyButton = screen.getByRole("button", { name: "Apply Changes" });
+    await user.click(screen.getByRole("button", { name: "Preview Summary" }));
+    await waitFor(() => expect(buildPropEditPreview).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByTitle("Close"));
+    await user.click(applyButton);
+    await waitFor(() => expect(startPropEditApply).toHaveBeenCalledTimes(1));
+    expect(buildPropEditPreview).toHaveBeenCalledTimes(1);
+    expect(startPropEditApply.mock.calls[0][0]).toMatchObject({ planId: "plan-1", idempotencyKey: "key-1" });
+
+    // A plan is spent once applied, and a changed request needs a new one.
+    await user.click(applyButton);
+    await waitFor(() => expect(startPropEditApply).toHaveBeenCalledTimes(2));
+    expect(startPropEditApply.mock.calls[1][0]).toMatchObject({ planId: "plan-2" });
+    await user.click(screen.getByRole("button", { name: "Preview Summary" }));
+    await waitFor(() => expect(buildPropEditPreview).toHaveBeenCalledTimes(3));
+    await user.click(screen.getByTitle("Close"));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Set video default flag" }), "Default");
+    await user.click(applyButton);
+    await waitFor(() => expect(startPropEditApply).toHaveBeenCalledTimes(3));
+    expect(buildPropEditPreview).toHaveBeenCalledTimes(4);
+    expect(startPropEditApply.mock.calls[2][0]).toMatchObject({ planId: "plan-4", selectedDefaultVideo: "Default" });
   });
 
   it("reloads its track template when Dashboard changes the shared template file", async () => {
