@@ -237,11 +237,14 @@ impl MetadataProviderClient for TvdbClient {
                 continue;
             }
             lookups += 1;
-            if let Ok(Some(name)) = self
+            match self
                 .localized_series_name(credentials, result.id, &language, &cancellation)
                 .await
             {
-                result.name = name;
+                Ok(Some(name)) => result.name = name,
+                Ok(None) => {}
+                // Names are cosmetic, so a failing TVDB is not asked for the rest.
+                Err(_) => lookups = MAX_NAME_LOOKUPS,
             }
         }
         Ok(results)
@@ -531,7 +534,8 @@ mod tests {
         assert_eq!(logins.load(Ordering::SeqCst), 2);
     }
 
-    /// A stub whose series search returns `series` and which counts the name lookups.
+    /// A stub whose series search returns `series` and which counts the name
+    /// lookups; ids from 100 up have no extended record.
     async fn search_stub(series: Value) -> (TvdbClient, Arc<AtomicUsize>) {
         let lookups = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&lookups);
@@ -556,9 +560,12 @@ mod tests {
                 "/series/{id}/extended",
                 get(move |Path(id): Path<u64>| async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({"data": {"translations": {"nameTranslations": [
+                    if id >= 100 {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                    Ok(Json(json!({"data": {"translations": {"nameTranslations": [
                         {"language": "cat", "name": format!("Sèrie {id}")}
-                    ]}}}))
+                    ]}}})))
                 }),
             );
         let base = Url::parse(&format!("{}/", serve_stub(router).await)).expect("stub URL");
@@ -587,6 +594,26 @@ mod tests {
             assert_eq!(results[10].name, "Series 11");
         }
         assert_eq!(lookups.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn name_lookups_stop_at_the_first_failure() {
+        let series: Vec<Value> = (100..115)
+            .map(|id| json!({"tvdb_id": id.to_string(), "name": format!("Series {id}")}))
+            .collect();
+        let (client, lookups) = search_stub(json!(series)).await;
+        let results = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "series",
+                "cat",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search");
+        assert_eq!(results[0].name, "Series 100");
+        assert_eq!(results.len(), 15);
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
