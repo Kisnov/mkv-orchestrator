@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { LogsPage } from "./LogsPage";
@@ -69,5 +69,28 @@ describe("Logs page", () => {
 
     // The page must not claim there are simply no logs when the query failed.
     await waitFor(() => expect(screen.queryAllByText("Scan completed")).toHaveLength(0));
+  });
+
+  it("asks for confirmation before clearing the logs", async () => {
+    const user = userEvent.setup();
+    const clearOperationLogs = vi.fn().mockResolvedValue({ entries: [] });
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] }),
+      clearOperationLogs
+    });
+    await screen.findAllByText("Scan completed");
+
+    await user.click(screen.getByTitle("Clear"));
+    const dialog = screen.getByRole("dialog", { name: "Clear Logs" });
+    expect(clearOperationLogs).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(clearOperationLogs).not.toHaveBeenCalled();
+
+    await user.click(screen.getByTitle("Clear"));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear Logs" }));
+    await waitFor(() => expect(clearOperationLogs).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(await screen.findByText(/logs cleared/i)).toBeInTheDocument();
   });
 });

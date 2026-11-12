@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Copy, Download, FileDown, RefreshCw, Trash2 } from "lucide-react";
 import { clearOperationLogs, exportOperationLogs, getOperationLogs, OperationLogEntry } from "../api";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { SectionHeader } from "../components/SectionHeader";
 
 export function LogsPage() {
@@ -10,6 +11,7 @@ export function LogsPage() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [areaFilter, setAreaFilter] = useState("All");
   const [statusText, setStatusText] = useState("");
+  const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
   const clear = useMutation({
     mutationFn: clearOperationLogs,
     onSuccess: () => {
@@ -73,7 +75,7 @@ export function LogsPage() {
               <button onClick={exportAllLogs} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Export all logs">
                 <FileDown size={15} />
               </button>
-              <button onClick={() => clear.mutate()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Clear">
+              <button onClick={() => setIsClearConfirmOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Clear">
                 <Trash2 size={15} />
               </button>
             </div>
@@ -153,6 +155,15 @@ export function LogsPage() {
           )}
         </section>
       </div>
+      {isClearConfirmOpen ? (
+        <ConfirmModal
+          title="Clear Logs"
+          message="This permanently deletes every recorded operation log. Export them first if you need a copy."
+          confirmLabel="Clear Logs"
+          onConfirm={() => { setIsClearConfirmOpen(false); clear.mutate(); }}
+          onClose={() => setIsClearConfirmOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
