@@ -104,7 +104,7 @@ fn enumerate_files(
             if !extensions.contains(&extension) {
                 continue;
             }
-            files.push(fingerprint_file(entry.path(), quick_hash).map_err(|error| {
+            files.push(fingerprint_entry(&entry, quick_hash).map_err(|error| {
                 PortError::Other(format!(
                     "could not fingerprint `{}`: {error}",
                     entry.path().display()
@@ -248,18 +248,37 @@ impl FileSystem for LocalFileSystem {
     }
 }
 
-fn fingerprint_file(
-    path: &Path,
+/// The walk starts at a canonical root and follows no links, so the entry's
+/// path is already canonical and its metadata came with the directory read.
+fn fingerprint_entry(
+    entry: &DirEntry,
     include_quick_hash: bool,
 ) -> Result<FileFingerprint, std::io::Error> {
-    let canonical = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical)?;
+    fingerprint(entry.path(), &entry.metadata()?, include_quick_hash)
+}
+
+fn fingerprint_file(
+    canonical: &Path,
+    include_quick_hash: bool,
+) -> Result<FileFingerprint, std::io::Error> {
+    fingerprint(
+        canonical,
+        &std::fs::metadata(canonical)?,
+        include_quick_hash,
+    )
+}
+
+fn fingerprint(
+    canonical: &Path,
+    metadata: &std::fs::Metadata,
+    include_quick_hash: bool,
+) -> Result<FileFingerprint, std::io::Error> {
     let modified_at: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
     let quick_hash = include_quick_hash
-        .then(|| quick_hash_file(&canonical, metadata.len()))
+        .then(|| quick_hash_file(canonical, metadata.len()))
         .transpose()?;
     Ok(FileFingerprint {
-        path: canonical,
+        path: canonical.to_path_buf(),
         size_bytes: metadata.len(),
         modified_at,
         quick_hash,
@@ -458,6 +477,96 @@ mod tests {
         let second = quick_hash_file(&path, 128 * 1024).expect("hash");
         let _ = std::fs::remove_file(path);
         assert_ne!(first, second);
+    }
+
+    fn temp_tree(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mkvo-enumerate-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp tree");
+        path
+    }
+
+    fn enumerate(roots: &[PathBuf]) -> Result<Vec<FileFingerprint>, PortError> {
+        enumerate_files(
+            roots,
+            &BTreeSet::new(),
+            &BTreeSet::from(["mkv".to_owned()]),
+            false,
+            &CancellationToken::new(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn link_dir(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("directory symlink");
+    }
+
+    /// A junction, because a Windows symlink needs a privilege tests lack.
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) {
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .args([link, target])
+            .output()
+            .expect("mklink");
+        assert!(created.status.success(), "{created:?}");
+    }
+
+    /// The scan root is authorized once; nothing below it is checked again, so
+    /// the walk itself must never leave it.
+    #[test]
+    fn enumeration_does_not_follow_links_out_of_the_root() {
+        let tree = temp_tree("links");
+        let root = tree.join("root");
+        let outside = tree.join("outside");
+        std::fs::create_dir_all(root.join("season")).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(root.join("season").join("a.mkv"), b"inside").expect("inside");
+        std::fs::write(outside.join("secret.mkv"), b"outside").expect("outside file");
+        link_dir(&outside, &root.join("escape"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secret.mkv"), root.join("link.mkv"))
+            .expect("file symlink");
+
+        let root = std::fs::canonicalize(root).expect("canonical root");
+        let files = enumerate(std::slice::from_ref(&root));
+        let _ = std::fs::remove_dir_all(&tree);
+        let paths: Vec<_> = files
+            .expect("enumerate")
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(paths, [root.join("season").join("a.mkv")]);
+    }
+
+    /// Cache rows are keyed by these values, so they must stay what
+    /// `canonicalize` and `metadata` report for the file.
+    #[test]
+    fn enumerated_fingerprints_match_the_canonical_path_and_metadata() {
+        let tree = temp_tree("fingerprint");
+        let file = tree.join("Show").join("a.mkv");
+        std::fs::create_dir_all(tree.join("Show")).expect("folder");
+        std::fs::write(&file, b"media").expect("file");
+        let canonical = std::fs::canonicalize(&file).expect("canonical file");
+        let metadata = std::fs::metadata(&file).expect("metadata");
+
+        let files = enumerate(&[std::fs::canonicalize(&tree).expect("canonical root")]);
+        let _ = std::fs::remove_dir_all(&tree);
+        assert_eq!(
+            files.expect("enumerate"),
+            [FileFingerprint {
+                path: canonical,
+                size_bytes: metadata.len(),
+                modified_at: metadata.modified().expect("modified").into(),
+                quick_hash: None,
+            }]
+        );
     }
 
     #[tokio::test]
