@@ -54,8 +54,11 @@ struct TitleCache {
     fetched_at: Option<SystemTime>,
 }
 
+/// A date in the future means the clock stepped back, which counts as just fetched.
 fn is_fresh(fetched_at: SystemTime) -> bool {
-    fetched_at.elapsed().is_ok_and(|age| age < TITLE_CACHE_TTL)
+    fetched_at
+        .elapsed()
+        .map_or(true, |age| age < TITLE_CACHE_TTL)
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +556,19 @@ mod tests {
         }
     }
 
+    /// Leave a dump in `directory` as a run at `modified` would have saved it.
+    fn save_dump(directory: &CacheDir, modified: SystemTime) -> PathBuf {
+        let path = directory.0.join(TITLES_FILE);
+        std::fs::create_dir_all(&directory.0).expect("cache directory");
+        std::fs::write(&path, TITLES_XML).expect("saved dump");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(modified))
+            .expect("date the saved dump");
+        path
+    }
+
     impl Drop for CacheDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -591,19 +607,26 @@ mod tests {
     async fn a_saved_dump_older_than_a_day_is_downloaded_again() {
         let (client, downloads) = stub().await;
         let directory = CacheDir::new("stale");
-        let path = directory.0.join(TITLES_FILE);
-        std::fs::create_dir_all(&directory.0).expect("cache directory");
-        std::fs::write(&path, TITLES_XML).expect("saved dump");
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .and_then(|file| file.set_modified(SystemTime::now() - 2 * TITLE_CACHE_TTL))
-            .expect("age the saved dump");
+        let path = save_dump(&directory, SystemTime::now() - 2 * TITLE_CACHE_TTL);
 
         search(&client().with_cache_dir(&directory.0)).await;
         assert_eq!(downloads.load(Ordering::SeqCst), 1);
         let saved = std::fs::metadata(&path).expect("saved dump");
         assert!(is_fresh(saved.modified().expect("modified")));
+    }
+
+    /// A clock that stepped back must not turn every search into a download.
+    #[tokio::test]
+    async fn a_saved_dump_dated_in_the_future_is_not_downloaded_again() {
+        let (client, downloads) = stub().await;
+        let directory = CacheDir::new("future");
+        save_dump(&directory, SystemTime::now() + Duration::from_secs(3600));
+
+        assert_eq!(
+            search(&client().with_cache_dir(&directory.0)).await[0].id,
+            2
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
