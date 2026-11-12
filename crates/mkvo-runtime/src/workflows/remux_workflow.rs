@@ -363,19 +363,6 @@ impl MkvoRuntime {
             if item.mode == RemuxMode::ExtractSubtitles {
                 continue;
             }
-            let old = item.temporary_output.clone();
-            let stem = item
-                .source
-                .file_stem()
-                .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
-            item.temporary_output = item
-                .source
-                .with_file_name(format!("{stem}.mkvo-remux.tmp.mkv"));
-            for resource in &mut context.resources {
-                if same_path(&resource.path, &old) {
-                    resource.path.clone_from(&item.temporary_output);
-                }
-            }
             if !same_path(&item.source, &item.final_output)
                 && self
                     .dependencies()

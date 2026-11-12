@@ -386,16 +386,17 @@ fn selected_tracks(file: &MediaFile, options: &RemuxOptions) -> Vec<u64> {
 }
 
 fn temporary_output_for(file: &MediaFile, mode: RemuxMode) -> PathBuf {
-    let stem = file
+    let name = file
         .path
-        .file_stem()
+        .file_name()
         .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
     let suffix = match mode {
         RemuxMode::ExtractSubtitles => "extract",
         RemuxMode::ConvertToMkv | RemuxMode::MuxSubtitles | RemuxMode::Remux => "remux",
     };
+    // Hidden and without a media extension, so watchers and media servers ignore it.
     file.path
-        .with_file_name(format!("{stem}.mkvo-{suffix}.tmp.mkv"))
+        .with_file_name(format!(".{name}.mkvo-{suffix}.tmp"))
 }
 
 fn preserved_output_for(file: &MediaFile, suffix: &str) -> PathBuf {
@@ -601,6 +602,15 @@ mod tests {
         );
         assert!(plan.payload.items[0].delete_source_after_success);
         assert!(plan.payload.items[0].can_apply());
+    }
+
+    #[test]
+    fn temporary_output_is_hidden_non_media_and_unique_per_source() {
+        let matroska = temporary_output_for(&media("show/a.mkv"), RemuxMode::Remux);
+        let mp4 = temporary_output_for(&media("show/a.mp4"), RemuxMode::ConvertToMkv);
+
+        assert_eq!(matroska, PathBuf::from("show/.a.mkv.mkvo-remux.tmp"));
+        assert_eq!(mp4, PathBuf::from("show/.a.mp4.mkvo-remux.tmp"));
     }
 
     #[test]
@@ -864,11 +874,10 @@ mod tests {
                     assert_eq!(item.selected_track_ids, [0, 1, 4]);
                     assert!(!item.preserve_chapters);
                     assert!(!item.preserve_attachments);
+                    // Unlike the legacy app, the temporary file is hidden from media scanners.
                     assert_eq!(
                         portable(&item.temporary_output),
-                        case["expected"]["actions"][0]["tempOutputPath"]
-                            .as_str()
-                            .unwrap()
+                        "${ROOT}/Shows/Example/Season 01/.Example - S01E01.mkv.mkvo-remux.tmp"
                     );
                 }
                 "sidecar-discovery-tagging-and-existing-track-skip" => {
@@ -894,7 +903,7 @@ mod tests {
                     );
                     assert_eq!(
                         portable(&conversion.temporary_output),
-                        "${ROOT}/Movies/Example Movie.mkvo-remux.tmp.mkv"
+                        "${ROOT}/Movies/.Example Movie.mp4.mkvo-remux.tmp"
                     );
                     assert!(conversion.delete_source_after_success);
                     assert!(conversion.can_apply());
