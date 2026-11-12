@@ -107,7 +107,8 @@ async fn jellyfin_connection_and_libraries_round_trip_over_http() {
         )
         .route(
             "/Items",
-            get(|| async {
+            get(|State(seen): State<Seen>, headers: HeaderMap| async move {
+                seen.record("/Items", &headers);
                 axum::Json(serde_json::json!({"Items":[{
                     "Id":"show-1",
                     "Name":"Example Show",
@@ -120,10 +121,13 @@ async fn jellyfin_connection_and_libraries_round_trip_over_http() {
         )
         .route(
             "/Items/{id}/Images/Primary",
-            get(|AxumPath(id): AxumPath<String>| async move {
-                assert_eq!(id, "show-1");
-                ([("content-type", "image/jpeg")], vec![1_u8, 2, 3, 4])
-            }),
+            get(
+                |seen: State<Seen>, id: AxumPath<String>, headers: HeaderMap| async move {
+                    assert_eq!(id.0, "show-1");
+                    seen.record("/Items/show-1/Images/Primary", &headers);
+                    ([("content-type", "image/jpeg")], vec![1_u8, 2, 3, 4])
+                },
+            ),
         )
         .with_state(seen.clone());
 
@@ -199,6 +203,15 @@ async fn jellyfin_connection_and_libraries_round_trip_over_http() {
         .expect("poster artwork");
     assert_eq!(artwork.content_type, "image/jpeg");
     assert_eq!(artwork.bytes, vec![1, 2, 3, 4]);
+
+    // The catalog and poster requests carry the same credential as discovery.
+    for path in ["/System/Info", "/Items", "/Items/show-1/Images/Primary"] {
+        assert_eq!(
+            seen.header_for(path, "authorization").as_deref(),
+            Some("MediaBrowser Token=\"token-123\""),
+            "{path}"
+        );
+    }
     server.abort();
 }
 
