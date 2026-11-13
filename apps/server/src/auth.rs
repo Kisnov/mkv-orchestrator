@@ -79,10 +79,22 @@ fn status(auth: &AuthState, peer: Option<SocketAddr>, authenticated: bool) -> Au
 }
 
 fn peer(request: &Request) -> Option<SocketAddr> {
-    request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0)
+    direct_peer(
+        request.headers(),
+        request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0),
+    )
+}
+
+/// The TCP peer, unless a proxy relayed the request: then it is the proxy, not the visitor.
+fn direct_peer(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<SocketAddr> {
+    let forwarded = headers.keys().any(|name| {
+        let name = name.as_str();
+        name == "forwarded" || name == "x-real-ip" || name.starts_with("x-forwarded-")
+    });
+    peer.filter(|_| !forwarded)
 }
 
 async fn auth_status(State(auth): State<AuthState>, request: Request) -> Json<AuthStatus> {
@@ -107,6 +119,7 @@ fn error(code: axum::http::StatusCode, detail: &str) -> Response {
 async fn auth_login(
     State(auth): State<AuthState>,
     peer: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     input: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Response {
     let Ok(Json(input)) = input else {
@@ -139,7 +152,11 @@ async fn auth_login(
     drop(throttle);
     (
         [(header::SET_COOKIE, cookie)],
-        Json(status(&auth, peer.map(|info| info.0.0), true)),
+        Json(status(
+            &auth,
+            direct_peer(&headers, peer.map(|info| info.0.0)),
+            true,
+        )),
     )
         .into_response()
 }
@@ -400,8 +417,7 @@ impl AuthState {
         Ok(())
     }
 
-    // Deliberately use the TCP peer, never client-controlled Forwarded headers.
-    // A private reverse proxy therefore qualifies when this opt-in is enabled.
+    // Callers pass the direct TCP peer only; forwarded requests arrive as `None`.
     pub fn local_bypass(&self, peer: Option<SocketAddr>) -> bool {
         self.security_settings().local_network_bypass
             && peer.is_some_and(|peer| is_local(peer.ip()))

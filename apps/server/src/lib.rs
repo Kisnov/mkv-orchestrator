@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lan_bypass_ignores_forwarded_headers_and_fails_closed_without_peer() {
+    async fn lan_bypass_needs_a_direct_local_peer_and_fails_closed_without_one() {
         let host = TestHost::new(Some(BasicAuth {
             username: "admin".to_owned(),
             password: "secret".to_owned(),
@@ -449,31 +449,41 @@ mod tests {
         )
         .unwrap();
         let router = host.router();
-        for peer in [
+        // A proxy in front makes every visitor look local, so any forwarding header turns the bypass off.
+        for forwarded in [
             None,
-            Some("8.8.8.8:1234"),
-            Some("100.64.0.1:1234"),
-            Some("192.168.1.2:1234"),
+            Some(("X-Forwarded-For", "127.0.0.1")),
+            Some(("X-Forwarded-Proto", "https")),
+            Some(("Forwarded", "for=192.168.1.9")),
+            Some(("X-Real-IP", "192.168.1.9")),
         ] {
-            let mut request = Request::get("/api/status")
-                .header("X-Forwarded-For", "127.0.0.1")
-                .header("Host", "localhost")
-                .body(Body::empty())
-                .unwrap();
-            if let Some(peer) = peer {
-                request.extensions_mut().insert(axum::extract::ConnectInfo(
-                    peer.parse::<SocketAddr>().unwrap(),
-                ));
-            }
-            let response = router.clone().oneshot(request).await.unwrap();
-            assert_eq!(
-                response.status(),
-                if peer == Some("192.168.1.2:1234") {
-                    StatusCode::OK
-                } else {
-                    StatusCode::UNAUTHORIZED
+            for peer in [
+                None,
+                Some("8.8.8.8:1234"),
+                Some("100.64.0.1:1234"),
+                Some("192.168.1.2:1234"),
+            ] {
+                let mut request = Request::get("/api/status").header("Host", "localhost");
+                if let Some((name, value)) = forwarded {
+                    request = request.header(name, value);
                 }
-            );
+                let mut request = request.body(Body::empty()).unwrap();
+                if let Some(peer) = peer {
+                    request.extensions_mut().insert(axum::extract::ConnectInfo(
+                        peer.parse::<SocketAddr>().unwrap(),
+                    ));
+                }
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    if forwarded.is_none() && peer == Some("192.168.1.2:1234") {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    },
+                    "{forwarded:?} {peer:?}"
+                );
+            }
         }
     }
 
