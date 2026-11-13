@@ -147,7 +147,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       extractSubtitleLanguages: extractLanguages,
       extractOverwriteExistingFiles: extractOverwrite,
       convertMp4ToMkv: convertMp4,
-      deleteMp4AfterConvert
+      deleteMp4AfterConvert: convertMp4 && deleteMp4AfterConvert
     });
   }
 

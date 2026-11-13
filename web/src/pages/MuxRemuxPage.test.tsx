@@ -359,3 +359,26 @@ it("counts only what it will send: an MP4 is unavailable until conversion is on"
   expect(screen.getByText("1 of 2 selected")).toBeInTheDocument();
   expect(screen.getByText("1 files selected")).toBeInTheDocument();
 });
+
+it("asks to delete MP4s only while conversion is on", async () => {
+  const user = userEvent.setup();
+  const mkv = mediaFile("Episode 01.mkv");
+  const mp4 = { ...mediaFile("Movie.mp4"), extension: ".mp4", reader: "ffprobe" };
+  const files = [mkv, mp4];
+  const scan = { updatedUtc: "2026-11-13T10:00:00Z", files, selectedPaths: files.map((file) => file.path), summary: { total: 2, mkv: 1, mp4: 1, failed: 0, cached: 0 } };
+  const buildMuxPreview = vi.fn((_request: MuxPreviewRequest) => Promise.resolve({ actions: [], noChangeFiles: [], summary: "", status: "Preview ready", planId: null, planFingerprint: null, idempotencyKey: null }));
+  renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="convert" /></MediaLibraryProvider>, {
+    getCurrentScanFiles: () => Promise.resolve(scan),
+    getWebSettings: () => Promise.resolve({ mkvMergeDefaultAudioLanguages: "eng", mkvMergeDefaultSubtitleLanguages: "eng" } as WebSettings),
+    setFileSelection: (selectedPaths: string[]) => Promise.resolve({ ...scan, selectedPaths }),
+    buildMuxPreview
+  });
+
+  const convert = await screen.findByRole("checkbox", { name: "Convert selected MP4 files to MKV" });
+  await waitFor(() => expect(convert).toBeChecked());
+  await user.click(screen.getByRole("checkbox", { name: "Delete original MP4 after success" }));
+  await user.click(convert);
+  await user.click(screen.getByRole("button", { name: "Preview Summary" }));
+  await waitFor(() => expect(buildMuxPreview).toHaveBeenCalled());
+  expect(buildMuxPreview.mock.calls[0][0]).toMatchObject({ convertMp4ToMkv: false, deleteMp4AfterConvert: false });
+});
