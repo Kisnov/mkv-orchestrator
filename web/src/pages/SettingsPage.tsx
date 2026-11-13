@@ -903,7 +903,9 @@ export function SettingsPage() {
 
           {activeTab === "library" ? (
             <div className="grid min-w-0 grid-cols-1 gap-3">
-              <SettingsCard title="Media Servers" description="Connect Emby, Jellyfin, or Plex. API keys and tokens are encrypted before they are stored." compactHeader actions={
+              <SettingsCard title="Media Servers" description={isDesktop
+                ? "Connect Emby, Jellyfin, or Plex. API keys and tokens are kept in the system credential store, or in a file in the app's configuration folder when there is none."
+                : "Connect Emby, Jellyfin, or Plex. API keys and tokens are stored unencrypted in secrets.json in the configuration folder, readable only by the server's user."} compactHeader actions={
                 <button type="button" aria-expanded={addingServer} aria-controls="add-media-server" onClick={() => setAddingServer(!addingServer)} className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-button px-4 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">
                   {addingServer ? <X size={16} /> : <Plus size={16} />}{addingServer ? "Cancel" : "Add server"}
                 </button>

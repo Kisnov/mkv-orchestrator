@@ -795,6 +795,19 @@ describe("Settings rendering", () => {
 });
 
 describe("Settings media server saves", () => {
+  /// secrets.json is plain JSON with owner-only permissions; it is not encrypted.
+  it("says truthfully how keys are stored", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings())
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+
+    expect(screen.getByText(/stored unencrypted in secrets\.json/i)).toBeInTheDocument();
+    expect(screen.queryByText(/encrypted before/i)).not.toBeInTheDocument();
+  });
+
   /// The reload after a save blanked the key field, so a key still being
   /// typed was cut off at whatever the first save had sent.
   it("keeps a typed API key in its field after the save", async () => {
