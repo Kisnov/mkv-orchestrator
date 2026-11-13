@@ -719,7 +719,7 @@ mod tests {
         assert!(cache.contains("two.mp4").await);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn probe_results_are_written_to_the_cache_in_batches() {
         let cache = Arc::new(Cache::default());
         let probe = Arc::new(Probe::default());
