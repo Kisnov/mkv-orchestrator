@@ -22,6 +22,7 @@ async fn startup_finished(startup: &mut Startup) -> RuntimeResult<()> {
     }
 }
 
+// Closing the window midway is safe: both steps commit atomically and re-run on the next launch.
 async fn migrate_and_recover(runtime: &MkvoRuntime) -> RuntimeResult<()> {
     let migration = runtime.migrate_legacy_data().await?;
     tracing::info!(status = ?migration.status, "legacy data migration checked");
