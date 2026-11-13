@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use mkvo_application::ScanOutcome;
 use mkvo_contracts::{CurrentScanResponse, JobSnapshot, MediaFileRow, ScanSummary};
-use mkvo_domain::{JobId, MediaFile};
+use mkvo_domain::{JobId, MediaFile, same_path};
 use serde::{Deserialize, Serialize};
 
 use super::display_path;
@@ -60,19 +60,55 @@ impl CurrentScanState {
 
     /// Move the authoritative working set and selection with completed renames.
     pub(super) fn apply_renames(&mut self, renames: &[(PathBuf, PathBuf)]) {
+        let mut positions: HashMap<String, usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| (mkvo_application::paths::path_key(&file.path), position))
+            .collect();
         for (source, target) in renames {
             let source_key = mkvo_application::paths::path_key(source);
-            for file in &mut self.files {
-                if mkvo_application::paths::path_key(&file.path) == source_key {
-                    file.path = target.clone();
-                }
+            let target_key = mkvo_application::paths::path_key(target);
+            if let Some(position) = positions.remove(&source_key) {
+                self.files[position].path = target.clone();
+                positions.insert(target_key.clone(), position);
             }
             if self.selected.remove(&source_key) {
-                self.selected
-                    .insert(mkvo_application::paths::path_key(target));
+                self.selected.insert(target_key);
             }
         }
         self.files.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+
+    /// Take re-read files into the working set: each replaces its entry, or
+    /// is added when it has none.
+    pub(super) fn merge(&mut self, files: Vec<MediaFile>) {
+        let mut reordered = false;
+        for file in files {
+            // The set is in path order, so an unchanged path is found without a scan.
+            let known = self
+                .files
+                .binary_search_by(|candidate| candidate.path.cmp(&file.path))
+                .ok()
+                .or_else(|| {
+                    let mut files = self.files.iter();
+                    files.position(|candidate| same_path(&candidate.path, &file.path))
+                });
+            match known {
+                Some(position) => {
+                    reordered |= self.files[position].path != file.path;
+                    self.files[position] = file;
+                }
+                None => {
+                    reordered = true;
+                    self.files.push(file);
+                }
+            }
+        }
+        if reordered {
+            self.files.sort_by(|left, right| left.path.cmp(&right.path));
+            self.reconcile_selection();
+        }
     }
 
     pub(super) fn reconcile_selection(&mut self) {
@@ -128,4 +164,61 @@ pub(super) fn current_scan_response(state: &CurrentScanState) -> CurrentScanResp
 pub(super) fn scan_state_from_snapshot(snapshot: &JobSnapshot) -> Option<ScanResultState> {
     // Read in place: a result stored by an older build also holds every file.
     ScanResultState::deserialize(snapshot.result.as_ref()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::super::tests::media_at;
+    use super::*;
+
+    fn state_with(paths: &[&str]) -> CurrentScanState {
+        CurrentScanState {
+            files: paths.iter().map(|path| media_at(path)).collect(),
+            ..CurrentScanState::default()
+        }
+    }
+
+    fn paths(state: &CurrentScanState) -> Vec<String> {
+        let paths = state.files.iter();
+        paths.map(|file| display_path(&file.path)).collect()
+    }
+
+    #[test]
+    fn a_batch_of_renames_may_reuse_a_name_it_just_freed() {
+        let mut state = state_with(&["/media/a.mkv", "/media/b.mkv", "/media/z.mkv"]);
+        state.selected = ["/media/a.mkv", "/media/b.mkv"]
+            .map(|path| mkvo_application::paths::path_key(Path::new(path)))
+            .into();
+
+        state.apply_renames(&[
+            (PathBuf::from("/media/b.mkv"), PathBuf::from("/media/c.mkv")),
+            (PathBuf::from("/media/a.mkv"), PathBuf::from("/media/b.mkv")),
+        ]);
+
+        assert_eq!(
+            paths(&state),
+            ["/media/b.mkv", "/media/c.mkv", "/media/z.mkv"]
+        );
+        assert_eq!(
+            state.selected_display_paths(),
+            ["/media/b.mkv", "/media/c.mkv"]
+        );
+    }
+
+    #[test]
+    fn re_read_files_replace_their_entry_and_new_ones_are_added_in_order() {
+        let mut state = state_with(&["/media/a.mkv", "/media/c.mkv"]);
+        let mut changed = media_at("/media/c.mkv");
+        changed.fingerprint.size_bytes = 99;
+
+        state.merge(vec![changed, media_at("/media/b.mkv")]);
+
+        assert_eq!(
+            paths(&state),
+            ["/media/a.mkv", "/media/b.mkv", "/media/c.mkv"]
+        );
+        assert_eq!(state.files[2].fingerprint.size_bytes, 99);
+    }
 }

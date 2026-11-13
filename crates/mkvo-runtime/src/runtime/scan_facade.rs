@@ -1,4 +1,9 @@
+use futures::{StreamExt, stream};
+
 use super::*;
+
+/// Files re-read at once after an operation; the scan workers' default.
+const REFRESH_PROBES: usize = 4;
 
 impl MkvoRuntime {
     pub async fn get_status(&self) -> RuntimeResult<AppStatus> {
@@ -418,23 +423,26 @@ impl MkvoRuntime {
             return;
         }
 
-        let mut probed = Vec::with_capacity(paths.len());
-        for path in paths {
-            match self
-                .inner
-                .dependencies
-                .probe
-                .inspect(path, CancellationToken::new())
-                .await
-            {
-                Ok(file) => probed.push(file),
-                Err(error) => tracing::debug!(
-                    path = %path.display(),
-                    %error,
-                    "file could not be re-read after an operation"
-                ),
-            }
-        }
+        let probed: Vec<MediaFile> = stream::iter(paths.to_vec())
+            .map(|path| {
+                let probe = Arc::clone(&self.inner.dependencies.probe);
+                async move {
+                    let inspected = probe.inspect(&path, CancellationToken::new()).await;
+                    inspected
+                        .inspect_err(|error| {
+                            tracing::debug!(
+                                path = %path.display(),
+                                %error,
+                                "file could not be re-read after an operation"
+                            );
+                        })
+                        .ok()
+                }
+            })
+            .buffer_unordered(REFRESH_PROBES)
+            .filter_map(|file| async move { file })
+            .collect()
+            .await;
 
         for file in &probed {
             if let Err(error) = self.inner.dependencies.cache.upsert(file).await {
@@ -447,21 +455,7 @@ impl MkvoRuntime {
         }
 
         let mut state = self.inner.current_scan.write().await;
-        for file in probed {
-            if let Some(existing) = state
-                .files
-                .iter_mut()
-                .find(|candidate| same_path(&candidate.path, &file.path))
-            {
-                *existing = file;
-            } else {
-                state.files.push(file);
-            }
-        }
-        state
-            .files
-            .sort_by(|left, right| left.path.cmp(&right.path));
-        state.reconcile_selection();
+        state.merge(probed);
         state.updated_utc = Some(Utc::now());
     }
 
@@ -548,6 +542,29 @@ mod tests {
         }
     }
 
+    /// A probe that takes a moment and counts how many run at once.
+    #[derive(Default)]
+    struct SlowProbe {
+        running: std::sync::atomic::AtomicUsize,
+        most_at_once: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MediaProbe for SlowProbe {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            use std::sync::atomic::Ordering;
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(media_at(&path.to_string_lossy()))
+        }
+    }
+
     struct Host {
         _directory: tempfile::TempDir,
         library: PathBuf,
@@ -555,8 +572,12 @@ mod tests {
         runtime: MkvoRuntime,
     }
 
-    /// A real database and a real folder of `files` MKVs; only the probe is faked.
     fn host(files: usize) -> Host {
+        host_with(files, Arc::new(Probe))
+    }
+
+    /// A real database and a real folder of `files` MKVs; only the probe is faked.
+    fn host_with(files: usize, probe: Arc<dyn MediaProbe>) -> Host {
         let directory = tempfile::tempdir().unwrap();
         let library = directory.path().join("library");
         let config = directory.path().join("config");
@@ -571,7 +592,7 @@ mod tests {
             .build()
             .unwrap();
         let mut dependencies = composed.inner.dependencies.clone();
-        dependencies.probe = Arc::new(Probe);
+        dependencies.probe = probe;
         Host {
             _directory: directory,
             library,
@@ -730,6 +751,30 @@ mod tests {
                 job.kind
             );
         }
+    }
+
+    #[tokio::test]
+    async fn files_changed_by_an_operation_are_re_read_a_few_at_a_time() {
+        let probe = Arc::new(SlowProbe::default());
+        let host = host_with(0, probe.clone());
+        let paths: Vec<_> = (0..12)
+            .map(|index| host.library.join(format!("{index:02}.mkv")))
+            .collect();
+
+        host.runtime.refresh_working_set(&paths).await;
+
+        let most_at_once = probe.most_at_once.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=REFRESH_PROBES).contains(&most_at_once),
+            "{most_at_once}"
+        );
+        let working_set = host.runtime.get_current_scan_files().await.unwrap();
+        assert_eq!(working_set.files.len(), 12);
+        assert!(
+            working_set
+                .files
+                .is_sorted_by(|left, right| left.path <= right.path)
+        );
     }
 
     #[test]
