@@ -8,7 +8,7 @@ import { ReorderTracksPage } from "./ReorderTracksPage";
 import { MediaLibraryProvider, useMediaLibrary } from "../state/MediaLibraryContext";
 import { OperationJobProvider } from "../state/OperationJobContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, MuxPreviewRequest } from "../api";
+import type { MediaFileRow, MuxPreviewRequest, MuxPreviewResponse } from "../api";
 
 const tracks = [
   { id: 0, trackNumber: 1, type: "video", codec: "HEVC", language: "und", name: "", channels: null, default: true, forced: false },
@@ -191,7 +191,7 @@ function Reordered({ files }: { files: MediaFileRow[] }) {
 it("starts the order over when the template's tracks change under the same path", async () => {
   localStorage.clear(); sessionStorage.clear();
   const files = [file("01.mkv"), file("02.mkv")];
-  const buildMuxPreview = vi.fn((_request: MuxPreviewRequest) => Promise.resolve({ actions: [], noChangeFiles: [], summary: "ready", status: "ready", planId: null, planFingerprint: null, idempotencyKey: null }));
+  const buildMuxPreview = vi.fn<(request: MuxPreviewRequest) => Promise<MuxPreviewResponse>>(() => Promise.resolve({ actions: [], noChangeFiles: [], summary: "ready", status: "ready", planId: null, planFingerprint: null, idempotencyKey: null }));
   const user = userEvent.setup();
   renderWithBackend(
     <MediaLibraryProvider><OperationJobProvider><Scan files={files}/><Reordered files={files}/><ReorderTracksPage/></OperationJobProvider></MediaLibraryProvider>,
