@@ -163,3 +163,13 @@ it.each([
   expect(window.sessionStorage.getItem("mkvo.web.activeOperationJob")).not.toBeNull();
   vi.useRealTimers();
 });
+
+it("opens folded in a narrow window even when the saved choice is expanded", () => {
+  window.localStorage.setItem("mkvo.sidebar.collapsed", "false");
+  vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 1099px)", addEventListener: () => undefined, removeEventListener: () => undefined }));
+  renderWithBackend(<MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Dashboard content</div>} /></Route></Routes></MediaLibraryProvider>, {
+    getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 })
+  });
+  expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
+  vi.unstubAllGlobals();
+});

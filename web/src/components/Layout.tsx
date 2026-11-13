@@ -22,6 +22,12 @@ const navItems = [
 // The mobile breakpoint of index.css, the only layout that uses the table labels.
 const mobileLayoutQuery = "(max-width: 767px), (max-width: 1023px) and (pointer: coarse)";
 
+const narrowWindowQuery = "(max-width: 1099px)";
+const isNarrowWindow = () => window.matchMedia?.(narrowWindowQuery).matches ?? false;
+function savedCollapsed() {
+  try { return localStorage.getItem("mkvo.sidebar.collapsed") === "true"; } catch { return false; }
+}
+
 // The mobile layout turns tables into blocks, which drops their semantics and their header row.
 function labelTable(table: HTMLTableElement) {
   const headers = [...(table.tHead?.rows[0]?.cells ?? [])].map((cell) => cell.textContent?.trim() ?? "");
@@ -38,12 +44,12 @@ export function Layout() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const location = useLocation();
   useEffect(() => { setMobileMenuOpen(false); }, [location.pathname]);
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem("mkvo.sidebar.collapsed") === null ? window.innerWidth < 1100 : localStorage.getItem("mkvo.sidebar.collapsed") === "true");
-  // Narrowing the window folds the sidebar for room; widening it restores the saved choice.
+  // A narrow window folds the sidebar for room; a wide one shows the saved choice.
+  const [collapsed, setCollapsed] = useState(() => isNarrowWindow() || savedCollapsed());
   useEffect(() => {
     if (!window.matchMedia) return;
-    const narrow = window.matchMedia("(max-width: 1099px)");
-    const sync = () => setCollapsed(narrow.matches || localStorage.getItem("mkvo.sidebar.collapsed") === "true");
+    const narrow = window.matchMedia(narrowWindowQuery);
+    const sync = () => setCollapsed(narrow.matches || savedCollapsed());
     narrow.addEventListener("change", sync);
     return () => narrow.removeEventListener("change", sync);
   }, []);
