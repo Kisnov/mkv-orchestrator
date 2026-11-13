@@ -1,4 +1,6 @@
-import { Copy, X } from "lucide-react";
+import { Copy } from "lucide-react";
+
+import { Dialog } from "./Dialog";
 
 export type PreviewSummaryMetric = {
   label: string;
@@ -40,14 +42,7 @@ export function PreviewSummaryModal({ title, emptyText, available, status, summa
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6">
-      <section className="flex h-[min(47.5rem,calc(100vh-3rem))] w-[min(72rem,calc(100vw-3rem))] flex-col overflow-hidden rounded-lg border-2 border-window bg-card shadow-[0_1.875rem_5.625rem_rgba(0,0,0,0.55)]">
-        <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-window px-4">
-          <div className="text-sm font-semibold text-muted">{title}</div>
-          <button type="button" onClick={onClose} className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted hover:bg-button-hover hover:text-text" title="Close">
-            <X size={16} />
-          </button>
-        </div>
+    <Dialog title={title} onClose={onClose} className="h-[min(47.5rem,calc(100vh-3rem))] w-[min(72rem,calc(100vw-3rem))]">
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {!available ? (
             <div className="rounded-md border border-border bg-input p-5 text-sm text-muted">{emptyText}</div>
@@ -89,7 +84,6 @@ export function PreviewSummaryModal({ title, emptyText, available, status, summa
             </>
           )}
         </div>
-      </section>
-    </div>
+    </Dialog>
   );
 }

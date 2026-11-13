@@ -1,7 +1,7 @@
 import { MobileOptions } from "../components/MobileOptions";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { RefreshCw, X } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import {
   buildPropEditPreview,
   cancelOperationJob,
@@ -13,6 +13,7 @@ import {
   PropEditTrackConfigRow,
   startPropEditApply
 } from "../api";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { FileSelectionTable } from "../components/FileSelectionTable";
 import { PanelDivider } from "../components/PanelDivider";
 import { SectionHeader } from "../components/SectionHeader";
@@ -523,33 +524,22 @@ export function TrackPropertiesPage() {
         />
       ) : null}
       {pendingApply ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6">
-          <section role="dialog" aria-modal="true" aria-label="Apply to files that differ from the template?" className="flex max-h-[calc(100vh-3rem)] w-[min(46rem,calc(100vw-3rem))] flex-col overflow-hidden rounded-lg border-2 border-window bg-card shadow-[0_1.875rem_5.625rem_rgba(0,0,0,0.55)]">
-            <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-window px-4">
-              <div className="text-sm font-semibold text-muted">Apply to files that differ from the template?</div>
-              <button type="button" onClick={() => setPendingApply(null)} className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted hover:bg-button-hover hover:text-text" title="Close">
-                <X size={16} />
-              </button>
-            </div>
-            <div className="min-h-0 flex-1 overflow-y-auto p-5">
-              <p className="text-sm leading-6 text-muted">
-                {pendingApply.rows.length === 1 ? "1 selected file differs" : `${pendingApply.rows.length} selected files differ`} from the template. Each edit goes to the track in the same position within its type, so check that these are the tracks you mean to change.
-              </p>
-              <div className="mt-4 overflow-hidden rounded-md border border-warning bg-input">
-                {pendingApply.rows.map((row) => (
-                  <div key={row.key} className="border-b border-border px-4 py-3 last:border-0">
-                    <div className="font-semibold text-text">{row.title}</div>
-                    <div className="mt-1 whitespace-pre-wrap text-xs leading-5 text-muted">{row.detail}</div>
-                  </div>
-                ))}
+        <ConfirmModal
+          title="Apply to files that differ from the template?"
+          message={`${pendingApply.rows.length === 1 ? "1 selected file differs" : `${pendingApply.rows.length} selected files differ`} from the template. Each edit goes to the track in the same position within its type, so check that these are the tracks you mean to change.`}
+          confirmLabel={`Apply to ${pendingApply.request.selectedPaths.length} file(s)`}
+          onConfirm={() => { setPendingApply(null); applyPlan(pendingApply.request, pendingApply.plan).catch(() => { /* Mutation handlers display the error. */ }); }}
+          onClose={() => setPendingApply(null)}
+        >
+          <div className="mt-4 overflow-hidden rounded-md border border-warning bg-input">
+            {pendingApply.rows.map((row) => (
+              <div key={row.key} className="border-b border-border px-4 py-3 last:border-0">
+                <div className="font-semibold text-text">{row.title}</div>
+                <div className="mt-1 whitespace-pre-wrap text-xs leading-5 text-muted">{row.detail}</div>
               </div>
-            </div>
-            <div className="flex shrink-0 justify-end gap-2 border-t border-border p-4">
-              <button type="button" onClick={() => setPendingApply(null)} className="h-9 rounded-md border border-border bg-button px-4 text-sm font-semibold">Cancel</button>
-              <button type="button" onClick={() => { setPendingApply(null); applyPlan(pendingApply.request, pendingApply.plan).catch(() => { /* Mutation handlers display the error. */ }); }} className="h-9 rounded-md bg-accent px-4 text-sm font-semibold">Apply to {pendingApply.request.selectedPaths.length} file(s)</button>
-            </div>
-          </section>
-        </div>
+            ))}
+          </div>
+        </ConfirmModal>
       ) : null}
     </div>
   );
