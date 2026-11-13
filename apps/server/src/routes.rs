@@ -9,7 +9,7 @@ use axum::{
 };
 use futures::{StreamExt, stream};
 use mkvo_contracts::{
-    FileSelectionRequest, JobEvent, LibraryArtworkRequest, LibraryCatalogRequest,
+    FileSelectionRequest, JobEvent, JobEventEnvelope, LibraryArtworkRequest, LibraryCatalogRequest,
     LibraryLocalArtworkRequest, ScanRequest, WebSettingsRequest,
 };
 use mkvo_runtime::{
@@ -329,6 +329,21 @@ async fn job_events(
     let snapshot = snapshot
         .map_err(|error| RuntimeError::internal(error.to_string()))?
         .event("snapshot");
+    Ok(
+        Sse::new(job_event_stream(snapshot, ended, receiver)).keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        ),
+    )
+}
+
+/// The snapshot, then the job's events until the one that ends it.
+pub(crate) fn job_event_stream(
+    snapshot: Event,
+    ended: bool,
+    receiver: broadcast::Receiver<JobEventEnvelope>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     let live = stream::unfold((!ended).then_some(receiver), |receiver| async move {
         let mut receiver = receiver?;
         match receiver.recv().await {
@@ -358,12 +373,7 @@ async fn job_events(
             Err(broadcast::error::RecvError::Closed) => None,
         }
     });
-    let events = stream::once(async { Ok(snapshot) }).chain(live);
-    Ok(Sse::new(events).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    stream::once(async { Ok(snapshot) }).chain(live)
 }
 
 async fn get_watch_health(State(state): State<AppState>) -> Result<impl IntoResponse, HttpError> {

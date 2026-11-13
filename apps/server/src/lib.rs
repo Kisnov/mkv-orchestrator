@@ -1035,8 +1035,25 @@ mod tests {
         }
     }
 
+    async fn sse_frames(response: Response) -> Vec<String> {
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            response.into_body().collect(),
+        )
+        .await
+        .expect("the stream ends with the job")
+        .unwrap()
+        .to_bytes();
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .trim_end()
+            .split("\n\n")
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn job_events_start_with_the_job_state_and_end_with_the_job() {
+    async fn job_events_of_an_ended_job_are_just_its_state() {
         let host = TestHost::new(None);
         let job = host
             .runtime
@@ -1047,39 +1064,60 @@ mod tests {
             .await
             .unwrap();
         let id = job.id.to_string();
-        // Followed both while it runs and once it has ended.
-        for _ in 0..2 {
-            let response = host
-                .router()
-                .oneshot(request("GET", &format!("/api/scans/{id}/events"), &[]))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                response.into_body().collect(),
-            )
+        while !host
+            .runtime
+            .get_scan_job(&id)
             .await
-            .expect("the stream ends with the job")
             .unwrap()
-            .to_bytes();
-            let body = String::from_utf8(body.to_vec()).unwrap();
-            let first = body.split("\n\n").next().unwrap();
-            assert!(
-                first.lines().any(|line| line == "event: snapshot"),
-                "{body}"
-            );
-            assert!(first.contains(&format!(r#""id":"{id}""#)), "{body}");
-            while !host
-                .runtime
-                .get_scan_job(&id)
-                .await
-                .unwrap()
-                .status
-                .is_terminal()
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            .status
+            .is_terminal()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        let response = host
+            .router()
+            .oneshot(request("GET", &format!("/api/scans/{id}/events"), &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let frames = sse_frames(response).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert!(frames[0].lines().any(|line| line == "event: snapshot"));
+        assert!(frames[0].contains(&format!(r#""id":"{id}""#)));
+    }
+
+    #[tokio::test]
+    async fn job_events_of_a_running_job_end_with_the_event_that_ends_it() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        for (sequence, event) in [
+            serde_json::json!({ "type": "status_changed", "status": "Running" }),
+            serde_json::json!({ "type": "failed", "message": "probe failed" }),
+            serde_json::json!({ "type": "status_changed", "status": "Running" }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let envelope =
+                serde_json::from_value::<mkvo_contracts::JobEventEnvelope>(serde_json::json!({
+                    "jobId": "01a1d606-70be-7350-9879-a59a34f6367a",
+                    "correlationId": "01a1d606-70be-7350-9879-a5a367cd3fc5",
+                    "sequence": sequence,
+                    "emittedUtc": "2026-11-13T17:48:28Z",
+                    "event": event,
+                }))
+                .unwrap();
+            sender.send(envelope).unwrap();
+        }
+        let snapshot = axum::response::sse::Event::default()
+            .event("snapshot")
+            .data("running");
+        let stream = routes::job_event_stream(snapshot, false, receiver);
+        // The sender stays open: only the failed event may end the stream.
+        let frames = sse_frames(axum::response::Sse::new(stream).into_response()).await;
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert!(frames[0].lines().any(|line| line == "event: snapshot"));
+        assert!(frames[1].contains(r#""status":"Running""#));
+        assert!(frames[2].contains(r#""type":"failed""#));
+        drop(sender);
     }
 }
