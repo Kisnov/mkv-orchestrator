@@ -394,27 +394,22 @@ impl FileSystem for LocalFileSystem {
     }
 }
 
-/// Move `source` to `target`, failing if anything is already there.
+/// Move `source` to `target`, failing if another file is already there.
 fn move_without_replacing(source: &Path, target: &Path) -> std::io::Result<()> {
-    let name = |path: &Path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_lowercase())
-    };
-    if source == target || source.parent() != target.parent() || name(source) != name(target) {
-        return move_to_new_name(source, target);
-    }
-    // Where case is ignored the new spelling is taken by the file itself, so it goes through a name that is free.
-    let mut parked = target.as_os_str().to_owned();
-    parked.push(".mkvo-rename.tmp");
-    let parked = PathBuf::from(parked);
-    move_to_new_name(source, &parked)?;
-    move_to_new_name(&parked, target).inspect_err(|_| {
-        let _ = move_to_new_name(&parked, source);
-    })
+    move_linking_with(
+        |source, target| std::fs::hard_link(source, target),
+        source,
+        target,
+    )
 }
 
-/// A hard link is the one call in std that fails on an existing target instead of replacing it.
-fn move_to_new_name(source: &Path, target: &Path) -> std::io::Result<()> {
+/// `link` is `hard_link`, the one call in std that fails on an existing target
+/// instead of replacing it.
+fn move_linking_with(
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    source: &Path,
+    target: &Path,
+) -> std::io::Result<()> {
     // Held so that a source nobody lets us delete fails here, before it has two names.
     #[cfg(windows)]
     let _deletable = {
@@ -424,11 +419,13 @@ fn move_to_new_name(source: &Path, target: &Path) -> std::io::Result<()> {
             .access_mode(DELETE)
             .open(source)?
     };
-    match std::fs::hard_link(source, target) {
+    match link(source, target) {
         Ok(()) => std::fs::remove_file(source).inspect_err(|_| {
             let _ = std::fs::remove_file(target);
         }),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            respell(source, target, error)
+        }
         Err(_) => rename_if_absent(source, target),
     }
 }
@@ -437,11 +434,21 @@ fn move_to_new_name(source: &Path, target: &Path) -> std::io::Result<()> {
 /// created between the two calls would be replaced.
 fn rename_if_absent(source: &Path, target: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(target) {
-        Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+        Ok(_) => respell(source, target, std::io::ErrorKind::AlreadyExists.into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::rename(source, target)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// `target` exists. Where case is ignored it may be `source` itself under the
+/// new spelling, and then one rename respells it; any other file is `taken`.
+fn respell(source: &Path, target: &Path, taken: std::io::Error) -> std::io::Result<()> {
+    if same_file::is_same_file(source, target)? {
+        std::fs::rename(source, target)
+    } else {
+        Err(taken)
     }
 }
 
@@ -1141,6 +1148,31 @@ mod move_tests {
         assert_eq!(
             std::fs::read(directory.join("Ep.mkv")).expect("moved"),
             b"episode"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The rename used to go through `<target>.mkvo-rename.tmp`, where a file
+    /// could be stranded, and which this one found taken.
+    #[tokio::test]
+    async fn a_case_only_rename_goes_through_no_other_name() {
+        let (directory, file_system) = library("case-direct");
+        std::fs::write(directory.join("ep.mkv"), b"episode").expect("source");
+        std::fs::write(directory.join(".Ep.mkv.mkvo-rename.tmp"), b"other").expect("other");
+        std::fs::write(directory.join("Ep.mkv.mkvo-rename.tmp"), b"other").expect("other");
+
+        file_system
+            .move_file(&directory.join("ep.mkv"), &directory.join("Ep.mkv"))
+            .await
+            .expect("case-only rename");
+
+        assert_eq!(
+            names(&directory),
+            [
+                ".Ep.mkv.mkvo-rename.tmp",
+                "Ep.mkv",
+                "Ep.mkv.mkvo-rename.tmp"
+            ]
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

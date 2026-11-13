@@ -2369,6 +2369,7 @@ dependencies = [
  "mkvo-application",
  "mkvo-domain",
  "notify",
+ "same-file",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
