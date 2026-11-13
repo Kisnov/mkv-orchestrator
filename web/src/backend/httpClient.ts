@@ -114,6 +114,7 @@ export class HttpBackendClient implements BackendClient {
   ): Promise<T> {
     let response: Response;
     let text: string;
+    const timeout = AbortSignal.timeout(timeoutMs);
     try {
       const headers = new Headers(init?.headers);
       if (!headers.has("Accept")) {
@@ -121,13 +122,14 @@ export class HttpBackendClient implements BackendClient {
       }
       response = await this.fetchImpl(this.url(path), {
         credentials: "same-origin",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: timeout,
         ...init,
         headers
       });
       text = await response.text();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name === "TimeoutError") {
+      // Some browsers reject a body read cut off by the timeout with a plain AbortError.
+      if ((error as { name?: unknown } | null)?.name === "TimeoutError" || timeout.aborted) {
         throw new ApiError("The MKVO server took too long to answer.", { code: "TIMEOUT", cause: error });
       }
       throw normalizeApiError(error, `Unable to reach the MKVO server at ${this.url(path)}.`);
