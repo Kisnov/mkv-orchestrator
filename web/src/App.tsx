@@ -2,6 +2,7 @@ import { Component, lazy, Suspense, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import AuthGate from "./components/AuthGate";
+import StartupGate from "./components/StartupGate";
 import { getBackendTransport } from "./api";
 import { Layout } from "./components/Layout";
 import { MediaLibraryProvider, MediaLibrarySynchronizer } from "./state/MediaLibraryContext";
@@ -19,7 +20,7 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage").then((page) => ({
 const TrackPropertiesPage = lazy(() => import("./pages/TrackPropertiesPage").then((page) => ({ default: page.TrackPropertiesPage })));
 
 export default function App() {
-  if (getBackendTransport() === "tauri") return <ProtectedApp />;
+  if (getBackendTransport() === "tauri") return <StartupGate><ProtectedApp /></StartupGate>;
   return <AuthGate><ProtectedApp /></AuthGate>;
 }
 
