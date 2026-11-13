@@ -7,6 +7,7 @@ use mkvo_domain::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::media::MediaFileSummary;
 use crate::{JobSnapshot, JobStatus, MediaAttachmentDto, MediaFileDto, SourceRoot};
 use mkvo_domain::JobId;
 
@@ -51,21 +52,21 @@ pub struct MediaFileRow {
 
 impl From<&MediaFile> for MediaFileRow {
     fn from(file: &MediaFile) -> Self {
-        let dto = MediaFileDto::from(file);
+        let summary = MediaFileSummary::from(file);
         Self {
-            path: dto.path,
-            file_name: dto.file_name,
-            extension: dto.extension,
+            path: summary.path,
+            file_name: summary.file_name,
+            extension: summary.extension,
             status: compatibility_status(file),
-            reader: dto.reader,
-            codec: dto.codec,
-            resolution: dto.resolution,
-            bit_depth: dto.bit_depth,
-            hdr: dto.hdr,
-            video_summary: dto.video_summary,
-            audio_summary: dto.audio_summary,
-            subtitle_summary: dto.subtitle_summary,
-            attachment_summary: dto.attachment_summary,
+            reader: summary.reader,
+            codec: summary.codec,
+            resolution: summary.resolution,
+            bit_depth: summary.bit_depth,
+            hdr: summary.hdr,
+            video_summary: summary.video_summary,
+            audio_summary: summary.audio_summary,
+            subtitle_summary: summary.subtitle_summary,
+            attachment_summary: summary.attachment_summary,
             tracks: file
                 .tracks
                 .iter()
@@ -89,7 +90,7 @@ impl From<&MediaFile> for MediaFileRow {
                     forced: track.forced,
                 })
                 .collect(),
-            attachments: dto.attachments,
+            attachments: file.attachments.iter().map(Into::into).collect(),
         }
     }
 }
@@ -140,6 +141,11 @@ pub struct ScanRequest {
     pub force_refresh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workers: Option<usize>,
+    /// Leave the working set as it is and serve the files from the job of
+    /// this scan. The Library overview reads every library, not what the
+    /// user is working on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_working_set: bool,
 }
 
 impl ScanRequest {
@@ -187,6 +193,18 @@ pub struct CurrentScanResponse {
 pub struct FileSelectionRequest {
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Make `paths` the whole working set, all selected, instead of selecting
+    /// within it. A title sent from the Library is not in the working set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_working_set: bool,
+}
+
+/// The selection as stored. The files are not repeated: every checkbox click
+/// gets one of these.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSelectionResponse {
+    pub selected_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

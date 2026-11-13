@@ -40,7 +40,6 @@ type MediaLibraryContextValue = {
 };
 
 const MediaLibraryContext = createContext<MediaLibraryContextValue | null>(null);
-const storageKey = "mkvo.web.scannedFiles";
 const templateStorageKey = "mkvo.web.templateFilePath";
 // Selection outlives the tab: it is a deliberate user action, and losing it
 // after a restart means re-picking files across a large library.
@@ -81,9 +80,9 @@ function isPathWithinSource(filePath: string, sourcePath: string): boolean {
  * to the authoritative answer anyway.
  */
 export function MediaLibraryProvider({ children }: { children: ReactNode }) {
-  const [files, setFilesState] = useState<MediaFileRow[]>(() =>
-    readStored<MediaFileRow[]>(sessionStorage, storageKey, [])
-  );
+  // Only paths are kept in the tab. The files come back from the backend
+  // working set, which MediaLibrarySynchronizer reads on every load.
+  const [files, setFilesState] = useState<MediaFileRow[]>([]);
   const [selectedPaths, setSelectedPathsState] = useState<string[]>(() =>
     readStored<string[]>(localStorage, selectionStorageKey, [])
   );
@@ -107,7 +106,6 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   });
 
-  useEffect(() => write(sessionStorage, storageKey, files), [files]);
   useEffect(() => write(localStorage, selectionStorageKey, selectedPaths), [selectedPaths]);
 
   useEffect(() => {
@@ -118,13 +116,13 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   }, [templateFilePath]);
 
-  const pushSelection = useCallback((paths: string[]): void => {
+  // One selection request at a time, in order; `send` answers with the selection the backend stored.
+  const queueSelection = useCallback((send: () => Promise<string[]>): void => {
     selectionPush.current = selectionPush.current
       .catch(() => undefined)
       .then(async () => {
         try {
-          const response = await setFileSelection(paths);
-          setSelectedPathsState(response.selectedPaths);
+          setSelectedPathsState(await send());
           setSelectionError(null);
         } catch (error) {
           const message = error instanceof Error ? error.message : "The selection could not be saved.";
@@ -138,6 +136,9 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
         }
       });
   }, []);
+  const pushSelection = useCallback((paths: string[]): void => {
+    queueSelection(async () => (await setFileSelection(paths)).selectedPaths);
+  }, [queueSelection]);
 
   const syncFromBackend = useCallback((scan: CurrentScanResponse, sourcePaths?: string[]) => {
     if (scan.updatedUtc && adoptedUpdatedUtc.current && scan.updatedUtc <= adoptedUpdatedUtc.current) {
@@ -177,7 +178,6 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     setTemplateFilePath("");
     setSelectionError(null);
     try {
-      sessionStorage.removeItem(storageKey);
       sessionStorage.removeItem(templateStorageKey);
       localStorage.removeItem(selectionStorageKey);
     } catch {
@@ -223,7 +223,19 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
       setFilesState(nextFiles);
       setSelectedPathsState(nextSelectedPaths);
       setTemplateFilePath(nextTemplatePath || nextFiles[0]?.path || "");
-      pushSelection(nextSelectedPaths);
+      // A Library scan leaves the backend working set alone, so these files are installed there first.
+      queueSelection(async () => {
+        const adopted = (await setFileSelection(nextFiles.map((file) => file.path), true)).selectedPaths;
+        const readable = new Set(adopted.map(pathKey));
+        if (readable.size < nextFiles.length) {
+          // The backend left out what it could not read, so those rows cannot be operated on.
+          workingViewPaths.current = readable;
+          setFilesState((current) => current.filter((file) => readable.has(pathKey(file.path))));
+          setTemplateFilePath((current) => readable.has(pathKey(current)) ? current : adopted[0] ?? "");
+        }
+        const wanted = nextSelectedPaths.filter((path) => readable.has(pathKey(path)));
+        return wanted.length < adopted.length ? (await setFileSelection(wanted)).selectedPaths : adopted;
+      });
     },
     isWorkingView,
     selectedPaths,
@@ -273,7 +285,7 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
         return rename ? rename.newPath : current;
       });
     }
-  }), [files, selectedPaths, selectionError, templateFilePath, isWorkingView, pushSelection, syncFromBackend, clearLibraryCache]);
+  }), [files, selectedPaths, selectionError, templateFilePath, isWorkingView, pushSelection, queueSelection, syncFromBackend, clearLibraryCache]);
 
   return (
     <MediaLibraryContext.Provider value={value}>

@@ -8,9 +8,34 @@ impl MkvoRuntime {
         let files = if request.paths.is_empty() {
             self.resolve_rows(&request.files, &[]).await?
         } else {
-            let requested: BTreeSet<_> = request.paths.iter().map(|path| path_key(path)).collect();
-            let mut files = self.current_domain_files().await;
-            files.retain(|file| requested.contains(&path_key(&display_path(&file.path))));
+            let mut missing: BTreeSet<_> =
+                request.paths.iter().map(|path| path_key(path)).collect();
+            let mut files = Vec::with_capacity(missing.len());
+            // A Library scan leaves the working set alone: what it just read
+            // is with its job, and is newer than any copy the set holds.
+            if let Some(overview) = self.overview_files().await {
+                let scanned = overview.iter();
+                files.extend(
+                    scanned
+                        .filter(|file| missing.remove(&file_key(&file.path)))
+                        .cloned(),
+                );
+            }
+            if !missing.is_empty() {
+                let held = self.working_set_by_key(file_key, &missing).await;
+                // The caller saves the audit as the state of everything it asked about.
+                if held.len() < missing.len() {
+                    return Err(RuntimeError::new(
+                        mkvo_contracts::ApiErrorCode::Conflict,
+                        format!(
+                            "The scan results for {} file(s) are no longer held. Scan the library again.",
+                            missing.len() - held.len()
+                        ),
+                    ));
+                }
+                files.extend(held.into_values());
+            }
+            files.sort_by(|left, right| left.path.cmp(&right.path));
             files
         };
         let audit = LibraryAuditService.build(&self.config().media_root, &files, &[]);
@@ -73,23 +98,35 @@ impl MkvoRuntime {
         })
     }
 
+    /// The rows a request selected. Selecting nothing is an error, never
+    /// "every file".
+    pub(super) async fn resolve_selected_rows(
+        &self,
+        rows: &[mkvo_contracts::MediaFileRow],
+        selected_paths: &[String],
+    ) -> RuntimeResult<Vec<MediaFile>> {
+        if selected_paths.is_empty() {
+            return Err(RuntimeError::invalid("No files selected."));
+        }
+        self.resolve_rows(rows, selected_paths).await
+    }
+
+    /// Every row, for requests that carry no selection: pass `&[]`.
     pub(super) async fn resolve_rows(
         &self,
         rows: &[mkvo_contracts::MediaFileRow],
         selected_paths: &[String],
     ) -> RuntimeResult<Vec<MediaFile>> {
-        let current = self.current_domain_files().await;
         let selected: BTreeSet<_> = selected_paths.iter().map(|path| path_key(path)).collect();
         let source_rows: Vec<_> = rows
             .iter()
             .filter(|row| selected.is_empty() || selected.contains(&path_key(&row.path)))
             .collect();
+        let wanted: BTreeSet<_> = source_rows.iter().map(|row| path_key(&row.path)).collect();
+        let current = self.working_set_by_key(file_key, &wanted).await;
         let mut files = Vec::with_capacity(source_rows.len());
         for row in source_rows {
-            if let Some(file) = current
-                .iter()
-                .find(|file| same_path(&file.path, Path::new(&row.path)))
-            {
+            if let Some(file) = current.get(&path_key(&row.path)) {
                 // The row is the track layout the user is looking at. Keep
                 // the runtime's fingerprint and rich file metadata, but plan
                 // track operations against the exact IDs displayed in the UI
@@ -201,11 +238,7 @@ impl MkvoRuntime {
     }
 
     pub(super) async fn current_existing_paths(&self) -> BTreeSet<PathBuf> {
-        self.current_domain_files()
-            .await
-            .into_iter()
-            .map(|file| file.path)
-            .collect()
+        self.working_set_paths().await
     }
 
     pub(super) fn authorized_root_paths(&self) -> Vec<PathBuf> {
@@ -323,5 +356,72 @@ impl MkvoRuntime {
             )));
         }
         Ok(PathBuf::from(status.resolved_path))
+    }
+}
+
+/// `path_key` of a scanned file, so it matches the key of a row's path.
+fn file_key(path: &Path) -> String {
+    path_key(&path.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// A request naming one real MKV in `files`, with `selected` as its selection.
+    fn request(library: &Path, selected: &[&str]) -> serde_json::Value {
+        let path = display_path(&library.join("episode.mkv"));
+        json!({
+            "files": [{
+                "path": path, "fileName": "episode.mkv", "extension": ".mkv",
+                "status": "Scanned", "reader": "mkvmerge", "codec": "", "resolution": "",
+                "bitDepth": "", "hdr": "", "videoSummary": "", "audioSummary": "",
+                "subtitleSummary": "", "attachmentSummary": "",
+            }],
+            "selectedPaths": selected,
+            "removeUnwantedAudioLanguages": false, "keepAudioLanguages": "",
+            "removeUnwantedSubtitleLanguages": false, "keepSubtitleLanguages": "",
+            "removeUnwantedTrackIds": false, "removeTrackIdsText": "",
+            "preserveChapters": true, "preserveAttachments": true,
+            "muxMatchingExternalSubtitles": false, "externalSubtitleLanguage": "und",
+            "externalSubtitleFormats": "", "preserveExternalSubtitleFiles": true,
+            "skipMuxIfSubtitleAlreadyExists": false, "extractSubtitles": false,
+            "extractSubtitleLanguages": "", "extractOverwriteExistingFiles": false,
+            "convertMp4ToMkv": false, "deleteMp4AfterConvert": false,
+            "containerTitleMode": "remove", "customContainerTitle": "",
+            "videoTitleMode": "keep", "customVideoTitle": "",
+            "selectedDefaultAudio": "", "selectedForcedAudio": "",
+            "selectedDefaultSubtitle": "", "selectedForcedSubtitle": "",
+        })
+    }
+
+    /// An empty selection used to mean every file in the request.
+    #[tokio::test]
+    async fn a_preview_with_nothing_selected_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("episode.mkv"), b"mkv").unwrap();
+        let runtime = MkvoRuntimeBuilder::new(&library, directory.path().join("config"))
+            .disable_legacy_migration()
+            .authorized_root(&library, true)
+            .build()
+            .unwrap();
+        let nothing = request(&library, &[]);
+
+        let mux = runtime
+            .build_mux_preview(serde_json::from_value(nothing.clone()).unwrap())
+            .await;
+        let propedit = runtime
+            .build_propedit_preview(serde_json::from_value(nothing).unwrap())
+            .await;
+
+        for error in [mux.unwrap_err(), propedit.unwrap_err()] {
+            assert_eq!(error.code, mkvo_contracts::ApiErrorCode::InvalidRequest);
+            assert_eq!(error.message, "No files selected.");
+        }
     }
 }

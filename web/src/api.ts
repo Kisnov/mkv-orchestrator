@@ -11,6 +11,7 @@ import type {
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemEntry,
   FileSystemResponse,
   LibraryArtworkRequest,
@@ -106,6 +107,7 @@ export type AttachmentRow = {
 export type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemEntry,
   FileSystemResponse,
   LibraryArtworkRequest,
@@ -204,8 +206,9 @@ export function authorizeBrowsedRoot(path: string): Promise<void> {
   return getBackendClient().authorizeBrowsedRoot(path);
 }
 
-export function setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-  return getBackendClient().setFileSelection(paths);
+export function setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+  const client = getBackendClient();
+  return replaceWorkingSet ? client.setFileSelection(paths, true) : client.setFileSelection(paths);
 }
 
 export function clearCurrentScanFiles(): Promise<CurrentScanResponse> {

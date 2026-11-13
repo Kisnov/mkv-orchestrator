@@ -2,6 +2,7 @@ import type { LogExport } from "./client";
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemResponse,
   LibraryArtworkRequest,
   LibraryArtworkResponse,
@@ -213,8 +214,10 @@ export class HttpBackendClient implements BackendClient {
     return this.json<CurrentScanResponse>("/api/files/current", "DELETE", undefined, "CurrentScanResponse");
   }
 
-  setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-    return this.json<CurrentScanResponse>("/api/files/selection", "PUT", { paths }, "CurrentScanResponse");
+  setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+    // Replacing the working set may read files the backend has not cached.
+    const timeout = replaceWorkingSet ? LONG_REQUEST_TIMEOUT_MS : undefined;
+    return this.json<FileSelectionResponse>("/api/files/selection", "PUT", { paths, replaceWorkingSet }, "FileSelectionResponse", timeout);
   }
 
   // The server only ever lists inside its configured roots, so anything the

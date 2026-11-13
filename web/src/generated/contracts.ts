@@ -66,6 +66,11 @@ export interface FileFingerprintDto {
 
 export interface FileSelectionRequest {
   "paths": Array<string>;
+  "replaceWorkingSet"?: boolean;
+}
+
+export interface FileSelectionResponse {
+  "selectedPaths": Array<string>;
 }
 
 export interface FileSystemEntry {
@@ -706,6 +711,7 @@ export interface ScanRequest {
   "ffProbePath"?: string | null;
   "forceRefresh": boolean;
   "maxWorkers"?: number | null;
+  "keepWorkingSet"?: boolean;
 }
 
 export interface ScanResponse {
@@ -900,6 +906,7 @@ export interface ContractTypes {
   ExecutionSummary: ExecutionSummary;
   FileFingerprintDto: FileFingerprintDto;
   FileSelectionRequest: FileSelectionRequest;
+  FileSelectionResponse: FileSelectionResponse;
   FileSystemEntry: FileSystemEntry;
   FileSystemEntryKind: FileSystemEntryKind;
   FileSystemResponse: FileSystemResponse;
@@ -1028,7 +1035,8 @@ export const contractSchemas: Record<ContractName, ContractSchema> = {
   CurrentScanResponse: { kind: "object", fields: { "updatedUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "files": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "MediaFileRow" } } }, "summary": { optional: false, schema: { kind: "ref", name: "ScanSummary" } }, "selectedPaths": { optional: false, schema: { kind: "array", item: { kind: "string" } } } }, flatten: [] },
   ExecutionSummary: { kind: "object", fields: { "workflow": { optional: false, schema: { kind: "ref", name: "JobKind" } }, "startedUtc": { optional: false, schema: { kind: "string" } }, "completedUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "counts": { optional: false, schema: { kind: "ref", name: "JobSummary" } }, "jobs": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "JobSnapshot" } } } }, flatten: [] },
   FileFingerprintDto: { kind: "object", fields: { "path": { optional: false, schema: { kind: "string" } }, "sizeBytes": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "modifiedUtc": { optional: false, schema: { kind: "string" } }, "quickHash": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },
-  FileSelectionRequest: { kind: "object", fields: { "paths": { optional: false, schema: { kind: "array", item: { kind: "string" } } } }, flatten: [] },
+  FileSelectionRequest: { kind: "object", fields: { "paths": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "replaceWorkingSet": { optional: true, schema: { kind: "boolean" } } }, flatten: [] },
+  FileSelectionResponse: { kind: "object", fields: { "selectedPaths": { optional: false, schema: { kind: "array", item: { kind: "string" } } } }, flatten: [] },
   FileSystemEntry: { kind: "object", fields: { "name": { optional: false, schema: { kind: "string" } }, "path": { optional: false, schema: { kind: "string" } }, "kind": { optional: false, schema: { kind: "ref", name: "FileSystemEntryKind" } }, "sizeBytes": { optional: true, schema: { kind: "union", variants: [{ kind: "number", integer: true, unsigned: true }, { kind: "null" }] } }, "modifiedUtc": { optional: false, schema: { kind: "string" } } }, flatten: [] },
   FileSystemEntryKind: { kind: "union", variants: [{ kind: "literal", value: "folder" }, { kind: "literal", value: "file" }] },
   FileSystemResponse: { kind: "object", fields: { "path": { optional: false, schema: { kind: "string" } }, "parentPath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "entries": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "FileSystemEntry" } } } }, flatten: [] },
@@ -1107,7 +1115,7 @@ export const contractSchemas: Record<ContractName, ContractSchema> = {
   RenameSearchResult: { kind: "object", fields: { "id": { optional: false, schema: { kind: "unknown" } }, "name": { optional: false, schema: { kind: "string" } }, "year": { optional: false, schema: { kind: "string" } }, "overview": { optional: false, schema: { kind: "string" } }, "provider": { optional: false, schema: { kind: "string" } }, "format": { optional: false, schema: { kind: "string" } }, "databaseUrl": { optional: false, schema: { kind: "string" } }, "displayName": { optional: false, schema: { kind: "string" } }, "providerDisplay": { optional: false, schema: { kind: "string" } } }, flatten: [] },
   RenameUndoRequest: { kind: "object", fields: { "batchId": { optional: false, schema: { kind: "string" } }, "idempotencyKey": { optional: false, schema: { kind: "string" } } }, flatten: [] },
   ScanJobResponse: { kind: "object", fields: { "id": { optional: false, schema: { kind: "string" } }, "status": { optional: false, schema: { kind: "ref", name: "JobStatus" } }, "createdUtc": { optional: false, schema: { kind: "string" } }, "startedUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "completedUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "currentSource": { optional: false, schema: { kind: "string" } }, "completed": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "total": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "files": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "MediaFileRow" } } }, "skipped": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "summary": { optional: false, schema: { kind: "ref", name: "ScanSummary" } }, "error": { optional: false, schema: { kind: "string" } } }, flatten: [] },
-  ScanRequest: { kind: "object", fields: { "sourcePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "sources": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "ignoredFolderNames": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "mkvMergePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "ffProbePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "forceRefresh": { optional: false, schema: { kind: "boolean" } }, "maxWorkers": { optional: true, schema: { kind: "union", variants: [{ kind: "number", integer: true, unsigned: true }, { kind: "null" }] } } }, flatten: [] },
+  ScanRequest: { kind: "object", fields: { "sourcePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "sources": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "ignoredFolderNames": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "mkvMergePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "ffProbePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "forceRefresh": { optional: false, schema: { kind: "boolean" } }, "maxWorkers": { optional: true, schema: { kind: "union", variants: [{ kind: "number", integer: true, unsigned: true }, { kind: "null" }] } }, "keepWorkingSet": { optional: true, schema: { kind: "boolean" } } }, flatten: [] },
   ScanResponse: { kind: "object", fields: { "files": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "MediaFileDto" } } }, "skipped": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "summary": { optional: false, schema: { kind: "ref", name: "ScanSummary" } } }, flatten: [] },
   ScanSummary: { kind: "object", fields: { "total": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "mkv": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "mp4": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "failed": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "cached": { optional: false, schema: { kind: "number", integer: true, unsigned: true } } }, flatten: [] },
   SecretStatus: { kind: "object", fields: { "key": { optional: false, schema: { kind: "string" } }, "configured": { optional: false, schema: { kind: "boolean" } }, "maskedHint": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },

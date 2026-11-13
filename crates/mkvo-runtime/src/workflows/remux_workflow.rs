@@ -13,7 +13,7 @@ impl MkvoRuntime {
 
     pub(super) async fn plan_mux(&self, request: &MuxPreviewRequest) -> RuntimeResult<RemuxPlan> {
         let files = self
-            .resolve_rows(&request.files, &request.selected_paths)
+            .resolve_selected_rows(&request.files, &request.selected_paths)
             .await?;
         let reorder_template = if request.reorder_tracks {
             let template_path = PathBuf::from(&request.reorder_template_path);
@@ -962,10 +962,8 @@ impl MkvoRuntime {
             arguments.push("--no-attachments".to_owned());
         }
         let source = self
-            .current_domain_files()
-            .await
-            .into_iter()
-            .find(|file| same_path(&file.path, &item.source));
+            .find_working_set_file(|file| same_path(&file.path, &item.source))
+            .await;
         if let Some(source) = source.as_ref() {
             append_track_selection(&mut arguments, source, &item.selected_track_ids);
             if preserve_attachments && !item.subtitle_transforms.is_empty() {
