@@ -27,12 +27,12 @@ export function TracksPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <nav aria-label="Track operations" className="mb-5 flex shrink-0 gap-5 overflow-x-auto border-b border-border">
+      <nav aria-label="Track operations" className="mb-5 flex shrink-0 gap-5 overflow-x-auto shadow-[inset_0_-1px_0_var(--color-border)]">
         {operations.filter((operation) => !operation.requiresMp4 || hasMp4Files || operation === current).map((operation) => (
           <NavLink
             key={operation.op}
             to={`/tracks/${operation.op}`}
-            className={({ isActive }) => `-mb-px shrink-0 whitespace-nowrap border-b-2 pb-2 text-sm font-semibold transition ${isActive ? "border-accent text-text" : "border-transparent text-muted hover:text-text"}`}
+            className={({ isActive }) => `shrink-0 whitespace-nowrap border-b-2 pb-2 text-sm font-semibold transition ${isActive ? "border-accent text-text" : "border-transparent text-muted hover:text-text"}`}
           >
             {operation.label}
           </NavLink>
