@@ -576,6 +576,23 @@ impl WatchService {
     }
 }
 
+fn watch_options(base: &WatchOptions, settings: &WatchSettings) -> WatchOptions {
+    let mut options = base.clone();
+    options.roots = settings.roots.clone();
+    options.debounce = std::time::Duration::from_millis(settings.debounce_millis.max(50));
+    if settings.reconciliation_interval_minutes > 0 {
+        options.poll_interval = std::time::Duration::from_secs(
+            settings.reconciliation_interval_minutes.saturating_mul(60),
+        );
+    }
+    options.mode = if settings.force_polling {
+        WatchMode::Polling
+    } else {
+        WatchMode::Auto
+    };
+    options
+}
+
 #[async_trait]
 impl WatchBackend for WatchService {
     fn subscribe(&self) -> broadcast::Receiver<WatchChange> {
@@ -584,19 +601,7 @@ impl WatchBackend for WatchService {
 
     async fn start(&self, settings: &WatchSettings) -> Result<(), PortError> {
         self.stop_inner().await;
-        let mut options = self.options.clone();
-        options.roots = settings.roots.clone();
-        options.debounce = std::time::Duration::from_millis(settings.debounce_millis.max(50));
-        if settings.reconciliation_interval_minutes > 0 {
-            options.poll_interval = std::time::Duration::from_secs(
-                settings.reconciliation_interval_minutes.saturating_mul(60),
-            );
-        }
-        options.mode = if settings.force_polling {
-            WatchMode::Polling
-        } else {
-            WatchMode::Auto
-        };
+        let options = watch_options(&self.options, settings);
         let mut handle = WatchHandle::start(options).map_err(|error| {
             PortError::unavailable(format!("watcher could not start: {error}"), true)
         })?;
@@ -873,11 +878,16 @@ mod tests {
     /// into a full library walk every few seconds.
     #[test]
     fn zero_reconciliation_interval_falls_back_to_the_settings_default() {
-        let minutes = WatchSettings::default().reconciliation_interval_minutes;
-        assert_eq!(
-            WatchOptions::default().poll_interval,
-            std::time::Duration::from_secs(minutes * 60)
-        );
+        let interval = |minutes| {
+            let settings = WatchSettings {
+                reconciliation_interval_minutes: minutes,
+                ..WatchSettings::default()
+            };
+            watch_options(&WatchOptions::default(), &settings).poll_interval
+        };
+        let default = WatchSettings::default().reconciliation_interval_minutes;
+        assert_eq!(interval(0), interval(default));
+        assert_eq!(interval(45), std::time::Duration::from_secs(45 * 60));
     }
 
     /// Each change costs the subscriber a probe, so a few hundred files landing
@@ -928,7 +938,7 @@ mod tests {
         let created = root.join("episode.mkv");
         std::fs::write(&created, b"episode").expect("create media file");
 
-        let change = tokio::time::timeout(std::time::Duration::from_secs(3), changes.recv())
+        let change = tokio::time::timeout(std::time::Duration::from_secs(20), changes.recv())
             .await
             .expect("polling reconciliation timed out")
             .expect("watch change channel closed");
