@@ -346,14 +346,10 @@ impl MkvoRuntime {
             .or_else(|| stored.map(|server| server.server_url.clone()))
             .ok_or_else(|| RuntimeError::invalid("Enter a server URL."))?;
         validate_media_server_url(&url)?;
-        let credential = match api_key {
-            Some(value) => value,
-            None => {
-                let key = stored
-                    .and_then(|server| server.credential.secret_reference.as_deref())
-                    .unwrap_or("media_server.temporary.api_key");
-                self.secret_alias(&[key]).await?.unwrap_or_default()
-            }
+        let credential = match (api_key, stored) {
+            (Some(value), _) => value,
+            (None, Some(stored)) => self.media_server_connection(stored).await?.credential,
+            (None, None) => String::new(),
         };
         let client = self.media_server_client(kind, &loaded.settings);
         let connection = MediaServerConnection {
@@ -840,6 +836,30 @@ mod media_server_credential_tests {
                 .contains("HTTP 401 Unauthorized for Items/show-1/Images/Primary"),
             "{error}"
         );
+    }
+
+    /// Sync, catalog and artwork also accept the key under its legacy name, so
+    /// Test must too, or a server that syncs is told it has no key.
+    #[tokio::test]
+    async fn test_finds_a_key_stored_only_under_its_legacy_name() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("k")).await;
+        host.runtime
+            .inner
+            .dependencies
+            .secrets
+            .remove(&format!("media_server.{}.api_key", server.id))
+            .await
+            .expect("remove the current secret name");
+
+        let result = host
+            .runtime
+            .test_media_server_connection(test_request(&server, &jellyfin.url, ""))
+            .await
+            .expect("test");
+
+        assert!(result.success, "{}", result.status);
     }
 
     /// With nothing to send, the server's 401 is about a missing key, not a wrong one.
