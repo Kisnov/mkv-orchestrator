@@ -367,15 +367,10 @@ pub fn rename_tokens(file: &MediaFile) -> RenameTokens {
     ]);
     let season = episode.and_then(|value| value.season);
     let episode_number = episode.and_then(|value| value.episode);
+    // Only what the provider says; a number made up from season and episode is not an absolute one.
     let absolute = episode
         .and_then(|value| value.absolute_episode)
-        .or_else(|| {
-            season.zip(episode_number).map(|(season, episode)| {
-                (season.max(1).saturating_sub(1))
-                    .saturating_mul(1_000)
-                    .saturating_add(episode)
-            })
-        });
+        .filter(|number| *number > 0);
     RenameTokens {
         title: series.clone(),
         series,
@@ -830,6 +825,25 @@ mod tests {
         );
     }
 
+    /// S02E05 used to be given the absolute number 1005.
+    #[test]
+    fn the_absolute_number_is_the_providers_or_nothing() {
+        let mut file = media("old.mkv", 5);
+        let episode = file.episode.as_mut().expect("episode");
+        episode.season = Some(2);
+        assert_eq!(rename_tokens(&file).absolute, None);
+        assert_eq!(
+            build_file_name(&file, "{absolute:000} - {episodeTitle}"),
+            "- Pilot - Part 1.mkv"
+        );
+
+        file.episode.as_mut().expect("episode").absolute_episode = Some(17);
+        assert_eq!(build_file_name(&file, "{absolute:000}"), "017.mkv");
+        // TVDB answers 0 for a series it has no absolute order for.
+        file.episode.as_mut().expect("episode").absolute_episode = Some(0);
+        assert_eq!(rename_tokens(&file).absolute, None);
+    }
+
     #[test]
     fn reserved_windows_name_is_portable() {
         assert_eq!(sanitize_file_name("CON"), "_CON");
@@ -893,7 +907,9 @@ mod tests {
                     .as_u64()
                     .or_else(|| input["episode"].as_u64())
                     .and_then(|value| u32::try_from(value).ok()),
-                absolute_episode: None,
+                absolute_episode: episode["absoluteNumber"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok()),
                 episode_title: Some(episode_title.to_owned()),
                 year: input["year"]
                     .as_u64()
