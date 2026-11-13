@@ -184,38 +184,53 @@ impl MkvoRuntime {
             .settings
             .workers
             .max_edit_workers;
+        let halted = &std::sync::atomic::AtomicBool::new(false);
         let mut executions = stream::iter(runnable.into_iter().enumerate())
             .map(|(index, item)| async move {
                 let key = item.path.to_string_lossy().into_owned();
-                let result = self
-                    .execute_propedit_item(&item, context, index, total)
-                    .await;
+                let result = if halted.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(ApplicationError::Canceled)
+                } else {
+                    self.execute_propedit_item(&item, context, index, total)
+                        .await
+                };
                 (key, result)
             })
             .buffer_unordered(workers);
         let mut failures = Vec::new();
+        let mut recorded = Ok(());
         while let Some((key, result)) = executions.next().await {
-            match result {
-                Ok(()) => {
-                    journal.step = journal.step.saturating_add(1);
-                    journal.complete_item(&key);
-                    context.record_completed().await?;
-                }
-                Err(error) => {
-                    // A canceled file was not changed: it stays pending rather than failed.
-                    if !matches!(error, ApplicationError::Canceled) {
-                        journal.fail_item(&key, error.to_string());
-                        context.record_failed().await?;
-                        context
-                            .log(JobLogLevel::Error, format!("{key}: {error}"))
-                            .await?;
-                    }
-                    failures.push((key, error));
-                }
+            // Returning here would drop, and so kill, the edits still writing: they are drained.
+            if recorded.is_err() {
+                continue;
             }
-            journal.updated_utc = Utc::now();
-            self.dependencies().journal.advance(&journal).await?;
+            recorded = async {
+                match result {
+                    Ok(()) => {
+                        journal.step = journal.step.saturating_add(1);
+                        journal.complete_item(&key);
+                        context.record_completed().await?;
+                    }
+                    Err(error) => {
+                        // A canceled file was not changed: it stays pending rather than failed.
+                        if !matches!(error, ApplicationError::Canceled) {
+                            journal.fail_item(&key, error.to_string());
+                            context.record_failed().await?;
+                            context
+                                .log(JobLogLevel::Error, format!("{key}: {error}"))
+                                .await?;
+                        }
+                        failures.push((key, error));
+                    }
+                }
+                journal.updated_utc = Utc::now();
+                self.dependencies().journal.advance(&journal).await?;
+                Ok::<_, ApplicationError>(())
+            }
+            .await;
+            halted.store(recorded.is_err(), std::sync::atomic::Ordering::Relaxed);
         }
+        recorded?;
         if !failures.is_empty() {
             let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
@@ -308,13 +323,19 @@ impl MkvoRuntime {
 mod execution_tests {
     use std::sync::Arc;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
-    use mkvo_application::{PortError, ToolExecutionResult, ToolExecutor};
+    use mkvo_application::{
+        JournalRecord, OperationJournal, PortError, ToolExecutionResult, ToolExecutor,
+    };
     use mkvo_contracts::{JobSnapshot, JobStatus};
     use tokio::sync::{Notify, Semaphore};
     use tokio_util::sync::CancellationToken;
 
-    use super::super::remux_workflow::execution_tests::{Library, ScriptedTools, exited, library};
+    use super::super::remux_workflow::execution_tests::{
+        Library, ScriptedTools, exited, library, library_with,
+    };
     use super::*;
 
     fn title_edit_plan(files: Vec<MediaFile>) -> PropertyEditPlan {
@@ -418,6 +439,84 @@ mod execution_tests {
 
         assert_eq!(job.status, JobStatus::Canceled);
         assert_eq!((job.completed, job.failed), (1, 0));
+    }
+
+    /// A journal that stops accepting updates once the batch is under way.
+    struct BrokenJournal {
+        inner: Arc<dyn OperationJournal>,
+        updates: AtomicUsize,
+        broke: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl OperationJournal for BrokenJournal {
+        async fn begin(&self, record: &JournalRecord) -> Result<(), PortError> {
+            self.inner.begin(record).await
+        }
+
+        async fn advance(&self, record: &JournalRecord) -> Result<(), PortError> {
+            // The first update only marks the batch as running.
+            if self.updates.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.inner.advance(record).await;
+            }
+            self.broke.notify_one();
+            Err(PortError::Other("the journal is unavailable".to_owned()))
+        }
+
+        async fn get(&self, key: &IdempotencyKey) -> Result<Option<JournalRecord>, PortError> {
+            self.inner.get(key).await
+        }
+    }
+
+    /// Edits `Episode 02` only once released; every other file at once.
+    #[derive(Clone)]
+    struct SlowSecondEdit {
+        release: Arc<Semaphore>,
+        finished: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SlowSecondEdit {
+        async fn execute(
+            &self,
+            invocation: &ToolInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<ToolExecutionResult, PortError> {
+            if invocation.arguments[0].contains("Episode 02") {
+                self.release.acquire().await.expect("open").forget();
+            }
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(exited(invocation, 0, "Done.\n"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bookkeeping_error_lets_the_edit_in_flight_finish() {
+        let tools = SlowSecondEdit {
+            release: Arc::new(Semaphore::new(0)),
+            finished: Arc::default(),
+        };
+        let broke = Arc::new(Notify::new());
+        let library = library_with(tools.clone(), |dependencies| {
+            dependencies.journal = Arc::new(BrokenJournal {
+                inner: dependencies.journal.clone(),
+                updates: AtomicUsize::new(0),
+                broke: broke.clone(),
+            });
+        });
+        let files = vec![
+            library.media("Episode 01.mkv").await,
+            library.media("Episode 02.mkv").await,
+        ];
+
+        let id = start_title_edit(&library, title_edit_plan(files)).await;
+        broke.notified().await;
+        tools.release.add_permits(1);
+        let job = library.finished_job(id).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.error.expect("error").contains("journal is unavailable"));
+        assert_eq!(tools.finished.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
