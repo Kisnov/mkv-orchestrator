@@ -123,6 +123,12 @@ pub trait FileSystem: Send + Sync {
     /// Put `source` in place of the existing `target` with a single rename,
     /// once `source` is safely on disk.
     async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError>;
+
+    /// The files directly inside `directory`. A file system that cannot list
+    /// reports none, and a rename then moves no sidecars.
+    async fn list_files(&self, _directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

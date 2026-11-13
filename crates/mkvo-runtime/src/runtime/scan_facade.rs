@@ -404,6 +404,30 @@ impl MkvoRuntime {
         self.refresh_working_set(&targets).await;
     }
 
+    /// Follow renames without probing: each pair is a file's old path and its
+    /// fingerprint under the new one, and its content is what it was.
+    pub(crate) async fn move_working_set_files(
+        &self,
+        renamed: &[(PathBuf, mkvo_domain::FileFingerprint)],
+    ) {
+        let renames: Vec<_> = renamed
+            .iter()
+            .map(|(source, target)| (source.clone(), target.path.clone()))
+            .collect();
+        let targets: std::collections::BTreeMap<_, _> = renamed
+            .iter()
+            .map(|(_, target)| (target.path.as_path(), target))
+            .collect();
+        let mut state = self.inner.current_scan.write().await;
+        state.apply_renames(&renames);
+        for file in &mut state.files {
+            if let Some(target) = targets.get(file.path.as_path()) {
+                file.fingerprint = (*target).clone();
+            }
+        }
+        state.updated_utc = Some(Utc::now());
+    }
+
     /// Re-read files an operation just changed, so the working set describes
     /// them as they are now rather than as they were when scanned.
     ///

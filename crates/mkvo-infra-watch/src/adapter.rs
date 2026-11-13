@@ -365,6 +365,33 @@ impl FileSystem for LocalFileSystem {
             ))
         })
     }
+
+    async fn list_files(&self, directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+        let directory = self
+            .authorized_roots
+            .authorize_existing(directory, AccessMode::Read)
+            .map_err(path_port_error)?
+            .into_path_buf();
+        let listed = {
+            let directory = directory.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut files = Vec::new();
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        files.push(entry.path());
+                    }
+                }
+                Ok::<_, std::io::Error>(files)
+            })
+        };
+        listed
+            .await
+            .map_err(|error| PortError::Other(format!("directory listing task failed: {error}")))?
+            .map_err(|error| {
+                PortError::Other(format!("could not list `{}`: {error}", directory.display()))
+            })
+    }
 }
 
 /// Move `source` to `target`, failing if anything is already there.
@@ -1215,5 +1242,39 @@ mod move_tests {
         permissions.set_readonly(false);
         let _ = std::fs::set_permissions(&moved, permissions);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listing_names_the_files_of_one_folder_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "mkvo-list-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(directory.join("Season 2")).expect("folders");
+        let directory = std::fs::canonicalize(directory).expect("canonical dir");
+        for name in ["a.mkv", "a.srt", "Season 2/b.mkv"] {
+            std::fs::write(directory.join(name), b"file").expect("file");
+        }
+        let roots =
+            AuthorizedRoots::new([crate::AuthorizedRoot::new(&directory, false).expect("root")])
+                .expect("roots");
+
+        let mut listed = LocalFileSystem::new(roots, false)
+            .list_files(&directory)
+            .await
+            .expect("list");
+        listed.sort();
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(listed, [directory.join("a.mkv"), directory.join("a.srt")]);
     }
 }
