@@ -476,7 +476,6 @@ describe("Edit Tracks file selection", () => {
   });
 
   it("asks for confirmation, naming the target tracks, before applying to a file that differs", async () => {
-
     const user = userEvent.setup();
     const { plan, apply } = renderPage();
     const applyButton = await ready();
@@ -532,7 +531,6 @@ describe("Edit Tracks file selection", () => {
   });
 
   it("disables preview and apply when nothing is selected", async () => {
-
     const user = userEvent.setup();
     const { plan, apply } = renderPage();
     const applyButton = await ready();

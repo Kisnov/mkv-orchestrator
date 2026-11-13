@@ -92,7 +92,6 @@ export function TrackPropertiesPage() {
   const [configurationReady, setConfigurationReady] = useState(false);
   // Holds the request, its plan and the differing files as they were when Apply was pressed.
   const [pendingApply, setPendingApply] = useState<{ request: PropEditPreviewRequest; plan: PropEditPreviewResponse; rows: PreviewSummaryRow[] } | null>(null);
-
   const [filePanelPercent, setFilePanelPercent] = useState(50);
   const panelRef = useRef<HTMLDivElement>(null);
   const lastPreview = useRef<{ request: string; plan: PropEditPreviewResponse } | null>(null);
@@ -436,8 +435,7 @@ export function TrackPropertiesPage() {
           </MobileOptions>
       <div className="mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3" aria-label="Operation actions">
         <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
-        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)}
- className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
+        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
         <span className="w-full text-xs text-muted">{selectedMkvPaths.length} files selected</span>
         <span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
       </div>
@@ -537,7 +535,6 @@ export function TrackPropertiesPage() {
               </p>
               <div className="mt-4 overflow-hidden rounded-md border border-warning bg-input">
                 {pendingApply.rows.map((row) => (
-
                   <div key={row.key} className="border-b border-border px-4 py-3 last:border-0">
                     <div className="font-semibold text-text">{row.title}</div>
                     <div className="mt-1 whitespace-pre-wrap text-xs leading-5 text-muted">{row.detail}</div>
