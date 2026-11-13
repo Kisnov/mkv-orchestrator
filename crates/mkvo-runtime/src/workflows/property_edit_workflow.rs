@@ -282,6 +282,7 @@ impl MkvoRuntime {
             )
             .await?;
         let invocation = self.propedit_invocation(item).await?;
+        context.ensure_not_canceled()?;
         // mkvpropedit rewrites the file in place; a cancel waits for it rather than kill it mid-write.
         let execution = self
             .dependencies()
