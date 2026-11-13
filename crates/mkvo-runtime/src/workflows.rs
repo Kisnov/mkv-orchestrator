@@ -966,6 +966,7 @@ mod tests {
             .build_plan(RenamePlanRequest {
                 source_access: BTreeMap::new(),
                 existing_parents: BTreeSet::new(),
+                unlisted_folders: BTreeSet::new(),
                 files: vec![source],
                 template: "Renamed".to_owned(),
                 provider: None,

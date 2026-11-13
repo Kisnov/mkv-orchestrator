@@ -35,6 +35,10 @@ pub struct RenamePlanRequest {
     /// Target parent directories known to exist, by portable path.
     #[serde(default)]
     pub existing_parents: BTreeSet<String>,
+    /// Source folders that could not be listed, by portable path: sidecars
+    /// in them are unknown.
+    #[serde(default)]
+    pub unlisted_folders: BTreeSet<String>,
     #[serde(default)]
     pub authorized_roots: Vec<PathBuf>,
     pub settings_fingerprint: String,
@@ -236,6 +240,21 @@ impl RenamePlanner {
                     PlanConflictKind::DuplicateTarget,
                     "Multiple files render to the same target",
                     Some(target),
+                ));
+            }
+        }
+        // Added last: a row shows its first conflict, and a blocking one says more.
+        for item in items.iter_mut().filter(|item| item.source != item.target) {
+            let unlisted = item.source.parent().is_some_and(|folder| {
+                request
+                    .unlisted_folders
+                    .contains(&portable_path_key(folder))
+            });
+            if unlisted {
+                item.conflicts.push(PlanConflict::informational(
+                    PlanConflictKind::Other,
+                    "Ready, but the folder could not be read: subtitles, metadata and artwork keep their old names",
+                    Some(item.source.clone()),
                 ));
             }
         }
@@ -876,6 +895,7 @@ mod tests {
         let request = RenamePlanRequest {
             source_access: BTreeMap::new(),
             existing_parents: BTreeSet::new(),
+            unlisted_folders: BTreeSet::new(),
             files: vec![media("a.mkv", 1), media("b.mkv", 1)],
             template: DEFAULT_SERIES_TEMPLATE.to_owned(),
             provider: None,
@@ -1063,6 +1083,7 @@ mod tests {
             let request = RenamePlanRequest {
                 source_access: BTreeMap::new(),
                 existing_parents: BTreeSet::new(),
+                unlisted_folders: BTreeSet::new(),
                 files: input["files"]
                     .as_array()
                     .expect("files")
@@ -1166,6 +1187,7 @@ mod access_conflict_tests {
             existing_paths: BTreeSet::new(),
             source_access: BTreeMap::new(),
             existing_parents: BTreeSet::new(),
+            unlisted_folders: BTreeSet::new(),
             authorized_roots: Vec::new(),
             settings_fingerprint: "settings".to_owned(),
             expires_in_seconds: 60,
@@ -1292,25 +1314,30 @@ mod preflight_tests {
         }
     }
 
+    fn request(files: Vec<MediaFile>, existing: &[&str]) -> RenamePlanRequest {
+        RenamePlanRequest {
+            existing_paths: files
+                .iter()
+                .map(|file| file.path.clone())
+                .chain(existing.iter().map(PathBuf::from))
+                .collect(),
+            files,
+            template: "{episodeTitle}".to_owned(),
+            provider: None,
+            check_existing_files: true,
+            source_access: BTreeMap::new(),
+            existing_parents: BTreeSet::new(),
+            unlisted_folders: BTreeSet::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        }
+    }
+
     fn plan(files: Vec<MediaFile>, existing: &[&str]) -> RenamePlan {
         RenamePlanner
-            .build_plan(RenamePlanRequest {
-                existing_paths: files
-                    .iter()
-                    .map(|file| file.path.clone())
-                    .chain(existing.iter().map(PathBuf::from))
-                    .collect(),
-                files,
-                template: "{episodeTitle}".to_owned(),
-                provider: None,
-                check_existing_files: true,
-                source_access: BTreeMap::new(),
-                existing_parents: BTreeSet::new(),
-                authorized_roots: Vec::new(),
-                settings_fingerprint: "settings".to_owned(),
-                expires_in_seconds: 60,
-                idempotency_key: IdempotencyKey::generate(),
-            })
+            .build_plan(request(files, existing))
             .expect("plan")
     }
 
@@ -1421,6 +1448,18 @@ mod preflight_tests {
                 );
             }
         }
+    }
+
+    /// A folder that cannot be listed used to mean, silently, no sidecars.
+    #[test]
+    fn a_folder_that_could_not_be_listed_is_said_on_its_files() {
+        let mut request = request(vec![media("/media/a.mkv", "Pilot")], &[]);
+        request.unlisted_folders.insert("/media".to_owned());
+        let plan = RenamePlanner.build_plan(request).expect("plan");
+        let item = &plan.payload.items[0];
+        assert_eq!(kinds(item), [PlanConflictKind::Other]);
+        assert!(item.can_apply());
+        assert!(!plan.payload.has_blocking_issues());
     }
 
     #[test]

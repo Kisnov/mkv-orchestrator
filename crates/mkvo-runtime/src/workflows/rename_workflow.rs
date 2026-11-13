@@ -110,6 +110,8 @@ impl MkvoRuntime {
             .idempotency_key
             .unwrap_or_else(IdempotencyKey::generate);
         let files_for_access = files.clone();
+        let (existing_paths, unlisted_folders) =
+            self.existing_paths_around(&files_for_access).await;
         let plan = RenamePlanner.build_plan(RenamePlanRequest {
             files,
             template: request
@@ -117,11 +119,12 @@ impl MkvoRuntime {
                 .unwrap_or_else(|| settings.rename.template.clone()),
             provider: Some(provider),
             check_existing_files: true,
-            existing_paths: self.existing_paths_around(&files_for_access).await,
+            existing_paths,
             source_access: self
                 .probe_source_access(&files_for_access, RequiredAccess::ReadWrite)
                 .await,
             existing_parents: self.existing_parents(&files_for_access).await,
+            unlisted_folders,
             authorized_roots: self.authorized_root_paths(),
             settings_fingerprint,
             expires_in_seconds: 900,
@@ -166,21 +169,29 @@ impl MkvoRuntime {
     }
 
     /// The working set plus everything in the files' folders, so the planner
-    /// sees their sidecars and every name that is already taken.
-    pub(super) async fn existing_paths_around(&self, files: &[MediaFile]) -> BTreeSet<PathBuf> {
+    /// sees their sidecars and every name that is already taken; and the keys
+    /// of the folders that could not be listed.
+    pub(super) async fn existing_paths_around(
+        &self,
+        files: &[MediaFile],
+    ) -> (BTreeSet<PathBuf>, BTreeSet<String>) {
         let mut existing = self.current_existing_paths().await;
+        let mut unlisted = BTreeSet::new();
         let folders: BTreeSet<_> = files.iter().filter_map(|file| file.path.parent()).collect();
         for folder in folders {
             match self.dependencies().file_system.list_files(folder).await {
                 Ok(listed) => existing.extend(listed),
-                Err(error) => tracing::debug!(
-                    path = %folder.display(),
-                    %error,
-                    "folder could not be listed for a rename preview"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %folder.display(),
+                        %error,
+                        "folder could not be listed for a rename preview"
+                    );
+                    unlisted.insert(mkvo_application::paths::path_key(folder));
+                }
             }
         }
-        existing
+        (existing, unlisted)
     }
 
     pub(super) async fn existing_parents(&self, files: &[MediaFile]) -> BTreeSet<String> {
@@ -896,13 +907,14 @@ mod tests {
             let settings = self.runtime.dependencies().settings.load().await.unwrap().0;
             let plan = RenamePlanner
                 .build_plan(RenamePlanRequest {
-                    existing_paths: self.runtime.existing_paths_around(&files).await,
+                    existing_paths: self.runtime.existing_paths_around(&files).await.0,
                     files,
                     template: "{episodeTitle}".to_owned(),
                     provider: None,
                     check_existing_files: true,
                     source_access: BTreeMap::new(),
                     existing_parents: BTreeSet::new(),
+                    unlisted_folders: BTreeSet::new(),
                     authorized_roots: Vec::new(),
                     settings_fingerprint: stable_fingerprint(&settings).unwrap(),
                     expires_in_seconds: 60,
@@ -1051,6 +1063,19 @@ mod tests {
         assert_eq!((preview.restorable, preview.skipped), (1, 0));
         library.runtime.undo_rename_batch(&batch).await.unwrap();
         assert_eq!(library.names(), ["ep.mkv", "ep.srt"]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_cannot_be_listed_is_reported_to_the_planner() {
+        let library = Library::with(&["a.mkv"]).await;
+        let mut files = library.runtime.current_domain_files().await;
+        files[0].path = library.root.join("gone").join("b.mkv");
+
+        let (existing, unlisted) = library.runtime.existing_paths_around(&files).await;
+
+        assert_eq!(existing, BTreeSet::from([library.root.join("a.mkv")]));
+        let gone = mkvo_domain::path_key(&library.root.join("gone"));
+        assert_eq!(unlisted, BTreeSet::from([gone]));
     }
 
     /// An undo that stopped at a locked subtitle left the video back in place;
