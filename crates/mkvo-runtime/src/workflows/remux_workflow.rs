@@ -1164,18 +1164,38 @@ pub(super) fn tool_warning(
 ) -> Result<Option<String>, ApplicationError> {
     match execution.exit_code {
         Some(0) => Ok(None),
-        Some(1) => Ok(Some(format!(
+        Some(1) if finished(tool, &execution.stdout) => Ok(Some(format!(
             "{tool} finished with warnings: {}",
             tool_message(execution, "Warning:")
         ))),
         code => Err(ApplicationError::Internal(format!(
-            "{tool} failed ({}): {}",
+            "{tool} {} ({}): {}",
+            if code == Some(1) {
+                "did not finish"
+            } else {
+                "failed"
+            },
             code.map_or_else(
                 || "no exit code".to_owned(),
                 |code| format!("exit code {code}")
             ),
             tool_message(execution, "Error:")
         ))),
+    }
+}
+
+// A tool killed on Windows also exits with 1; only its last line (English is forced) proves it ended.
+fn finished(tool: &str, stdout: &str) -> bool {
+    let last = stdout
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    match tool {
+        "mkvmerge" => last.starts_with("Multiplexing took"),
+        "mkvpropedit" => last == "Done." || last == "No changes were made.",
+        // mkvextract prints nothing after its last progress line.
+        _ => false,
     }
 }
 
@@ -2709,5 +2729,62 @@ pub(super) mod execution_tests {
                 .to_string()
                 .ends_with("(exit code 2): access denied")
         );
+    }
+
+    // What `taskkill /F` left of a real mkvmerge v102 run: exit code 1 and a third of the file.
+    const KILLED: &str =
+        "mkvmerge v102.0 ('Little Houses') 64-bit\nProgress: 0%\rProgress: 10%\rProgress: 35%\r";
+
+    #[tokio::test]
+    async fn a_killed_mkvmerge_is_not_taken_for_one_that_finished_with_warnings() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            std::fs::write(&invocation.expected_outputs[0], "truncated").expect("output");
+            exited(invocation, 1, KILLED)
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "original"
+        );
+        assert_eq!(library.file_names(), ["Episode 01.mkv"]);
+        let error = job.error.expect("error");
+        assert!(
+            error.contains("mkvmerge did not finish (exit code 1)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exit_code_one_counts_only_with_the_line_a_finished_tool_prints_last() {
+        let ended = |tool: &str, stdout: &str| {
+            let execution = mkvo_application::ToolExecutionResult {
+                exit_code: Some(1),
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                validated_outputs: Vec::new(),
+            };
+            tool_warning(tool, &execution).is_ok()
+        };
+
+        assert!(ended("mkvmerge", WARNED));
+        assert!(ended(
+            "mkvmerge",
+            "Multiplexing took 1 minute 5 seconds.\r\n"
+        ));
+        assert!(!ended("mkvmerge", KILLED));
+        assert!(ended(
+            "mkvpropedit",
+            "Warning: x\nThe changes are written to the file.\nDone.\n"
+        ));
+        assert!(ended("mkvpropedit", "Warning: x\nNo changes were made.\n"));
+        assert!(!ended(
+            "mkvpropedit",
+            "The file is being analyzed.\nThe changes are written to the file.\n"
+        ));
+        assert!(!ended("mkvextract", "Progress: 100%\n"));
     }
 }
