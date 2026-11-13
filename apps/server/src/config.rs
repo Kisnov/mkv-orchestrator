@@ -57,7 +57,7 @@ impl ServerConfig {
         )?;
 
         let source_roots = parse_source_roots(get("MKVO_SOURCE_ROOTS").as_deref(), &media_root)?;
-        let legacy_mode = get("MKVO_AUTH_MODE");
+        let legacy_mode = get("MKVO_AUTH_MODE").filter(|value| !value.trim().is_empty());
         let auth_mode = legacy_mode
             .clone()
             .unwrap_or_else(|| "auto".to_owned())
@@ -105,6 +105,15 @@ impl ServerConfig {
             "basic" | "disabled" => credentials,
             _ => bail!("MKVO_AUTH_MODE must be one of: auto, basic, disabled"),
         };
+        if !auth_enabled
+            && !bind.ip().is_loopback()
+            && !parse_bool("MKVO_ALLOW_NO_LOGIN", get("MKVO_ALLOW_NO_LOGIN"))?.unwrap_or(false)
+        {
+            bail!(
+                "Login is turned off (MKVO_AUTH_ENABLED=false or MKVO_AUTH_MODE=disabled) but MKVO_BIND={bind} accepts network connections, so anyone on the network could rename, remux and delete your media. Remove that setting to sign in as '{auth_username}' with the password stored in {}/admin-password.txt (or set MKVO_PASSWORD), or set MKVO_ALLOW_NO_LOGIN=true to keep running without login on a trusted network",
+                config_dir.display()
+            );
+        }
         let provider_secret_overrides = [
             ("MKVO_TVDB_API_KEY", "provider.tvdb.api_key"),
             ("MKVO_TVDB_PIN", "provider.tvdb.pin"),
@@ -297,16 +306,40 @@ mod tests {
     }
 
     #[test]
-    fn permits_explicit_unauthenticated_non_loopback_bind() {
+    fn refuses_network_bind_without_login_unless_confirmed() {
+        for (key, value) in [
+            ("MKVO_AUTH_MODE", "disabled"),
+            ("MKVO_AUTH_ENABLED", "false"),
+        ] {
+            let mut values = BTreeMap::from([("MKVO_BIND", "0.0.0.0:8080"), (key, value)]);
+            let error = ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("MKVO_ALLOW_NO_LOGIN=true"), "{error}");
+            values.insert("MKVO_ALLOW_NO_LOGIN", "true");
+            let config =
+                ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).unwrap();
+            assert!(!config.auth_enabled);
+            assert!(!config.bind.ip().is_loopback());
+        }
+        let values = BTreeMap::from([
+            ("MKVO_BIND", "127.0.0.1:8080"),
+            ("MKVO_AUTH_ENABLED", "false"),
+        ]);
+        assert!(ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).is_ok());
+    }
+
+    #[test]
+    fn blank_container_variables_keep_the_login_default() {
         let values = BTreeMap::from([
             ("MKVO_BIND", "0.0.0.0:8080"),
-            ("MKVO_AUTH_MODE", "disabled"),
+            ("MKVO_AUTH_MODE", ""),
+            ("MKVO_AUTH_ENABLED", ""),
         ]);
         let config =
             ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).unwrap();
-
-        assert!(!config.bind.ip().is_loopback());
-        assert!(config.auth.is_none());
+        assert!(config.auth_enabled);
     }
 
     #[test]

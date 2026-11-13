@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tracing::warn;
+use tracing::{info, warn};
 
 const COOKIE_NAME: &str = "mkvo_session";
 
@@ -195,6 +195,7 @@ pub struct AuthState {
     auth_enabled: bool,
     username: Arc<str>,
     password: Option<Arc<str>>,
+    password_file: Option<PathBuf>,
     sessions: Arc<RwLock<HashMap<String, Instant>>>,
     secure_cookie: bool,
     settings: Arc<RwLock<SecuritySettings>>,
@@ -280,6 +281,9 @@ impl AuthState {
             auth_enabled: true,
             username: username.trim().into(),
             password: Some(password.into()),
+            password_file: configured_password
+                .is_none()
+                .then(|| data_dir.join("admin-password.txt")),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie,
             settings: Arc::new(RwLock::new(settings)),
@@ -293,6 +297,7 @@ impl AuthState {
             auth_enabled: true,
             username: "admin".into(),
             password: (!password.is_empty()).then(|| Arc::from(password.to_owned())),
+            password_file: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie: false,
             settings: Arc::new(RwLock::new(SecuritySettings::default())),
@@ -328,6 +333,14 @@ impl AuthState {
             warn!(
                 "Administrator login is disabled: all connections, including reverse proxies, have full access"
             );
+        } else if let Some(path) = &self.password_file {
+            warn!(
+                username = %self.username,
+                "Administrator login is required: sign in with the password in {} (or set MKVO_PASSWORD)",
+                path.display()
+            );
+        } else {
+            info!(username = %self.username, "Administrator login is required: sign in with MKVO_PASSWORD");
         }
         self
     }
