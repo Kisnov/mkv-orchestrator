@@ -23,6 +23,16 @@ impl MkvoRuntime {
             }
             if !missing.is_empty() {
                 let held = self.working_set_by_key(file_key, &missing).await;
+                // The caller saves the audit as the state of everything it asked about.
+                if held.len() < missing.len() {
+                    return Err(RuntimeError::new(
+                        mkvo_contracts::ApiErrorCode::Conflict,
+                        format!(
+                            "The scan results for {} file(s) are no longer held. Scan the library again.",
+                            missing.len() - held.len()
+                        ),
+                    ));
+                }
                 files.extend(held.into_values());
             }
             files.sort_by(|left, right| left.path.cmp(&right.path));

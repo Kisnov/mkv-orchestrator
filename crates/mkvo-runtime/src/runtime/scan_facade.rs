@@ -868,6 +868,34 @@ mod tests {
         assert_eq!(audit.summary.files, 3);
     }
 
+    /// The Library saves an audit as its picture of the library, so one that
+    /// covers only some of the files asked for must not look like a result.
+    #[tokio::test]
+    async fn an_audit_of_files_no_longer_held_is_an_error() {
+        let host = host(0);
+        let scanned = overview(&host, &folder(&host, "films", 3)).await;
+        let request = crate::compat::LibraryAuditRequest {
+            paths: scanned.files.into_iter().map(|file| file.path).collect(),
+            files: Vec::new(),
+        };
+        let restarted = MkvoRuntime::from_parts(
+            host.runtime.inner.config.clone(),
+            host.runtime.inner.dependencies.clone(),
+        );
+        let after_restart = restarted.run_library_audit(request.clone()).await;
+        // A later Library scan takes the place of the one being audited.
+        overview(&host, &folder(&host, "series", 1)).await;
+        let after_another_scan = host.runtime.run_library_audit(request).await;
+
+        for error in [after_restart.unwrap_err(), after_another_scan.unwrap_err()] {
+            assert_eq!(error.code, mkvo_contracts::ApiErrorCode::Conflict);
+            assert!(
+                error.message.contains("Scan the library again"),
+                "{error:?}"
+            );
+        }
+    }
+
     /// A title sent to the Dashboard leaves copies in the working set. When
     /// the Library rebuilds it later, the audit is of what was just read.
     #[tokio::test]
