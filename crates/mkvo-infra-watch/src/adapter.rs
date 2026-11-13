@@ -1206,21 +1206,32 @@ mod move_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The path taken where hard links do not exist (exFAT, some shares).
+    /// What happens where hard links do not exist (exFAT, some shares): the
+    /// move still works, a case-only one too, and still replaces nothing.
     #[test]
-    fn without_hard_links_a_move_still_refuses_an_existing_target() {
+    fn a_filesystem_without_hard_links_falls_back_to_a_checked_rename() {
         let (directory, _) = library("fallback");
         std::fs::write(directory.join("a.mkv"), b"moved").expect("source");
         std::fs::write(directory.join("b.mkv"), b"kept").expect("target");
+        let unsupported = |_: &Path, _: &Path| Err(std::io::ErrorKind::Unsupported.into());
+        let unlinked = |from: &str, to: &str| {
+            move_linking_with(unsupported, &directory.join(from), &directory.join(to))
+        };
 
-        let refused = rename_if_absent(&directory.join("a.mkv"), &directory.join("b.mkv"));
         assert_eq!(
-            refused.expect_err("existing target").kind(),
+            unlinked("a.mkv", "b.mkv")
+                .expect_err("existing target")
+                .kind(),
             std::io::ErrorKind::AlreadyExists
         );
-        rename_if_absent(&directory.join("a.mkv"), &directory.join("c.mkv")).expect("free target");
+        unlinked("a.mkv", "c.mkv").expect("free target");
+        unlinked("c.mkv", "C.mkv").expect("case-only");
 
-        assert_eq!(names(&directory), ["b.mkv", "c.mkv"]);
+        assert_eq!(names(&directory), ["C.mkv", "b.mkv"]);
+        assert_eq!(
+            std::fs::read(directory.join("C.mkv")).expect("moved"),
+            b"moved"
+        );
         assert_eq!(
             std::fs::read(directory.join("b.mkv")).expect("target"),
             b"kept"
