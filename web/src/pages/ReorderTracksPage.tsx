@@ -7,6 +7,7 @@ import { fileColumns } from "../components/fileColumns";
 import { FileSelectionTable } from "../components/FileSelectionTable";
 import { OperationShell } from "../components/OperationShell";
 import { pathKey } from "../lib/pathKey";
+import { normalizeTrackSignature } from "../lib/templateMatch";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useLibrarySelection } from "../state/useFileSelection";
 import { buildMuxRequest, useMuxRequest } from "../state/useMuxRequest";
@@ -54,11 +55,13 @@ export function ReorderTracksPage() {
   const selection = useLibrarySelection(mkvFiles, template);
   const selectedMkvPaths = selection.selectedPaths;
 
+  // An apply renumbers the template's tracks under the same path, so the layout resets the order too.
+  const templateLayout = template ? normalizeTrackSignature(template) : "";
   useEffect(() => {
     setOrder(template?.tracks.slice().sort((left, right) => left.trackNumber - right.trackNumber).map((track) => track.id) ?? []);
     run.setPreviewResult(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [template?.path]);
+  }, [template?.path, templateLayout]);
 
   const orderedTracks = order
     .map((id) => template?.tracks.find((track) => track.id === id))
