@@ -1830,6 +1830,26 @@ mod media_server_save_tests {
         assert!(!moved.has_api_key);
     }
 
+    /// Moving a server with its key typed again keeps that key, for the new URL.
+    #[tokio::test]
+    async fn a_changed_url_with_a_new_key_stores_that_key() {
+        let old = FakeJellyfin::start();
+        let new = FakeJellyfin::start();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = runtime(directory.path());
+        let server = save_server(&runtime, None, &old.url, Some("first-key")).await;
+
+        let moved = save_server(&runtime, Some(&server.id), &new.url, Some("old-secret")).await;
+
+        assert!(moved.has_api_key);
+        runtime
+            .sync_media_server_libraries(&server.id)
+            .await
+            .expect("sync with the new key");
+        assert_eq!(new.authorizations(), [r#"MediaBrowser Token="old-secret""#]);
+        assert!(old.authorizations().is_empty());
+    }
+
     /// The comparison Test already uses: a trailing slash is not a new server.
     #[tokio::test]
     async fn a_cosmetic_url_change_keeps_the_key() {
