@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, expect, it, vi } from "vitest";
@@ -76,4 +76,15 @@ it("shows the Convert / Remux tab once an MP4 is scanned", async () => {
   renderAt("/tracks/remove", [mp4]);
   const tabs = await screen.findByRole("navigation", { name: "Track operations" });
   expect(await within(tabs).findByRole("link", { name: "Convert / Remux" })).toHaveAttribute("href", "/tracks/convert");
+});
+
+it("brings the active tab into view and wraps the tabs on phones", async () => {
+  const scrollIntoView = vi.fn();
+  Element.prototype.scrollIntoView = scrollIntoView;
+  renderAt("/tracks/remove");
+  const tabs = await screen.findByRole("navigation", { name: "Track operations" });
+  await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+  expect(scrollIntoView.mock.contexts.at(-1)).toBe(within(tabs).getByRole("link", { name: "Remove Tracks" }));
+  expect(tabs).toHaveClass("max-md:flex-wrap");
+  delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
 });
