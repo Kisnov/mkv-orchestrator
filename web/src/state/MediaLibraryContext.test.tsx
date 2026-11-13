@@ -203,6 +203,25 @@ describe("working set persistence", () => {
     expect(result.current.selectedPaths).toEqual([title[1].path]);
   });
 
+  /// A file deleted since the Library last looked is left out by the backend.
+  /// Selecting it anyway would be rejected and leave a row no operation can use.
+  it("drops handed-off files the backend could not read", async () => {
+    const title = [file("/media/tv/Show/01.mkv"), file("/media/tv/Show/gone.mkv")];
+    const setFileSelection = vi.fn((paths: string[], replaceWorkingSet?: boolean) => replaceWorkingSet
+      ? Promise.resolve({ selectedPaths: [title[0].path] })
+      : Promise.reject(new Error(`${paths.length} selected path(s) are not in the current scan`)));
+    setBackendClient(createMockBackendClient({ setFileSelection }));
+
+    const { result } = library();
+    act(() => result.current.setWorkingView(title, title.map((item) => item.path), title[1].path));
+
+    await waitFor(() => expect(result.current.files).toEqual([title[0]]));
+    expect(result.current.selectedPaths).toEqual([title[0].path]);
+    expect(result.current.templateFilePath).toBe(title[0].path);
+    expect(result.current.selectionError).toBeNull();
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+  });
+
   /// The backend is authoritative, so what it reports wins over whatever this
   /// tab happened to have cached.
   it("adopts the backend selection without echoing it back", async () => {

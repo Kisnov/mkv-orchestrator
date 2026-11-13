@@ -225,7 +225,7 @@ describe("Library poster workflow", () => {
     await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith([
       "/media/tv/Example Show/Season 1/Episode 01.mkv",
       "/media/tv/Example Show/Season 1/Episode 02.mkv"
-    ]));
+    ], true));
   });
 
   it("loads every library automatically and restores each one immediately", async () => {
