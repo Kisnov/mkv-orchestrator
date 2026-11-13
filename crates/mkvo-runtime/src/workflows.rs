@@ -603,6 +603,16 @@ mod tests {
             self.files.write().await.remove(path);
             Ok(())
         }
+
+        async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            let mut files = self.files.write().await;
+            let mut fingerprint = files
+                .remove(source)
+                .ok_or_else(|| PortError::NotFound(source.display().to_string()))?;
+            fingerprint.path = target.to_path_buf();
+            files.insert(target.to_path_buf(), fingerprint);
+            Ok(())
+        }
     }
 
     struct FakeTools;
