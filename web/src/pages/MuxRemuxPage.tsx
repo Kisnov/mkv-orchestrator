@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   getCurrentScanFiles,
   getWebSettings,
+  MediaFileRow,
   MuxPreviewRequest
 } from "../api";
 import { fileColumns } from "../components/fileColumns";
@@ -119,6 +120,8 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
     [files, selectedDetailPath]
   );
   const canRun = selectedMkvPaths.length > 0 || (convertMp4 && selectedMp4Paths.length > 0);
+  const unavailable = (file: MediaFileRow) => file.extension.toLowerCase() !== ".mp4" || convertMp4 ? undefined
+    : workflow === "convert" ? "Turn on MP4 conversion to include this file." : "MP4 files can only be converted, on Convert / Remux.";
 
   function buildRequest(): MuxPreviewRequest {
     return buildMuxRequest(files, convertMp4 ? [...selectedMkvPaths, ...selectedMp4Paths] : selectedMkvPaths, {
@@ -242,7 +245,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
             </div>
           ) : null}
       </>}
-      files={<FileSelectionTable title="File Info" files={files} templateFile={templateFile} selection={selection} columns={columns} label="MKV Operations file selection" activePath={selectedDetailFile?.path} onActivate={setSelectedDetailPath} />}
+      files={<FileSelectionTable title="File Info" files={files} templateFile={templateFile} selection={selection} columns={columns} label="MKV Operations file selection" activePath={selectedDetailFile?.path} onActivate={setSelectedDetailPath} unavailable={unavailable} />}
       details={<>
             <div className="flex shrink-0 gap-6 text-sm">
               <button onClick={() => setDetailTab("tracks")} className={detailTab === "tracks" ? "border-b border-accent pb-1 font-semibold text-text" : "pb-1 font-semibold text-muted"}>File Details: Tracks</button>

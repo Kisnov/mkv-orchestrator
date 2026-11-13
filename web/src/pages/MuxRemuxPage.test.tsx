@@ -322,3 +322,36 @@ it("builds a fresh plan and applies without a manual preview", async () => {
   await waitFor(() => expect(startMuxApply).toHaveBeenCalledWith(expect.objectContaining({ planId: "fresh-plan", planFingerprint: "fresh-fingerprint", idempotencyKey: "fresh-key" })));
   expect(buildMuxPreview).toHaveBeenCalledTimes(1);
 });
+
+it("counts only what it will send: an MP4 is unavailable until conversion is on", async () => {
+  const user = userEvent.setup();
+  const mkv = mediaFile("Episode 01.mkv");
+  const mp4 = { ...mediaFile("Movie.mp4"), extension: ".mp4", reader: "ffprobe" };
+  const files = [mkv, mp4];
+  const scan = { updatedUtc: "2026-11-13T10:00:00Z", files, selectedPaths: files.map((file) => file.path), summary: { total: 2, mkv: 1, mp4: 1, failed: 0, cached: 0 } };
+  const backend = {
+    getCurrentScanFiles: () => Promise.resolve(scan),
+    getWebSettings: () => Promise.resolve({ mkvMergeDefaultAudioLanguages: "eng", mkvMergeDefaultSubtitleLanguages: "eng" } as WebSettings),
+    setFileSelection: (selectedPaths: string[]) => Promise.resolve({ ...scan, selectedPaths })
+  };
+  const { unmount } = renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="remove" /></MediaLibraryProvider>, backend);
+
+  const box = await screen.findByRole("checkbox", { name: "Select Movie.mp4" });
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Episode 01.mkv" })).toBeChecked());
+  expect(box).toBeDisabled();
+  expect(box).not.toBeChecked();
+  expect(box).toHaveAttribute("title", "MP4 files can only be converted, on Convert / Remux.");
+  expect(screen.getByText("1 of 2 selected")).toBeInTheDocument();
+  expect(screen.getByText("1 files selected")).toBeInTheDocument();
+  unmount();
+
+  renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="convert" /></MediaLibraryProvider>, backend);
+  const convertBox = await screen.findByRole("checkbox", { name: "Select Movie.mp4" });
+  await waitFor(() => expect(convertBox).toBeChecked());
+  expect(screen.getByText("2 of 2 selected")).toBeInTheDocument();
+  expect(screen.getByText("2 files selected")).toBeInTheDocument();
+  await user.click(screen.getByRole("checkbox", { name: "Convert selected MP4 files to MKV" }));
+  expect(screen.getByRole("checkbox", { name: "Select Movie.mp4" })).toHaveAttribute("title", "Turn on MP4 conversion to include this file.");
+  expect(screen.getByText("1 of 2 selected")).toBeInTheDocument();
+  expect(screen.getByText("1 files selected")).toBeInTheDocument();
+});

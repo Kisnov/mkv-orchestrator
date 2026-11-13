@@ -13,7 +13,7 @@ const toolbarButton = "rounded-md border border-border px-3 py-1.5 hover:bg-sele
 const notice = "flex items-center gap-2 rounded-md border border-warning bg-input px-3 py-2 text-xs text-warning";
 const moveKeys = ["ArrowDown", "ArrowUp", "Home", "End"];
 
-export function FileSelectionTable({ title, files, templateFile, selection, columns = defaultColumns, label, warnDiffering = false, matchingAction = true, activePath, onActivate }: {
+export function FileSelectionTable({ title, files, templateFile, selection, columns = defaultColumns, label, warnDiffering = false, matchingAction = true, activePath, onActivate, unavailable }: {
   title: string;
   files: MediaFileRow[];
   templateFile: MediaFileRow | null;
@@ -30,6 +30,8 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
   activePath?: string;
   /** Makes rows pickable by click and from the keyboard: arrows move, Space checks, Enter picks. */
   onActivate?: (path: string) => void;
+  /** Why a file cannot be part of this operation right now; it shows unchecked and cannot be checked. */
+  unavailable?: (file: MediaFileRow) => string | undefined;
 }) {
   const detailsId = useId();
   const [sort, setSort] = useState<{ key: string; direction: SortDirection }>({ key: "file", direction: "asc" });
@@ -51,11 +53,14 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
     });
   }, [files, templateFile, sort, columns, selection.filter]);
   const displayedPaths = rows.map((row) => row.file.path);
-  const selected = new Set(selection.selectedPaths);
+  const reasons = new Map(files.map((file) => [file.path, unavailable?.(file)] as const).filter(([, reason]) => reason));
+  // What the toolbar, ranges and counts work on: the shown rows that can be part of the operation.
+  const pickable = displayedPaths.filter((path) => !reasons.has(path));
+  const selected = new Set(selection.selectedPaths.filter((path) => !reasons.has(path)));
   const matching = new Set(selection.matchingPaths);
   const selectedDiffering = selection.selectedPaths.filter((path) => selection.differingPaths.has(path)).length;
   const unselectedDiffering = selection.differingPaths.size - selectedDiffering;
-  const hiddenSelected = selection.selectedPaths.filter(selection.isHidden).length;
+  const hiddenSelected = [...selected].filter(selection.isHidden).length;
   const filter = selection.filter;
   // One row is in the tab order: the active one, or the first.
   const focusPath = activePath && displayedPaths.includes(activePath) ? activePath : displayedPaths[0];
@@ -70,7 +75,7 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
       rowElements.current.get(displayedPaths[target])?.focus();
     } else if (event.key === " ") {
       event.preventDefault();
-      selection.toggle(path, event.shiftKey, displayedPaths);
+      if (!reasons.has(path)) selection.toggle(path, event.shiftKey, pickable);
     } else if (event.key === "Enter") {
       onActivate?.(path);
     }
@@ -85,10 +90,10 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <input type="search" aria-label="Filter files by name" placeholder="Filter by name" value={filter} onChange={(event) => selection.setFilter(event.target.value)} className="h-8 w-40 rounded-md border border-border bg-input px-2.5 text-xs text-text outline-none placeholder:text-subtle focus:border-accent" />
-          <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, displayedPaths)}>Select all</button>
-          <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, [])}>Select none</button>
-          <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, displayedPaths.filter((path) => !selected.has(path)))}>Invert</button>
-          {matchingAction ? <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, displayedPaths.filter((path) => matching.has(path)))}>Only equal to template</button> : null}
+          <button type="button" className={toolbarButton} onClick={() => selection.setWithin(pickable, pickable)}>Select all</button>
+          <button type="button" className={toolbarButton} onClick={() => selection.setWithin(pickable, [])}>Select none</button>
+          <button type="button" className={toolbarButton} onClick={() => selection.setWithin(pickable, pickable.filter((path) => !selected.has(path)))}>Invert</button>
+          {matchingAction ? <button type="button" className={toolbarButton} onClick={() => selection.setWithin(pickable, pickable.filter((path) => matching.has(path)))}>Only equal to template</button> : null}
         </div>
       </div>
       <div aria-live="polite" className="mt-3 shrink-0 space-y-2 empty:hidden">
@@ -135,10 +140,12 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
                   type="checkbox"
                   aria-label={`Select ${file.fileName}`}
                   checked={selected.has(file.path)}
+                  disabled={reasons.has(file.path)}
+                  title={reasons.get(file.path)}
                   onChange={(event) => {
                     const shiftKey = shiftOnLabel.current || (event.nativeEvent as MouseEvent).shiftKey;
                     shiftOnLabel.current = false;
-                    selection.toggle(file.path, shiftKey, displayedPaths);
+                    selection.toggle(file.path, shiftKey, pickable);
                   }}
                 />
               );
