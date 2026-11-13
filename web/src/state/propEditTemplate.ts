@@ -76,14 +76,3 @@ export function PropEditTemplateWarmer(): null {
 
   return null;
 }
-
-/**
- * Drops cached templates after an edit lands.
- *
- * An apply changes the files on disk while the rows already in hand still
- * describe how they used to look, so the key alone would not notice.
- */
-export function useInvalidatePropEditTemplate() {
-  const queryClient = useQueryClient();
-  return () => queryClient.invalidateQueries({ queryKey: ["propedit-template"] });
-}
