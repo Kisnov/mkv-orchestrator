@@ -899,6 +899,7 @@ mod tests {
             .start(&WatchSettings {
                 enabled: true,
                 roots: vec![root.clone()],
+                debounce_millis: 50,
                 reconciliation_interval_minutes: 0,
                 force_polling: true,
                 ..WatchSettings::default()

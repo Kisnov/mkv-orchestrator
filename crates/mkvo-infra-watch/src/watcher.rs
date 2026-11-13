@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -198,6 +198,70 @@ fn validate_roots(roots: &[PathBuf]) -> Result<(), WatchStartError> {
     Ok(())
 }
 
+/// A path waiting to be reported, with its size and mtime at the last check.
+#[derive(Debug)]
+struct Pending {
+    kind: WatchEventKind,
+    at: Instant,
+    seen: Option<(u64, Option<SystemTime>)>,
+}
+
+fn settle_tick(debounce: Duration) -> Duration {
+    debounce
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(50))
+}
+
+/// Takes the paths quiet for `debounce` whose size and mtime also held still
+/// since the previous check, so a file still being copied is not probed.
+fn take_settled(
+    pending: &mut BTreeMap<PathBuf, Pending>,
+    debounce: Duration,
+    now: Instant,
+) -> Vec<WatchEvent> {
+    let mut ready = Vec::new();
+    pending.retain(|path, entry| {
+        if now.duration_since(entry.at) < debounce {
+            return true;
+        }
+        if entry.kind != WatchEventKind::Removed {
+            let state = std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            if state.is_some() && state != entry.seen {
+                entry.seen = state;
+                entry.at = now;
+                return true;
+            }
+        }
+        ready.push(WatchEvent {
+            kind: entry.kind,
+            paths: vec![path.clone()],
+        });
+        false
+    });
+    ready
+}
+
+fn queue(
+    pending: &mut BTreeMap<PathBuf, Pending>,
+    path: PathBuf,
+    kind: WatchEventKind,
+    at: Instant,
+) {
+    pending
+        .entry(path)
+        .and_modify(|entry| {
+            entry.kind = kind;
+            entry.at = at;
+        })
+        .or_insert(Pending {
+            kind,
+            at,
+            seen: None,
+        });
+}
+
 async fn debounce_native_events(
     mut raw_receiver: mpsc::Receiver<notify::Result<Event>>,
     sender: mpsc::Sender<WatchEvent>,
@@ -207,14 +271,11 @@ async fn debounce_native_events(
     media_only: bool,
     overflowed: Arc<AtomicBool>,
 ) {
-    let tick_duration = debounce
-        .min(Duration::from_secs(1))
-        .max(Duration::from_millis(50));
-    let mut tick = tokio::time::interval(tick_duration);
+    let mut tick = tokio::time::interval(settle_tick(debounce));
     let mut reconcile = tokio::time::interval(reconciliation.max(Duration::from_secs(1)));
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reconcile.tick().await;
-    let mut pending = BTreeMap::<PathBuf, (WatchEventKind, Instant)>::new();
+    let mut pending = BTreeMap::new();
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -236,15 +297,8 @@ async fn debounce_native_events(
                 {
                     return;
                 }
-                let now = Instant::now();
-                let ready: Vec<_> = pending
-                    .iter()
-                    .filter(|(_, (_, at))| now.duration_since(*at) >= debounce)
-                    .map(|(path, (kind, _))| (path.clone(), *kind))
-                    .collect();
-                for (path, kind) in ready {
-                    pending.remove(&path);
-                    if sender.send(WatchEvent { kind, paths: vec![path] }).await.is_err() {
+                for event in take_settled(&mut pending, debounce, Instant::now()) {
+                    if sender.send(event).await.is_err() {
                         return;
                     }
                 }
@@ -258,11 +312,7 @@ async fn debounce_native_events(
     }
 }
 
-fn queue_notify_event(
-    event: Event,
-    media_only: bool,
-    pending: &mut BTreeMap<PathBuf, (WatchEventKind, Instant)>,
-) {
+fn queue_notify_event(event: Event, media_only: bool, pending: &mut BTreeMap<PathBuf, Pending>) {
     let kind = match event.kind {
         EventKind::Create(_) => WatchEventKind::Created,
         EventKind::Modify(notify::event::ModifyKind::Name(_)) => WatchEventKind::Renamed,
@@ -275,7 +325,7 @@ fn queue_notify_event(
         if media_only && path.extension().is_some() && !is_supported_media_path(&path) {
             continue;
         }
-        pending.insert(path, (kind, at));
+        queue(pending, path, kind, at);
     }
 }
 
@@ -287,6 +337,8 @@ async fn poll_loop(
 ) {
     let mut interval = tokio::time::interval(options.poll_interval.max(Duration::from_secs(1)));
     interval.tick().await;
+    let mut tick = tokio::time::interval(settle_tick(options.debounce));
+    let mut pending = BTreeMap::new();
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -296,20 +348,26 @@ async fn poll_loop(
                 let snapshot = tokio::task::spawn_blocking(move || snapshot_roots(&roots, media_only)).await;
                 match snapshot {
                     Ok(Ok(current)) => {
+                        let now = Instant::now();
                         for change in diff_snapshots(&previous, &current) {
                             let kind = match change.kind {
                                 ReconcileChangeKind::Created => WatchEventKind::Created,
                                 ReconcileChangeKind::Modified => WatchEventKind::Modified,
                                 ReconcileChangeKind::Removed => WatchEventKind::Removed,
                             };
-                            if sender.send(WatchEvent { kind, paths: vec![change.path] }).await.is_err() {
-                                return;
-                            }
+                            queue(&mut pending, change.path, kind, now);
                         }
                         previous = current;
                     }
                     Ok(Err(error)) => tracing::warn!(%error, "polling filesystem reconciliation failed"),
                     Err(error) => tracing::warn!(%error, "polling filesystem task failed"),
+                }
+            }
+            _ = tick.tick() => {
+                for event in take_settled(&mut pending, options.debounce, Instant::now()) {
+                    if sender.send(event).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -363,6 +421,53 @@ mod tests {
         drop(handle);
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(event.paths, [expected]);
+    }
+
+    /// A file still being copied keeps growing between checks, and is only
+    /// reported once its size and mtime hold still across one.
+    #[test]
+    fn a_growing_file_is_held_until_it_settles() {
+        let directory = std::env::temp_dir().join(format!(
+            "mkvo-watch-settle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("directory");
+        let copying = directory.join("copying.mkv");
+        std::fs::write(&copying, b"part").expect("first chunk");
+        let mut pending = BTreeMap::new();
+        queue(
+            &mut pending,
+            copying.clone(),
+            WatchEventKind::Created,
+            Instant::now(),
+        );
+        queue(
+            &mut pending,
+            directory.join("gone.mkv"),
+            WatchEventKind::Removed,
+            Instant::now(),
+        );
+
+        let first = take_settled(&mut pending, Duration::ZERO, Instant::now());
+        assert_eq!(first.len(), 1, "a removal needs no settling");
+        assert_eq!(first[0].kind, WatchEventKind::Removed);
+
+        std::fs::write(&copying, b"part and more").expect("second chunk");
+        assert!(take_settled(&mut pending, Duration::ZERO, Instant::now()).is_empty());
+
+        let settled = take_settled(&mut pending, Duration::ZERO, Instant::now());
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            settled,
+            [WatchEvent {
+                kind: WatchEventKind::Created,
+                paths: vec![copying],
+            }]
+        );
     }
 
     #[test]
