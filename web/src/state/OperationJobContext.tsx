@@ -1,9 +1,13 @@
 import { createContext, type ReactNode, useContext, useEffect, useRef, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getOperationJob, type OperationJobResponse } from "../api";
+import { ApiError } from "../backend/error";
 
 const storageKey = "mkvo.web.activeOperationJob";
 const terminalStatuses = new Set(["Completed", "Failed", "Skipped", "Canceled"]);
+
+// A restarted server has forgotten the job this tab remembers.
+const isUnknownJob = (error: unknown) => error instanceof ApiError && (error.status === 404 || error.code === "not_found");
 
 type ActiveOperation = { id: string; label: string };
 
@@ -28,16 +32,21 @@ function readActiveOperation(): ActiveOperation | null {
 }
 
 export function OperationJobProvider({ children }: { children: ReactNode }) {
-  const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(readActiveOperation);
+  const [trackedOperation, setActiveOperation] = useState<ActiveOperation | null>(readActiveOperation);
   const jobQuery = useQuery({
-    queryKey: ["operation-job", activeOperation?.id],
-    queryFn: () => getOperationJob(activeOperation!.id),
-    enabled: activeOperation !== null,
+    queryKey: ["operation-job", trackedOperation?.id],
+    queryFn: () => getOperationJob(trackedOperation!.id),
+    enabled: trackedOperation !== null,
     refetchInterval: (query) => {
       const job = query.state.data;
-      return job && terminalStatuses.has(job.status) ? false : 1000;
+      return (job && terminalStatuses.has(job.status)) || isUnknownJob(query.state.error) ? false : 1000;
     }
   });
+  const unknownJob = isUnknownJob(jobQuery.error);
+  const activeOperation = unknownJob ? null : trackedOperation;
+  useEffect(() => {
+    if (unknownJob) try { sessionStorage.removeItem(storageKey); } catch { /* nothing left to forget */ }
+  }, [unknownJob]);
   const queryClient = useQueryClient();
   const refreshedJob = useRef<string | null>(null);
   const job = jobQuery.data;

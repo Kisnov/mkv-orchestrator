@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Layout } from "./Layout";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
+import { ApiError } from "../backend/error";
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -127,4 +128,18 @@ it("folds the sidebar when the window narrows and restores the saved choice when
   act(() => listeners.forEach((listener) => listener()));
   expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
   vi.unstubAllGlobals();
+});
+
+it("lets go of a remembered job the server no longer knows", async () => {
+  window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "gone-job", label: "Reorder Tracks" }));
+  const getOperationJob = vi.fn(() => Promise.reject(new ApiError("Job not found", { code: "not_found", status: 404 })));
+  renderWithBackend(<MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Dashboard content</div>} /></Route></Routes></MediaLibraryProvider>, {
+    getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 }),
+    getOperationJob
+  });
+
+  expect(await screen.findByText("ready")).toBeInTheDocument();
+  expect(screen.queryByText(/checking job/)).not.toBeInTheDocument();
+  expect(window.sessionStorage.getItem("mkvo.web.activeOperationJob")).toBeNull();
+  expect(getOperationJob).toHaveBeenCalledTimes(1);
 });
