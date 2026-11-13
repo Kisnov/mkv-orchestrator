@@ -834,24 +834,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        // The LAN bypass skips the password, so it gets the same Host check.
+        // The LAN bypass skips the password only for names a rebound page cannot use;
+        // any other name asks for the password, and a session works by every name.
         fs::write(
             host.config.config_dir.join("security-settings.json"),
             r#"{"idle_timeout_minutes":null,"local_network_bypass":true}"#,
         )
         .unwrap();
         let router = host.router();
-        for (host_header, expected) in [
-            ("192.168.1.10:8886", StatusCode::OK),
-            ("rebound.evil.example", StatusCode::FORBIDDEN),
-        ] {
-            let mut request = request("GET", "/api/status", &[("Host", host_header)]);
+        let lan = |mut request: Request<Body>| {
             request.extensions_mut().insert(axum::extract::ConnectInfo(
                 "192.168.1.2:1234".parse::<SocketAddr>().unwrap(),
             ));
-            let response = router.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), expected, "{host_header}");
+            request
+        };
+        let login = router
+            .clone()
+            .oneshot(login_request("correct-password"))
+            .await
+            .unwrap();
+        let cookie = login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for (headers, expected) in [
+            (vec![("Host", "192.168.1.10:8886")], StatusCode::OK),
+            (vec![("Host", "tower:8886")], StatusCode::UNAUTHORIZED),
+            (
+                vec![("Host", "tower:8886"), ("Cookie", &cookie)],
+                StatusCode::OK,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(lan(request("GET", "/api/status", &headers)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{headers:?}");
         }
+        let response = router
+            .clone()
+            .oneshot(lan(request(
+                "GET",
+                "/api/auth/status",
+                &[("Host", "tower:8886")],
+            )))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(status["password_required"], true);
+        assert_eq!(status["authenticated"], false);
+        let mut login = lan(login_request("correct-password"));
+        login
+            .headers_mut()
+            .insert(header::HOST, "tower:8886".parse().unwrap());
+        let response = router.oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(status["password_required"], true);
     }
 
     #[tokio::test]

@@ -64,8 +64,13 @@ struct AuthStatus {
     idle_timeout_minutes: Option<u32>,
 }
 
-fn status(auth: &AuthState, peer: Option<SocketAddr>, authenticated: bool) -> AuthStatus {
-    let password_required = auth.password_required(peer);
+fn status(
+    auth: &AuthState,
+    peer: Option<SocketAddr>,
+    host: Option<&str>,
+    authenticated: bool,
+) -> AuthStatus {
+    let password_required = auth.password_required(peer, host);
     AuthStatus {
         username: auth.username().to_owned(),
         authenticated,
@@ -98,10 +103,12 @@ fn direct_peer(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<SocketAd
 }
 
 async fn auth_status(State(auth): State<AuthState>, request: Request) -> Json<AuthStatus> {
+    let host = request_host(&request);
     Json(status(
         &auth,
         peer(&request),
-        !auth.password_required(peer(&request)) || auth.authenticated(request.headers()),
+        host,
+        !auth.password_required(peer(&request), host) || auth.authenticated(request.headers()),
     ))
 }
 
@@ -159,6 +166,9 @@ async fn auth_login(
         Json(status(
             &auth,
             direct_peer(&headers, peer.map(|info| info.0.0)),
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok()),
             true,
         )),
     )
@@ -168,22 +178,21 @@ async fn auth_login(
 async fn auth_logout(State(auth): State<AuthState>, request: Request) -> Response {
     (
         [(header::SET_COOKIE, auth.logout(request.headers()))],
-        Json(status(&auth, peer(&request), false)),
+        Json(status(&auth, peer(&request), request_host(&request), false)),
     )
         .into_response()
 }
 
 pub async fn require_auth(State(auth): State<AuthState>, request: Request, next: Next) -> Response {
-    if !auth.password_required(peer(&request)) {
-        // Without a session cookie, only a known Host name stops DNS rebinding.
-        if !auth.host_allowed(request_host(&request)) {
-            return error(
-                axum::http::StatusCode::FORBIDDEN,
-                "This host name is not allowed without signing in. Add it to MKVO_ALLOWED_HOSTS or use the IP address.",
-            );
-        }
-        next.run(request).await
-    } else if auth.authenticated(request.headers()) {
+    let host = request_host(&request);
+    // With login off there is no sign-in to fall back to, so an unknown name is refused.
+    if !auth.auth_enabled && !auth.host_allowed(host) {
+        return error(
+            axum::http::StatusCode::FORBIDDEN,
+            "This host name is not allowed without signing in. Add it to MKVO_ALLOWED_HOSTS or use the IP address.",
+        );
+    }
+    if !auth.password_required(peer(&request), host) || auth.authenticated(request.headers()) {
         next.run(request).await
     } else {
         unauthorized()
@@ -239,7 +248,9 @@ fn hostname(authority: &str) -> &str {
 }
 
 async fn auth_activity(State(auth): State<AuthState>, request: Request) -> Response {
-    if !auth.password_required(peer(&request)) || auth.activity(request.headers()) {
+    if !auth.password_required(peer(&request), request_host(&request))
+        || auth.activity(request.headers())
+    {
         axum::http::StatusCode::NO_CONTENT.into_response()
     } else {
         unauthorized()
@@ -479,8 +490,9 @@ impl AuthState {
             || self.listed_host(host)
     }
 
-    pub fn password_required(&self, peer: Option<SocketAddr>) -> bool {
-        self.auth_enabled && !self.local_bypass(peer)
+    /// The LAN bypass only covers Host names a DNS-rebinding page cannot use.
+    pub fn password_required(&self, peer: Option<SocketAddr>, host: Option<&str>) -> bool {
+        self.auth_enabled && !(self.local_bypass(peer) && self.host_allowed(host))
     }
 
     pub fn username(&self) -> &str {
@@ -722,7 +734,7 @@ mod tests {
         headers.insert(header::COOKIE, cookie);
         let disabled = auth.clone().with_authentication(false);
         assert!(disabled.authenticated(&HeaderMap::new()));
-        assert!(!disabled.password_required(None));
+        assert!(!disabled.password_required(None, None));
         let enabled = disabled.with_authentication(true);
         assert!(enabled.login("admin", "password").is_some());
         let restarted = AuthState::load(directory.path(), Some("password"), "admin", true).unwrap();
