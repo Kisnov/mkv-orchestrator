@@ -164,6 +164,8 @@ impl RenamePlanner {
                     target: target.with_file_name(format!("{new_stem}{suffix}")),
                     source,
                 })
+                // One that already has its new name stays where it is.
+                .filter(|sidecar| sidecar.source != sidecar.target)
                 .collect();
             for sidecar in &sidecars {
                 if taken(&sidecar.target, &sidecar.source) {
@@ -1425,6 +1427,25 @@ mod preflight_tests {
             &["/media/Pilot.srt"],
         );
         assert_eq!(plan.payload.items[0].sidecars, []);
+    }
+
+    /// `ep.mkv` becoming `Ep.mkv` next to an `Ep.srt` planned a move of the
+    /// subtitle onto itself.
+    #[test]
+    fn a_sidecar_that_already_has_its_new_name_is_left_out() {
+        let plan = plan(
+            vec![media("/media/ep.mkv", "Ep")],
+            &["/media/Ep.srt", "/media/ep.nfo"],
+        );
+        let item = &plan.payload.items[0];
+        assert_eq!(kinds(item), []);
+        assert_eq!(
+            item.sidecars,
+            [RenameSidecar {
+                source: PathBuf::from("/media/ep.nfo"),
+                target: PathBuf::from("/media").join("Ep.nfo"),
+            }]
+        );
     }
 
     #[test]
