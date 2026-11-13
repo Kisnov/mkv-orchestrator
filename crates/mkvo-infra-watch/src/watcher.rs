@@ -41,7 +41,7 @@ impl Default for WatchOptions {
             roots: Vec::new(),
             mode: WatchMode::Auto,
             debounce: Duration::from_secs(3),
-            poll_interval: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(30 * 60),
             media_only: true,
             channel_capacity: 256,
         }

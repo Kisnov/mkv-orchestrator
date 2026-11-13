@@ -869,6 +869,17 @@ mod tests {
         );
     }
 
+    /// A stored interval of 0 keeps the service default, which must not turn
+    /// into a full library walk every few seconds.
+    #[test]
+    fn zero_reconciliation_interval_falls_back_to_the_settings_default() {
+        let minutes = WatchSettings::default().reconciliation_interval_minutes;
+        assert_eq!(
+            WatchOptions::default().poll_interval,
+            std::time::Duration::from_secs(minutes * 60)
+        );
+    }
+
     #[tokio::test]
     async fn polling_reconciliation_is_delivered_through_watch_backend_subscription() {
         let stamp = SystemTime::now()
