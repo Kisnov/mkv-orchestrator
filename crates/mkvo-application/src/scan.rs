@@ -190,14 +190,21 @@ impl ScanService {
             .await;
         // A canceled scan still keeps what it probed.
         self.flush(&mut writes).await?;
-        scanned?;
+        let unreadable = scanned?;
 
         // Files that moved away must not pile up in the cache. Everything found was
         // just marked seen, so this drops only what has been gone from these roots
-        // for the whole retention.
+        // for the whole retention. A share that dropped looks empty or unreadable,
+        // not deleted, so such a root keeps its entries.
         let cutoff = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
         for root in &enumeration.roots {
-            self.cache.remove_unseen_under(root, cutoff).await?;
+            let listed = outcome
+                .files
+                .iter()
+                .any(|file| file.fingerprint.path.starts_with(root));
+            if listed && !unreadable.iter().any(|path| path.starts_with(root)) {
+                self.cache.remove_unseen_under(root, cutoff).await?;
+            }
         }
         outcome
             .files
@@ -224,7 +231,7 @@ impl ScanService {
         sink: &dyn ScanEventSink,
         outcome: &mut ScanOutcome,
         writes: &mut CacheWrites,
-    ) -> ApplicationResult<()> {
+    ) -> ApplicationResult<Vec<PathBuf>> {
         let workers = request
             .max_workers
             .unwrap_or(self.default_workers)
@@ -242,6 +249,7 @@ impl ScanService {
             let mut work = FuturesUnordered::new();
             let mut discovered = 0_u64;
             let mut enumerated = false;
+            let mut unreadable = Vec::new();
             loop {
                 while work.len() < workers
                     && let Some(fingerprint) = queued.pop_front()
@@ -249,7 +257,7 @@ impl ScanService {
                     work.push(self.resolve(fingerprint, request.force_refresh, cancel));
                 }
                 if enumerated && work.is_empty() {
-                    return Ok(());
+                    return Ok(unreadable);
                 }
                 let result = tokio::select! {
                     biased;
@@ -262,6 +270,7 @@ impl ScanService {
                         }
                         Some(EnumeratedMedia::Skipped { path, reason }) => {
                             discovered += 1;
+                            unreadable.push(path.clone());
                             Err((path, ApplicationError::AdapterFailure(reason)))
                         }
                         None => {
@@ -275,7 +284,7 @@ impl ScanService {
                     .await?;
             }
         };
-        tokio::try_join!(enumerating, probing).map(|_| ())
+        tokio::try_join!(enumerating, probing).map(|((), unreadable)| unreadable)
     }
 
     async fn resolve(
@@ -373,6 +382,31 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<Vec<FileFingerprint>, PortError> {
             Ok(self.0.clone())
+        }
+    }
+
+    /// Reports its root as unreadable, like a network share that dropped.
+    struct UnreadableCatalog;
+    #[async_trait]
+    impl MediaCatalog for UnreadableCatalog {
+        async fn enumerate(
+            &self,
+            _request: &MediaEnumerationRequest,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<FileFingerprint>, PortError> {
+            unreachable!("the scan streams")
+        }
+        async fn enumerate_streaming(
+            &self,
+            request: &MediaEnumerationRequest,
+            _cancel: CancellationToken,
+            entries: mpsc::UnboundedSender<EnumeratedMedia>,
+        ) -> Result<(), PortError> {
+            let _ = entries.send(EnumeratedMedia::Skipped {
+                path: request.roots[0].clone(),
+                reason: "host is down".to_owned(),
+            });
+            Ok(())
         }
     }
 
@@ -717,5 +751,43 @@ mod tests {
         scan("lib", &["lib/one.mkv"], &cache, &probe).await;
         assert!(!cache.contains("lib/gone.mkv").await);
         assert!(cache.contains("lib/unreachable-today.mkv").await);
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_could_not_be_read_keeps_its_cache() {
+        let cache = Arc::new(Cache::default());
+        cache
+            .seed("lib/one.mkv", days_ago(MEDIA_CACHE_RETENTION_DAYS + 1))
+            .await;
+        let service = ScanService::new(
+            Arc::new(UnreadableCatalog),
+            Arc::new(Probe::default()),
+            cache.clone(),
+            Arc::new(Paths),
+            2,
+        );
+
+        let outcome = service
+            .scan(
+                &request("lib"),
+                CancellationToken::new(),
+                &NoopScanEventSink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.summary.failed, 1);
+        assert!(cache.contains("lib/one.mkv").await);
+    }
+
+    #[tokio::test]
+    async fn a_folder_found_empty_keeps_its_cache() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        cache
+            .seed("lib/one.mkv", days_ago(MEDIA_CACHE_RETENTION_DAYS + 1))
+            .await;
+
+        scan("lib", &[], &cache, &probe).await;
+        assert!(cache.contains("lib/one.mkv").await);
     }
 }
