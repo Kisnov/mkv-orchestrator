@@ -100,7 +100,15 @@ not Host or forwarded headers. Missing peer information fails closed. Any
 that request, because it means a proxy relayed it and the peer is the proxy.
 In Docker bridge networking (the default) visitors may appear as the bridge
 gateway, a private address, so do not enable the bypass there unless every
-host that can reach the published port is trusted.
+host that can reach the published port is trusted. A proxy that adds no
+forwarding headers (a bare nginx `proxy_pass`, TCP-mode proxies, SSH tunnels,
+port forwards) cannot be detected: every client it carries looks local and gets
+in without a password.
+
+The bypass also only applies when the page is opened by IP address,
+`localhost` or a name in `MKVO_ALLOWED_HOSTS`; this keeps DNS-rebinding pages
+out. Opened by any other name (`http://tower:8886`), MKVO asks for the password
+as usual, and once signed in the session works by any name.
 
 > Warning: Anyone whose connection appears local gets full access without a password.
 > A reverse proxy or Docker networking can make remote visitors appear local too,
