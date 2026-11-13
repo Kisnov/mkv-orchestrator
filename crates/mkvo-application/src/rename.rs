@@ -456,20 +456,18 @@ pub fn build_file_name(file: &MediaFile, template: &str) -> String {
     }
 
     let mut rendered = active.to_owned();
+    // First, while what stands before each one is still the template's own text.
+    for (token, width) in [("{episode:00}", 2), ("{episode}", 0)] {
+        rendered = replace_ascii_case_insensitive(&rendered, token, |before| {
+            format_episodes(before, tokens.episode, tokens.last_episode, width)
+        });
+    }
     for (token, value) in [
         ("{episodeTitle}", tokens.episode_title),
         ("{absolute:000}", format_optional(tokens.absolute, 3)),
         ("{season:00}", format_optional(tokens.season, 2)),
-        (
-            "{episode:00}",
-            format_episodes(tokens.episode, tokens.last_episode, 2),
-        ),
         ("{absolute}", format_optional(tokens.absolute, 0)),
         ("{season}", format_optional(tokens.season, 0)),
-        (
-            "{episode}",
-            format_episodes(tokens.episode, tokens.last_episode, 0),
-        ),
         ("{series}", tokens.series),
         ("{title}", tokens.title),
         (
@@ -479,7 +477,7 @@ pub fn build_file_name(file: &MediaFile, template: &str) -> String {
                 .map_or_else(String::new, |value| value.to_string()),
         ),
     ] {
-        rendered = replace_ascii_case_insensitive(&rendered, token, &value);
+        rendered = replace_ascii_case_insensitive(&rendered, token, |_| value.clone());
     }
     let stem = sanitize_file_name(&rendered);
     let extension = file.extension();
@@ -613,7 +611,12 @@ fn ordered_regular_episodes(provider_episodes: &[EpisodeMetadata]) -> Vec<&Episo
     ordered
 }
 
-fn replace_ascii_case_insensitive(source: &str, token: &str, replacement: &str) -> String {
+/// Replace every `token` with what `replacement` returns for the text before it.
+fn replace_ascii_case_insensitive(
+    source: &str,
+    token: &str,
+    replacement: impl Fn(&str) -> String,
+) -> String {
     let mut result = String::with_capacity(source.len());
     let mut remaining = source;
     let token_lower = token.to_ascii_lowercase();
@@ -624,7 +627,8 @@ fn replace_ascii_case_insensitive(source: &str, token: &str, replacement: &str) 
             break;
         };
         result.push_str(&remaining[..index]);
-        result.push_str(replacement);
+        let replaced = replacement(&result);
+        result.push_str(&replaced);
         remaining = &remaining[index + token.len()..];
     }
     result
@@ -640,13 +644,20 @@ fn format_optional(value: Option<u32>, width: usize) -> String {
     })
 }
 
-/// `01`, or `01-E02` for a file that holds several episodes.
-fn format_episodes(first: Option<u32>, last: Option<u32>, width: usize) -> String {
+/// `01`, or for a file that holds several episodes `01-02`; after a marker,
+/// as in `S01E`, the second number repeats it: `01-E02`.
+fn format_episodes(before: &str, first: Option<u32>, last: Option<u32>, width: usize) -> String {
     let first = format_optional(first, width);
-    match last {
-        Some(_) => format!("{first}-E{}", format_optional(last, width)),
-        None => first,
+    if last.is_none() {
+        return first;
     }
+    let mut written = before.chars().rev();
+    let marker = written
+        .next()
+        .filter(|letter| matches!(letter, 'E' | 'e'))
+        .filter(|_| !written.next().is_some_and(char::is_alphabetic))
+        .map_or_else(String::new, String::from);
+    format!("{first}-{marker}{}", format_optional(last, width))
 }
 
 fn first_non_blank<const N: usize>(values: [Option<&str>; N]) -> String {
@@ -875,7 +886,15 @@ mod tests {
             build_file_name(&file, "S{season:00}E{episode:00} - {episodeTitle}"),
             "S01E01-E02 - Pilot - Part 1.mkv"
         );
-        assert_eq!(build_file_name(&file, "{season}x{episode}"), "1x1-E2.mkv");
+        // The second number repeats the marker only where the template has one.
+        for (template, expected) in [
+            ("s{season:00}e{episode:00}", "s01e01-e02.mkv"),
+            ("{season}x{episode}", "1x1-2.mkv"),
+            ("{series} - {episode:00}", "Show - Name - 01-02.mkv"),
+            ("Episode{episode}", "Episode1-2.mkv"),
+        ] {
+            assert_eq!(build_file_name(&file, template), expected);
+        }
 
         // Matched to an episode other than the one it names: its range says nothing.
         file.episode.as_mut().expect("episode").episode = Some(5);
