@@ -81,6 +81,7 @@ pub enum ApiErrorCode {
     ToolUnavailable,
     ProviderUnavailable,
     CredentialRejected,
+    CredentialInsufficient,
     CacheUnavailable,
     JobCanceled,
     JobFailed,

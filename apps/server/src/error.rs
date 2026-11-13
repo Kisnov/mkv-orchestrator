@@ -72,7 +72,9 @@ const fn status_for_code(code: ApiErrorCode) -> StatusCode {
         | ApiErrorCode::JobCanceled => StatusCode::CONFLICT,
         ApiErrorCode::PlanExpired => StatusCode::GONE,
         // Not 401 (that is this app's own login) and not 5xx (nothing is down).
-        ApiErrorCode::CredentialRejected => StatusCode::FAILED_DEPENDENCY,
+        ApiErrorCode::CredentialRejected | ApiErrorCode::CredentialInsufficient => {
+            StatusCode::FAILED_DEPENDENCY
+        }
         ApiErrorCode::ToolUnavailable
         | ApiErrorCode::ProviderUnavailable
         | ApiErrorCode::CacheUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -110,6 +112,10 @@ mod tests {
         );
         assert_eq!(
             status_for_code(ApiErrorCode::CredentialRejected),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(
+            status_for_code(ApiErrorCode::CredentialInsufficient),
             StatusCode::FAILED_DEPENDENCY
         );
         assert_eq!(

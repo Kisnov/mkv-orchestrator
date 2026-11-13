@@ -45,6 +45,13 @@ fn remember_rejection(
     true
 }
 
+/// A 403: the server knows the key but will not let it do this.
+fn insufficient_credential_message(server: &str, detail: &str) -> String {
+    format!(
+        "{server} accepted the API key but refused the request ({detail}). The key needs administrator rights."
+    )
+}
+
 impl MkvoRuntime {
     pub async fn get_library_catalog(
         &self,
@@ -303,6 +310,11 @@ impl MkvoRuntime {
                 }
                 Err(RuntimeError::new(ApiErrorCode::CredentialRejected, message))
             }
+            // Not remembered: a key refused here may still be allowed elsewhere.
+            Err(PortError::CredentialInsufficient(detail)) => Err(RuntimeError::new(
+                ApiErrorCode::CredentialInsufficient,
+                insufficient_credential_message(&server.name, &detail),
+            )),
             other => Ok(other?),
         }
     }
@@ -387,6 +399,11 @@ impl MkvoRuntime {
                     library_count: 0,
                 })
             }
+            Err(PortError::CredentialInsufficient(detail)) => Ok(MediaServerTestResponse {
+                success: false,
+                status: insufficient_credential_message("The server", &detail),
+                library_count: 0,
+            }),
             Err(error) => Ok(MediaServerTestResponse {
                 success: false,
                 status: error.to_string(),
@@ -596,6 +613,7 @@ mod media_server_credential_tests {
         url: String,
         paths: Arc<Mutex<Vec<String>>>,
         refuse_everything: Arc<AtomicBool>,
+        forbid_libraries: Arc<AtomicBool>,
     }
 
     impl FakeJellyfin {
@@ -606,6 +624,8 @@ mod media_server_credential_tests {
             let seen = Arc::clone(&paths);
             let refuse_everything = Arc::new(AtomicBool::new(false));
             let refusing = Arc::clone(&refuse_everything);
+            let forbid_libraries = Arc::new(AtomicBool::new(false));
+            let forbidding = Arc::clone(&forbid_libraries);
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let mut reader = BufReader::new(stream);
@@ -629,6 +649,10 @@ mod media_server_credential_tests {
                         || refusing.load(Ordering::SeqCst)
                     {
                         ("401 Unauthorized", "text/plain", "")
+                    } else if path.starts_with("/Library/VirtualFolders")
+                        && forbidding.load(Ordering::SeqCst)
+                    {
+                        ("403 Forbidden", "text/plain", "")
                     } else if path.starts_with("/Library/VirtualFolders") {
                         (
                             "200 OK",
@@ -657,6 +681,7 @@ mod media_server_credential_tests {
                 url,
                 paths,
                 refuse_everything,
+                forbid_libraries,
             }
         }
 
@@ -965,6 +990,53 @@ mod media_server_credential_tests {
             .get_library_artwork(artwork_request(&server))
             .await
             .expect("artwork with the new key");
+    }
+
+    /// Jellyfin answers 403 on its admin-only library list for a valid user
+    /// token. That key still fetches posters, so it must not be remembered as
+    /// refused, and the message has to say what is actually wrong.
+    #[tokio::test]
+    async fn a_key_without_admin_rights_is_not_remembered_as_refused() {
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("k")).await;
+        jellyfin.forbid_libraries.store(true, Ordering::SeqCst);
+
+        let error = host
+            .runtime
+            .sync_media_server_libraries(&server.id)
+            .await
+            .expect_err("forbidden library list");
+        assert_eq!(error.code, ApiErrorCode::CredentialInsufficient);
+        assert!(
+            error
+                .message
+                .starts_with("Home accepted the API key but refused the request"),
+            "{error}"
+        );
+        assert!(
+            error
+                .message
+                .contains("HTTP 403 Forbidden for Library/VirtualFolders"),
+            "{error}"
+        );
+
+        let result = host
+            .runtime
+            .test_media_server_connection(test_request(&server, &jellyfin.url, ""))
+            .await
+            .expect("test");
+        assert!(!result.success);
+        assert!(
+            result.status.contains("needs administrator rights"),
+            "{}",
+            result.status
+        );
+
+        host.runtime
+            .get_library_artwork(artwork_request(&server))
+            .await
+            .expect("artwork still works with this key");
     }
 
     #[tokio::test]

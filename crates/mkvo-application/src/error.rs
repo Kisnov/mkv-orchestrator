@@ -19,6 +19,8 @@ pub enum PortError {
     Canceled,
     #[error("{0}")]
     CredentialRejected(String),
+    #[error("{0}")]
+    CredentialInsufficient(String),
     #[error("adapter failure: {0}")]
     Other(String),
 }
@@ -62,6 +64,8 @@ pub enum ApplicationError {
     DependencyUnavailable { message: String, retryable: bool },
     #[error("{0}")]
     CredentialRejected(String),
+    #[error("{0}")]
+    CredentialInsufficient(String),
     #[error("adapter failure: {0}")]
     AdapterFailure(String),
     #[error("internal error: {0}")]
@@ -94,6 +98,8 @@ impl ApplicationError {
             Self::DependencyUnavailable { .. } => ApiErrorCode::ProviderUnavailable,
             // The service answered and refused the key: fix the key, do not wait.
             Self::CredentialRejected(_) => ApiErrorCode::CredentialRejected,
+            // The key was accepted but may not do this: it needs more rights.
+            Self::CredentialInsufficient(_) => ApiErrorCode::CredentialInsufficient,
             Self::AdapterFailure(_) | Self::Internal(_) => ApiErrorCode::Internal,
         };
         ApiError::new(code, self.to_string(), correlation_id).retryable(retryable)
@@ -111,6 +117,7 @@ impl From<PortError> for ApplicationError {
             PortError::InvalidData(message) => Self::InvalidRequest(message),
             PortError::Canceled => Self::Canceled,
             PortError::CredentialRejected(message) => Self::CredentialRejected(message),
+            PortError::CredentialInsufficient(message) => Self::CredentialInsufficient(message),
             PortError::Other(message) => Self::AdapterFailure(message),
         }
     }
@@ -134,6 +141,10 @@ mod tests {
             (
                 PortError::CredentialRejected("Jellyfin returned HTTP 401".to_owned()),
                 ApiErrorCode::CredentialRejected,
+            ),
+            (
+                PortError::CredentialInsufficient("Jellyfin returned HTTP 403".to_owned()),
+                ApiErrorCode::CredentialInsufficient,
             ),
             (
                 PortError::NotFound("plan".to_owned()),

@@ -158,9 +158,13 @@ fn server_port_error(error: MediaServerError) -> PortError {
             PortError::unavailable(error.to_string(), true)
         }
         MediaServerError::Status {
-            status: reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN,
+            status: reqwest::StatusCode::UNAUTHORIZED,
             ..
         } => PortError::CredentialRejected(error.to_string()),
+        MediaServerError::Status {
+            status: reqwest::StatusCode::FORBIDDEN,
+            ..
+        } => PortError::CredentialInsufficient(error.to_string()),
         MediaServerError::Status { .. } => PortError::unavailable(error.to_string(), false),
         error => PortError::InvalidData(error.to_string()),
     }
@@ -187,17 +191,20 @@ mod tests {
             status,
             path: "Items/show-1/Images/Primary".to_owned(),
         };
-        for refused in [
-            reqwest::StatusCode::UNAUTHORIZED,
-            reqwest::StatusCode::FORBIDDEN,
-        ] {
-            assert_eq!(
-                server_port_error(status(refused)),
-                PortError::CredentialRejected(format!(
-                    "Jellyfin returned HTTP {refused} for Items/show-1/Images/Primary"
-                ))
-            );
-        }
+        assert_eq!(
+            server_port_error(status(reqwest::StatusCode::UNAUTHORIZED)),
+            PortError::CredentialRejected(
+                "Jellyfin returned HTTP 401 Unauthorized for Items/show-1/Images/Primary"
+                    .to_owned()
+            )
+        );
+        // The key was accepted; it just may not do this. That is not a bad key.
+        assert_eq!(
+            server_port_error(status(reqwest::StatusCode::FORBIDDEN)),
+            PortError::CredentialInsufficient(
+                "Jellyfin returned HTTP 403 Forbidden for Items/show-1/Images/Primary".to_owned()
+            )
+        );
         assert!(matches!(
             server_port_error(status(reqwest::StatusCode::NOT_FOUND)),
             PortError::Unavailable {
