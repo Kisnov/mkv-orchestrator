@@ -26,6 +26,7 @@ import {
 import { OutputModal } from "../components/OutputModal";
 import { PreviewSummaryModal } from "../components/PreviewSummaryModal";
 import { SectionHeader } from "../components/SectionHeader";
+import { createLocalId } from "../lib/localId";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 
 const renamePreviewCompactStorageKey = "mkvo.web.renamePreviewCompactView";
@@ -532,7 +533,7 @@ export function RenamePage() {
           template,
           planId: plan.preview.planId ?? undefined,
           planFingerprint: plan.preview.planFingerprint ?? undefined,
-          idempotencyKey: plan.preview.idempotencyKey ?? crypto.randomUUID()
+          idempotencyKey: plan.preview.idempotencyKey ?? createLocalId()
         });
         const renamedItems = response.items.filter((item) => item.status === "Renamed").length;
         renamed += renamedItems;
@@ -615,7 +616,7 @@ export function RenamePage() {
       if (!rows.some((row) => row.selected && row.canApply)) { setStatusText("No applicable renames are selected."); return; }
       const warnings = buildRenameApplyWarnings(rows);
       if (warnings.length) { setApplyWarnings(warnings); setIsApplyConfirmOpen(true); return; }
-      await apply.mutateAsync({ items: rows, provider, template, planId: plan.planId ?? undefined, planFingerprint: plan.planFingerprint ?? undefined, idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
+      await apply.mutateAsync({ items: rows, provider, template, planId: plan.planId ?? undefined, planFingerprint: plan.planFingerprint ?? undefined, idempotencyKey: plan.idempotencyKey ?? createLocalId() });
     } catch { /* Mutation handlers display the error. */ }
   }
 
@@ -627,7 +628,7 @@ export function RenamePage() {
       template,
       planId: preview.data?.planId ?? undefined,
       planFingerprint: preview.data?.planFingerprint ?? undefined,
-      idempotencyKey: preview.data?.idempotencyKey ?? crypto.randomUUID()
+      idempotencyKey: preview.data?.idempotencyKey ?? createLocalId()
     });
   }
 
