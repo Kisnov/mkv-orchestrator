@@ -13,7 +13,7 @@ impl MkvoRuntime {
 
     pub(super) async fn plan_mux(&self, request: &MuxPreviewRequest) -> RuntimeResult<RemuxPlan> {
         let files = self
-            .resolve_rows(&request.files, &request.selected_paths)
+            .resolve_selected_rows(&request.files, &request.selected_paths)
             .await?;
         let reorder_template = if request.reorder_tracks {
             let template_path = PathBuf::from(&request.reorder_template_path);

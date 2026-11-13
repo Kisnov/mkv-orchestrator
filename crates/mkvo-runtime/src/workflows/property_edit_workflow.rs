@@ -61,7 +61,7 @@ impl MkvoRuntime {
         request: &PropEditPreviewRequest,
     ) -> RuntimeResult<PropertyEditPlan> {
         let files = self
-            .resolve_rows(&request.files, &request.selected_paths)
+            .resolve_selected_rows(&request.files, &request.selected_paths)
             .await?;
         let settings = self.dependencies().settings.load().await?.0;
         let settings_fingerprint = stable_fingerprint(&settings)

@@ -77,6 +77,20 @@ impl MkvoRuntime {
         })
     }
 
+    /// The rows a request selected. Selecting nothing is an error, never
+    /// "every file".
+    pub(super) async fn resolve_selected_rows(
+        &self,
+        rows: &[mkvo_contracts::MediaFileRow],
+        selected_paths: &[String],
+    ) -> RuntimeResult<Vec<MediaFile>> {
+        if selected_paths.is_empty() {
+            return Err(RuntimeError::invalid("No files selected."));
+        }
+        self.resolve_rows(rows, selected_paths).await
+    }
+
+    /// Every row, for requests that carry no selection: pass `&[]`.
     pub(super) async fn resolve_rows(
         &self,
         rows: &[mkvo_contracts::MediaFileRow],
@@ -327,4 +341,66 @@ impl MkvoRuntime {
 /// `path_key` of a scanned file, so it matches the key of a row's path.
 fn file_key(path: &Path) -> String {
     path_key(&path.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// A request naming one real MKV in `files`, with `selected` as its selection.
+    fn request(library: &Path, selected: &[&str]) -> serde_json::Value {
+        let path = display_path(&library.join("episode.mkv"));
+        json!({
+            "files": [{
+                "path": path, "fileName": "episode.mkv", "extension": ".mkv",
+                "status": "Scanned", "reader": "mkvmerge", "codec": "", "resolution": "",
+                "bitDepth": "", "hdr": "", "videoSummary": "", "audioSummary": "",
+                "subtitleSummary": "", "attachmentSummary": "",
+            }],
+            "selectedPaths": selected,
+            "removeUnwantedAudioLanguages": false, "keepAudioLanguages": "",
+            "removeUnwantedSubtitleLanguages": false, "keepSubtitleLanguages": "",
+            "removeUnwantedTrackIds": false, "removeTrackIdsText": "",
+            "preserveChapters": true, "preserveAttachments": true,
+            "muxMatchingExternalSubtitles": false, "externalSubtitleLanguage": "und",
+            "externalSubtitleFormats": "", "preserveExternalSubtitleFiles": true,
+            "skipMuxIfSubtitleAlreadyExists": false, "extractSubtitles": false,
+            "extractSubtitleLanguages": "", "extractOverwriteExistingFiles": false,
+            "convertMp4ToMkv": false, "deleteMp4AfterConvert": false,
+            "containerTitleMode": "remove", "customContainerTitle": "",
+            "videoTitleMode": "keep", "customVideoTitle": "",
+            "selectedDefaultAudio": "", "selectedForcedAudio": "",
+            "selectedDefaultSubtitle": "", "selectedForcedSubtitle": "",
+        })
+    }
+
+    /// An empty selection used to mean every file in the request.
+    #[tokio::test]
+    async fn a_preview_with_nothing_selected_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("episode.mkv"), b"mkv").unwrap();
+        let runtime = MkvoRuntimeBuilder::new(&library, directory.path().join("config"))
+            .disable_legacy_migration()
+            .authorized_root(&library, true)
+            .build()
+            .unwrap();
+        let nothing = request(&library, &[]);
+
+        let mux = runtime
+            .build_mux_preview(serde_json::from_value(nothing.clone()).unwrap())
+            .await;
+        let propedit = runtime
+            .build_propedit_preview(serde_json::from_value(nothing).unwrap())
+            .await;
+
+        for error in [mux.unwrap_err(), propedit.unwrap_err()] {
+            assert_eq!(error.code, mkvo_contracts::ApiErrorCode::InvalidRequest);
+            assert_eq!(error.message, "No files selected.");
+        }
+    }
 }
