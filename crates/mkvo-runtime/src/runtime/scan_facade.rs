@@ -603,6 +603,19 @@ mod tests {
         finished(host, id).await
     }
 
+    /// The status is answered from memory a moment before the final state
+    /// and its event reach the database.
+    async fn saved(host: &Host, id: JobId) -> SqliteStore {
+        let store = SqliteStore::open(&host.database).unwrap();
+        for _ in 0..400 {
+            if store.count_job_events(&id.to_string()).unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        store
+    }
+
     /// The scan status still answers with every file, but what the scan
     /// leaves in the database must not depend on how many there were.
     #[tokio::test]
@@ -615,16 +628,8 @@ mod tests {
             assert_eq!(job.files.len(), files);
             assert_eq!(job.summary.total, files as u64);
 
-            // The status is answered from memory a moment before the final
-            // state and its event reach the database.
-            let store = SqliteStore::open(&host.database).unwrap();
+            let store = saved(&host, job.id).await;
             let id = job.id.to_string();
-            for _ in 0..400 {
-                if store.count_job_events(&id).unwrap() > 0 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
             let row = store.get_job(&id).unwrap().unwrap();
             assert_eq!(row.state, "\"Completed\"");
             stored.push((
@@ -646,6 +651,7 @@ mod tests {
     async fn a_finished_scan_is_still_readable_after_a_restart() {
         let host = host(3);
         let job = scan(&host).await;
+        saved(&host, job.id).await;
 
         let restarted = MkvoRuntime::from_parts(
             host.runtime.inner.config.clone(),
