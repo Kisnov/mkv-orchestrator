@@ -1,6 +1,6 @@
 import { useOverlayAccessibility } from "./useOverlayAccessibility";
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Activity, Captions, Database, FileCog, FolderOpen, ListRestart, ListVideo, Logs, RefreshCw, Settings, TextCursorInput, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Activity, Captions, Database, FileCog, FolderOpen, ListVideo, Logs, Settings } from "lucide-react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getStatus } from "../api";
@@ -12,12 +12,8 @@ import { SignOutButton } from "./SignOutButton";
 const navItems = [
   { to: "/dashboard", label: "Dashboard", icon: Activity },
   { to: "/rename", label: "Rename Files", icon: ListVideo },
-  { to: "/remove-tracks", label: "Remove Tracks", icon: Trash2 },
-  { to: "/reorder-tracks", label: "Reorder Tracks", icon: ListRestart },
-  { to: "/subtitle-format", label: "Subtitle Format", icon: TextCursorInput },
-  { to: "/edit-tracks", label: "Edit Tracks", icon: FileCog },
+  { to: "/tracks", label: "Tracks", icon: FileCog },
   { to: "/subtitles", label: "Subtitles", icon: Captions },
-  { to: "/convert-remux", label: "Convert / Remux", icon: RefreshCw, requiresMp4: true },
   { to: "/library", label: "Library", icon: Database },
   { to: "/logs", label: "Logs", icon: Logs },
   { to: "/settings", label: "Settings", icon: Settings }
@@ -25,6 +21,12 @@ const navItems = [
 
 // The mobile breakpoint of index.css, the only layout that uses the table labels.
 const mobileLayoutQuery = "(max-width: 767px), (max-width: 1023px) and (pointer: coarse)";
+
+const narrowWindowQuery = "(max-width: 1099px)";
+const isNarrowWindow = () => window.matchMedia?.(narrowWindowQuery).matches ?? false;
+function savedCollapsed() {
+  try { return localStorage.getItem("mkvo.sidebar.collapsed") === "true"; } catch { return false; }
+}
 
 // The mobile layout turns tables into blocks, which drops their semantics and their header row.
 function labelTable(table: HTMLTableElement) {
@@ -42,7 +44,15 @@ export function Layout() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const location = useLocation();
   useEffect(() => { setMobileMenuOpen(false); }, [location.pathname]);
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem("mkvo.sidebar.collapsed") === null ? window.innerWidth < 1100 : localStorage.getItem("mkvo.sidebar.collapsed") === "true");
+  // A narrow window folds the sidebar for room; a wide one shows the saved choice.
+  const [collapsed, setCollapsed] = useState(() => isNarrowWindow() || savedCollapsed());
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const narrow = window.matchMedia(narrowWindowQuery);
+    const sync = () => setCollapsed(narrow.matches || savedCollapsed());
+    narrow.addEventListener("change", sync);
+    return () => narrow.removeEventListener("change", sync);
+  }, []);
   const pageContentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const content = pageContentRef.current;
@@ -74,9 +84,8 @@ export function Layout() {
   const isSettingsPage = useLocation().pathname === "/settings";
   const status = useQuery({ queryKey: ["status"], queryFn: getStatus });
   const missingTools = status.data?.tools.filter((tool) => !tool.available).length ?? 0;
-  const { files, selectionError } = useMediaLibrary();
+  const { selectionError } = useMediaLibrary();
   const operation = useOperationJob();
-  const hasMp4Files = files.some((file) => file.extension.toLowerCase() === ".mp4");
   const toggleSidebar = () => setCollapsed((value) => {
     localStorage.setItem("mkvo.sidebar.collapsed", String(!value));
     return !value;
@@ -115,7 +124,7 @@ export function Layout() {
           </div>
 
           <nav className="min-h-0 flex-1 overflow-y-auto space-y-1.5">
-            {navItems.filter((item) => !item.requiresMp4 || hasMp4Files).map((item) => {
+            {navItems.map((item) => {
               const Icon = item.icon;
               return (
                 <NavLink
@@ -169,7 +178,7 @@ export function Layout() {
             <button type="button" aria-expanded={mobileMenuOpen} aria-controls="mobile-navigation-menu" onClick={() => setMobileMenuOpen((open) => !open)} className="rounded-md border border-border px-3">{mobileMenuOpen ? "Close Menu" : "Menu"}</button>
           </div>
           {mobileMenuOpen ? <nav onKeyDown={(event) => { if (event.key === "Escape") { setMobileMenuOpen(false); document.querySelector<HTMLButtonElement>('[aria-controls="mobile-navigation-menu"]')?.focus(); } }} id="mobile-navigation-menu" aria-label="Mobile navigation" className="grid grid-cols-2 gap-2 border-t border-border p-4">
-            {navItems.filter((item) => !item.requiresMp4 || hasMp4Files).map((item) => <NavLink key={item.to} to={item.to} className={({ isActive }) => `flex items-center gap-2 rounded-md px-2 py-2 text-sm ${isActive ? "bg-selected text-accent" : "text-muted"}`}><item.icon size={16} /><span>{item.label}</span></NavLink>)}
+            {navItems.map((item) => <NavLink key={item.to} to={item.to} className={({ isActive }) => `flex items-center gap-2 rounded-md px-2 py-2 text-sm ${isActive ? "bg-selected text-accent" : "text-muted"}`}><item.icon size={16} /><span>{item.label}</span></NavLink>)}
             <SignOutButton className="col-span-2" />
           </nav> : null}
           <div role="status" className="break-words border-t border-border px-4 py-2 text-xs text-muted">{operation.statusText ?? (missingTools ? `${missingTools} tool issue(s)` : "Ready")}</div>

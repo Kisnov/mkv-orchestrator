@@ -6,10 +6,12 @@ import { getCurrentScanFiles } from "../api";
 import { fileColumns } from "../components/fileColumns";
 import { FileSelectionTable } from "../components/FileSelectionTable";
 import { OperationShell } from "../components/OperationShell";
+import { OriginalsConfirm } from "../components/OriginalsConfirm";
 import { pathKey } from "../lib/pathKey";
 import { normalizeTrackSignature } from "../lib/templateMatch";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useLibrarySelection } from "../state/useFileSelection";
+import { useConfirmedApply } from "../state/useConfirmedApply";
 import { buildMuxRequest, useMuxRequest } from "../state/useMuxRequest";
 
 const columns = [fileColumns.reader, fileColumns.codec, fileColumns.audio, fileColumns.subtitles, fileColumns.status];
@@ -27,6 +29,7 @@ export function ReorderTracksPage() {
     startedText: (total) => `Reordering tracks in ${total} file(s)...`,
     noChangesText: "No track-order changes are needed for the selected files."
   });
+  const confirmed = useConfirmedApply(run);
 
   useEffect(() => {
     if (!currentScan.data) return;
@@ -90,9 +93,10 @@ export function ReorderTracksPage() {
       run={run}
       canRun={canRun}
       onPreview={() => { if (!canRun) { run.setStatus("Select a template file and include it in the batch."); return; } run.preview(request()); }}
-      onApply={() => { if (canRun) void run.apply(request()); }}
+      onApply={() => { if (canRun) void confirmed.apply(request()); }}
       selectedText={`${selectedMkvPaths.length} files selected`}
       hiddenSelected={selectedMkvPaths.filter(selection.isHidden).length}
+      risks={["Replaces originals"]}
       notice={template && !canRun ? <span className="w-full text-xs text-warning">The template file is not in the batch. Check it in the list to continue.</span> : null}
       options={<div className="space-y-3">
         <h2 className="text-base font-semibold">Reorder Options</h2>
@@ -110,6 +114,8 @@ export function ReorderTracksPage() {
         </table>{!template ? <div className="flex h-full items-center justify-center text-sm text-muted">Load MKV files from Dashboard or Library first.</div> : null}</div>
       </>}
       summary={{ title: "Reorder Tracks Preview Summary", emptyText: "Build a preview to see track-order changes.", available: previewResult !== null, status: previewResult?.status ?? "", summary: previewResult?.summary ?? "", metrics: [{ label: "Files changing", value: new Set(previewResult?.actions.map((action) => action.filePath) ?? []).size, tone: "text-success" }, { label: "No change", value: previewResult?.noChangeFiles.length ?? 0, tone: "text-muted" }], sections: [{ title: "Planned operations", emptyText: "No track-order changes are needed.", rows: previewResult?.actions.map((action) => ({ key: `${action.filePath}-${action.index}`, title: action.fileName, detail: action.description })) ?? [] }] }}
-    />
+    >
+      {confirmed.dialog ? <OriginalsConfirm {...confirmed.dialog} /> : null}
+    </OperationShell>
   );
 }

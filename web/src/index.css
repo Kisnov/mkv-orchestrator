@@ -170,7 +170,7 @@ button[class*="bg-accent"]:not(:disabled):hover {
   position: absolute;
   top: 50%;
   right: -12px;
-  z-index: 55;
+  z-index: 40; /* under the dialog layer (z-50) */
   display: flex;
   width: 24px;
   height: 56px;
@@ -291,7 +291,8 @@ button[class*="bg-accent"]:not(:disabled):hover {
   .workspace-page > .grid { display: flex; flex-direction: column; }
   .workspace-page .grid[class*="grid-cols-["] { grid-template-columns: minmax(0, 1fr); height: auto; max-height: none; }
   .workspace-page > .grid > section, .workspace-page > section { overflow: visible; }
-  .workspace-page > .grid > div { display: flex; flex-direction: column; gap: 12px; }
+  .workspace-page > .grid > div, .workspace-page .operation-panels { display: flex; flex-direction: column; gap: 12px; }
+  .operation-sidebar .options-panel-toggle { display: none; }
   .workspace-page [role=separator] { display: none; }
   .operation-sidebar { zoom: 1; }
   .mobile-options { overflow: visible; }

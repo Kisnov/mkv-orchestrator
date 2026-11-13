@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { buildRemovedTrackDetails, MuxRemuxPage } from "./MuxRemuxPage";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, MuxPreviewRequest, WebSettings } from "../generated/contracts";
+import type { MediaFileRow, MuxPreviewRequest, MuxPreviewResponse, WebSettings } from "../generated/contracts";
 
 function mediaFile(name: string): MediaFileRow {
   return {
@@ -319,6 +319,10 @@ it("builds a fresh plan and applies without a manual preview", async () => {
   await waitFor(() => expect(applyButton).toBeEnabled());
   expect(screen.queryByRole("button", { name: "Preview" })).not.toBeInTheDocument();
   await user.click(applyButton);
+  // Replacing the original is the default here, so the plan waits for a yes.
+  const dialog = await screen.findByRole("dialog", { name: "Replace 1 original file?" });
+  expect(startMuxApply).not.toHaveBeenCalled();
+  await user.click(within(dialog).getByRole("button", { name: "Replace 1 file" }));
   await waitFor(() => expect(startMuxApply).toHaveBeenCalledWith(expect.objectContaining({ planId: "fresh-plan", planFingerprint: "fresh-fingerprint", idempotencyKey: "fresh-key" })));
   expect(buildMuxPreview).toHaveBeenCalledTimes(1);
 });
@@ -354,4 +358,27 @@ it("counts only what it will send: an MP4 is unavailable until conversion is on"
   expect(screen.getByRole("checkbox", { name: "Select Movie.mp4" })).toHaveAttribute("title", "Turn on MP4 conversion to include this file.");
   expect(screen.getByText("1 of 2 selected")).toBeInTheDocument();
   expect(screen.getByText("1 files selected")).toBeInTheDocument();
+});
+
+it("asks to delete MP4s only while conversion is on", async () => {
+  const user = userEvent.setup();
+  const mkv = mediaFile("Episode 01.mkv");
+  const mp4 = { ...mediaFile("Movie.mp4"), extension: ".mp4", reader: "ffprobe" };
+  const files = [mkv, mp4];
+  const scan = { updatedUtc: "2026-11-13T10:00:00Z", files, selectedPaths: files.map((file) => file.path), summary: { total: 2, mkv: 1, mp4: 1, failed: 0, cached: 0 } };
+  const buildMuxPreview = vi.fn<(request: MuxPreviewRequest) => Promise<MuxPreviewResponse>>(() => Promise.resolve({ actions: [], noChangeFiles: [], summary: "", status: "Preview ready", planId: null, planFingerprint: null, idempotencyKey: null }));
+  renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="convert" /></MediaLibraryProvider>, {
+    getCurrentScanFiles: () => Promise.resolve(scan),
+    getWebSettings: () => Promise.resolve({ mkvMergeDefaultAudioLanguages: "eng", mkvMergeDefaultSubtitleLanguages: "eng" } as WebSettings),
+    setFileSelection: (selectedPaths: string[]) => Promise.resolve({ ...scan, selectedPaths }),
+    buildMuxPreview
+  });
+
+  const convert = await screen.findByRole("checkbox", { name: "Convert selected MP4 files to MKV" });
+  await waitFor(() => expect(convert).toBeChecked());
+  await user.click(screen.getByRole("checkbox", { name: "Delete original MP4 after success" }));
+  await user.click(convert);
+  await user.click(screen.getByRole("button", { name: "Preview Summary" }));
+  await waitFor(() => expect(buildMuxPreview).toHaveBeenCalled());
+  expect(buildMuxPreview.mock.calls[0][0]).toMatchObject({ convertMp4ToMkv: false, deleteMp4AfterConvert: false });
 });

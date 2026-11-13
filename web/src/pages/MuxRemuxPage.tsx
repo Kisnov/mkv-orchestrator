@@ -10,9 +10,11 @@ import { fileColumns } from "../components/fileColumns";
 import { FileSelectionTable } from "../components/FileSelectionTable";
 import { LanguageChips } from "../components/LanguageChips";
 import { OperationShell } from "../components/OperationShell";
+import { OriginalsConfirm } from "../components/OriginalsConfirm";
 import { pathKey } from "../lib/pathKey";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useLibrarySelection } from "../state/useFileSelection";
+import { useConfirmedApply } from "../state/useConfirmedApply";
 import { buildMuxRequest, useMuxRequest } from "../state/useMuxRequest";
 
 const columns = [fileColumns.reader, fileColumns.codec, fileColumns.resolution, fileColumns.audio, fileColumns.subtitles, fileColumns.status];
@@ -59,6 +61,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
     cancelingText: "Canceling MKV operation job...",
     onPreview: (_plan, request) => setPreviewRemovedTracks(buildRemovedTrackDetails(request))
   });
+  const confirmed = useConfirmedApply(run);
 
   useEffect(() => {
     if (!currentScan.data) return;
@@ -144,7 +147,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       extractSubtitleLanguages: extractLanguages,
       extractOverwriteExistingFiles: extractOverwrite,
       convertMp4ToMkv: convertMp4,
-      deleteMp4AfterConvert
+      deleteMp4AfterConvert: convertMp4 && deleteMp4AfterConvert
     });
   }
 
@@ -165,9 +168,10 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       run={run}
       canRun={canRun}
       onPreview={runPreview}
-      onApply={() => { if (canRun) void run.apply(buildRequest()); }}
+      onApply={() => { if (canRun) void confirmed.apply(buildRequest()); }}
       selectedText={`${selectedMkvPaths.length + (convertMp4 ? selectedMp4Paths.length : 0)} files selected`}
       hiddenSelected={[...selectedMkvPaths, ...(convertMp4 ? selectedMp4Paths : [])].filter(selection.isHidden).length}
+      risks={[!convertMp4 && !extractSubtitles && !preserveOriginal && "Replaces originals", convertMp4 && deleteMp4AfterConvert && "Deletes MP4", muxExternal && !preserveSidecars && "Deletes subtitle files", extractSubtitles && extractOverwrite && "Overwrites extracted subtitles"].filter((risk) => risk !== false)}
       options={<>
           {workflow !== "subtitles" ? <div className="flex items-center justify-between">
             {workflow === "remove" ? <h2 className="text-base font-semibold">Track Options</h2> : <span />}
@@ -342,7 +346,9 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
           }
         ]
       }}
-    />
+    >
+      {confirmed.dialog ? <OriginalsConfirm {...confirmed.dialog} /> : null}
+    </OperationShell>
   );
 }
 
