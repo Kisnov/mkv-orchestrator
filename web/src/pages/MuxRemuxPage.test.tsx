@@ -319,6 +319,10 @@ it("builds a fresh plan and applies without a manual preview", async () => {
   await waitFor(() => expect(applyButton).toBeEnabled());
   expect(screen.queryByRole("button", { name: "Preview" })).not.toBeInTheDocument();
   await user.click(applyButton);
+  // Replacing the original is the default here, so the plan waits for a yes.
+  const dialog = await screen.findByRole("dialog", { name: "Replace 1 original file?" });
+  expect(startMuxApply).not.toHaveBeenCalled();
+  await user.click(within(dialog).getByRole("button", { name: "Replace 1 file" }));
   await waitFor(() => expect(startMuxApply).toHaveBeenCalledWith(expect.objectContaining({ planId: "fresh-plan", planFingerprint: "fresh-fingerprint", idempotencyKey: "fresh-key" })));
   expect(buildMuxPreview).toHaveBeenCalledTimes(1);
 });

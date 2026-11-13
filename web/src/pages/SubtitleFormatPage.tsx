@@ -4,9 +4,11 @@ import { getWebSettings, saveWebSettings } from "../api";
 import type { FileColumn } from "../components/fileColumns";
 import { FileSelectionTable } from "../components/FileSelectionTable";
 import { OperationShell } from "../components/OperationShell";
+import { OriginalsConfirm } from "../components/OriginalsConfirm";
 import { pathKey } from "../lib/pathKey";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useLibrarySelection } from "../state/useFileSelection";
+import { useConfirmedApply } from "../state/useConfirmedApply";
 import { buildMuxRequest, useMuxRequest } from "../state/useMuxRequest";
 import { builtInSubtitleFonts, deleteImportedFont, fileToSubtitleFont, loadImportedFonts, registerPreviewFont, resolveFontData, type SubtitleFont } from "../lib/subtitleFonts";
 
@@ -34,6 +36,7 @@ export function SubtitleFormatPage() {
     noChangesText: "No compatible subtitle changes are available."
   });
   const { setStatus, setPreviewResult, previewResult } = run;
+  const confirmed = useConfirmedApply(run);
   const offsetMs = keepTiming ? 0 : Math.round((Number(timingOffset) || 0) * 1000);
   const selectedTrackCount = selectedMkvPaths.reduce((count, path) => count + (selectedTrackIds[pathKey(path)]?.length ?? 0), 0);
   const compatibleCount = selectedMkvPaths.filter((path) => (selectedTrackIds[pathKey(path)]?.length ?? 0) > 0).length;
@@ -202,7 +205,7 @@ export function SubtitleFormatPage() {
       run={run}
       canRun={canRun}
       onPreview={() => { if (canRun) run.preview(request()); }}
-      onApply={() => { if (canRun) void run.apply(request()); }}
+      onApply={() => { if (canRun) void confirmed.apply(request()); }}
       selectedText={`${selectedMkvPaths.length} files selected · ${selectedTrackCount} tracks across ${compatibleCount} files`}
       hiddenSelected={selectedMkvPaths.filter(selection.isHidden).length}
       options={<div className="space-y-3">
@@ -236,7 +239,9 @@ export function SubtitleFormatPage() {
         </div>
       </>}
       summary={{ title: "Subtitle Format Preview Summary", emptyText: "Build a preview to see subtitle changes.", available: previewResult !== null, status: previewResult?.status ?? "", summary: previewResult?.summary ?? "", metrics: [{ label: "Files changing", value: new Set(previewResult?.actions.map((action) => action.filePath) ?? []).size, tone: "text-success" }, { label: "Blocked/no change", value: previewResult?.noChangeFiles.length ?? 0, tone: "text-muted" }], sections: [{ title: "Planned operations", emptyText: "No compatible subtitle changes are available.", rows: previewResult?.actions.map((action) => ({ key: `${action.filePath}-${action.index}`, title: action.fileName, detail: action.description })) ?? [] }] }}
-    />
+    >
+      {confirmed.dialog ? <OriginalsConfirm {...confirmed.dialog} /> : null}
+    </OperationShell>
   );
 }
 

@@ -208,3 +208,32 @@ it("starts the order over when the template's tracks change under the same path"
   const names = screen.getAllByRole("button", { name: /^Move .* up$/ }).map((button) => button.getAttribute("aria-label"));
   expect(names).toEqual(["Move track 0 up", "Move Signs/Songs up", "Move Dialogue up"]);
 });
+
+it("asks before replacing the originals and sends nothing when cancelled", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  const files = [file("01.mkv"), file("02.mkv")];
+  const actions = files.map((item, index) => ({ index, filePath: item.path, fileName: item.fileName, operation: "Remux", toolName: "mkvmerge", description: "Reorder tracks", command: "mkvmerge" }));
+  const buildMuxPreview = vi.fn((): Promise<MuxPreviewResponse> => Promise.resolve({ actions, noChangeFiles: [], summary: "ready", status: "ready", planId: "plan", planFingerprint: "print", idempotencyKey: "key" }));
+  const startMuxApply = vi.fn(() => Promise.reject(new Error("Test stops before tracking a job")));
+  const user = userEvent.setup();
+  renderWithBackend(
+    <MediaLibraryProvider><Scan files={files}/><ReorderTracksPage/></MediaLibraryProvider>,
+    { buildMuxPreview, startMuxApply, setFileSelection: (paths) => Promise.resolve({ files, selectedPaths: paths, updatedUtc: null, summary: { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 } }) }
+  );
+
+  const applyButton = screen.getByRole("button", { name: "Apply Changes" });
+  await waitFor(() => expect(applyButton).toBeEnabled());
+  await user.click(applyButton);
+  const dialog = await screen.findByRole("dialog", { name: "Replace 2 original files?" });
+  expect(within(dialog).getByText("Replaced (2)")).toBeInTheDocument();
+  expect(within(dialog).getByText("01.mkv")).toBeInTheDocument();
+  expect(within(dialog).getByText("02.mkv")).toBeInTheDocument();
+  expect(within(dialog).getByText(/can't be undone/)).toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(startMuxApply).not.toHaveBeenCalled();
+
+  await user.click(applyButton);
+  await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace 2 files" }));
+  await waitFor(() => expect(startMuxApply).toHaveBeenCalledWith(expect.objectContaining({ planId: "plan", selectedPaths: ["/media/01.mkv", "/media/02.mkv"], reorderTracks: true })));
+});
