@@ -975,6 +975,26 @@ mod tests {
         panic!("job did not reach canceled state");
     }
 
+    /// Wait for the event that ends the job and count the ones before it.
+    /// It is sent once the final state and that event have been stored.
+    async fn events_before_the_end(events: &mut broadcast::Receiver<JobEventEnvelope>) -> usize {
+        let mut seen = 0;
+        loop {
+            match events.recv().await {
+                Ok(envelope) => match envelope.event {
+                    JobEvent::Completed { .. }
+                    | JobEvent::Failed { .. }
+                    | JobEvent::Canceled { .. } => return seen,
+                    _ => seen += 1,
+                },
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    seen += usize::try_from(missed).unwrap();
+                }
+                Err(broadcast::error::RecvError::Closed) => panic!("job never ended"),
+            }
+        }
+    }
+
     async fn wait_for_status(supervisor: &JobSupervisor, id: JobId, status: JobStatus) {
         for _ in 0..400 {
             if supervisor.get(id).await.unwrap().unwrap().status == status {
@@ -992,11 +1012,15 @@ mod tests {
         let accepted = supervisor
             .start(
                 spec("early-cancel", vec![ResourceClaim::read("library/show")]),
-                |_| async move { panic!("canceled task must not run") },
+                |context| async move {
+                    context.cancellation_token().cancelled().await;
+                    Err(ApplicationError::Canceled)
+                },
             )
             .await
             .unwrap();
-        // The runner has not been polled yet, so it finds the job Canceling.
+        // On one thread the runner has not been polled yet and finds the job
+        // Canceling. Any other order has to end the same way.
         supervisor.cancel(accepted.id).await.unwrap();
         wait_for_status(&supervisor, accepted.id, JobStatus::Canceled).await;
     }
@@ -1080,22 +1104,20 @@ mod tests {
             JobSupervisor::new(repository.clone())
                 .with_completed_job_retention(Duration::from_millis(5)),
         );
+        // The task waits, so the subscription exists before anything is sent.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let accepted = supervisor
             .start(spec("unsaved-key", Vec::new()), |_| async move {
+                released.await.unwrap();
                 Ok(JobCompletion::default())
             })
             .await
             .unwrap();
         let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+        release.send(()).unwrap();
 
-        let announced = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let JobEvent::Completed { .. } = events.recv().await.unwrap().event {
-                    return;
-                }
-            }
-        })
-        .await;
+        let announced =
+            tokio::time::timeout(Duration::from_secs(1), events_before_the_end(&mut events)).await;
         assert!(announced.is_ok(), "subscribers never saw the job finish");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1136,8 +1158,11 @@ mod tests {
         const FILES: u64 = 2_000;
         let repository = Arc::new(ObservedRepository::default());
         let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        // The task waits, so the subscription exists before anything is sent.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let accepted = supervisor
             .start(spec("many-files", Vec::new()), |context| async move {
+                released.await.unwrap();
                 for index in 1..=FILES {
                     context.emit(discovered("library/show/a.mkv")).await?;
                     context.progress(index, FILES, "a.mkv", 100).await?;
@@ -1149,7 +1174,9 @@ mod tests {
             .await
             .unwrap();
         let mut events = supervisor.subscribe(accepted.id).await.unwrap();
-        wait_for_status(&supervisor, accepted.id, JobStatus::Completed).await;
+        release.send(()).unwrap();
+        // Live subscribers still get the stream.
+        assert!(events_before_the_end(&mut events).await > 1);
 
         // Running, at most a handful of timed saves, and the terminal state.
         let updates = repository.updates.load(Ordering::SeqCst);
@@ -1162,13 +1189,6 @@ mod tests {
         let stored_events = &stored_events[&accepted.id];
         assert_eq!(stored_events.len(), 1);
         assert!(matches!(stored_events[0].event, JobEvent::Completed { .. }));
-
-        // Live subscribers still get the stream.
-        let mut live_events = 0;
-        while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = events.try_recv() {
-            live_events += 1;
-        }
-        assert!(live_events > 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1225,8 +1245,11 @@ mod tests {
             JobSupervisor::new(Arc::new(InMemoryJobRepository::default()))
                 .with_completed_job_retention(Duration::from_millis(20)),
         );
+        // The task waits, so the job cannot leave memory before the checks.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let accepted = supervisor
             .start(spec("attached-key", Vec::new()), |_| async move {
+                released.await.unwrap();
                 Ok(JobCompletion::default())
             })
             .await
@@ -1239,6 +1262,7 @@ mod tests {
         let files = supervisor.attachment::<Vec<String>>(accepted.id).await;
         assert_eq!(files.as_deref(), Some(&vec!["a.mkv".to_owned()]));
         assert!(supervisor.attachment::<u8>(accepted.id).await.is_none());
+        release.send(()).unwrap();
 
         for _ in 0..400 {
             if !supervisor.live.read().await.contains_key(&accepted.id) {
