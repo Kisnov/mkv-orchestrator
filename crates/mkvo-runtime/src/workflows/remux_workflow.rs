@@ -1202,12 +1202,12 @@ fn finished(tool: &str, stdout: &str) -> bool {
 
 // MKVToolNix prints its messages to stdout, among the progress lines.
 fn tool_message(execution: &mkvo_application::ToolExecutionResult, prefix: &str) -> String {
-    let stderr = execution.stderr.trim();
-    if !stderr.is_empty() {
-        return stderr.to_owned();
-    }
-    let lines: Vec<&str> = execution
-        .stdout
+    let output = if execution.stderr.trim().is_empty() {
+        &execution.stdout
+    } else {
+        &execution.stderr
+    };
+    let lines: Vec<&str> = output
         .split(['\r', '\n'])
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -1217,11 +1217,8 @@ fn tool_message(execution: &mkvo_application::ToolExecutionResult, prefix: &str)
         .copied()
         .filter(|line| line.starts_with(prefix))
         .collect();
-    if flagged.is_empty() {
-        lines[lines.len().saturating_sub(5)..].join(" | ")
-    } else {
-        flagged.join(" | ")
-    }
+    let shown = if flagged.is_empty() { lines } else { flagged };
+    shown[shown.len().saturating_sub(5)..].join(" | ")
 }
 
 fn ordered_template_tracks<'a>(
@@ -2723,12 +2720,12 @@ pub(super) mod execution_tests {
             "internal error: mkvmerge failed (exit code 2): one | two"
         );
         let mut on_stderr = exited(&invocation, 2, FAILED);
-        on_stderr.stderr = "access denied\n".to_owned();
+        on_stderr.stderr = "1\n2\n3\n4\n5\n6\naccess denied\n".to_owned();
         let on_stderr = tool_warning("mkvmerge", &on_stderr).expect_err("failed");
         assert!(
             on_stderr
                 .to_string()
-                .ends_with("(exit code 2): access denied")
+                .ends_with("(exit code 2): 3 | 4 | 5 | 6 | access denied")
         );
     }
 
