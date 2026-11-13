@@ -6,6 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Request, State, rejection::JsonRejection},
@@ -19,6 +23,10 @@ use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 const COOKIE_NAME: &str = "mkvo_session";
+const PASSWORD_FILE: &str = "admin-password.txt";
+const PASSWORD_HASH_FILE: &str = "admin-password.hash";
+const MIN_PASSWORD_LENGTH: usize = 12;
+const FREE_LOGIN_FAILURES: u32 = 5;
 
 pub fn public_router(auth: AuthState) -> Router {
     Router::new()
@@ -107,12 +115,28 @@ async fn auth_login(
             "Username and password are required.",
         );
     };
+    // Held through the check so concurrent guesses cannot slip past the lock.
+    let mut throttle = auth.throttle.lock().await;
+    if let Some(wait) = throttle.retry_after(Instant::now()) {
+        let mut response = error(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed sign-in attempts. Try again in a few minutes.",
+        );
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).into(),
+        );
+        return response;
+    }
     let Some((_, cookie)) = auth.login(&input.username, &input.password) else {
+        throttle.fail(Instant::now());
         return error(
             axum::http::StatusCode::UNAUTHORIZED,
             "Incorrect username or password.",
         );
     };
+    *throttle = Throttle::default();
+    drop(throttle);
     (
         [(header::SET_COOKIE, cookie)],
         Json(status(&auth, peer.map(|info| info.0.0), true)),
@@ -194,8 +218,9 @@ impl SecuritySettings {
 pub struct AuthState {
     auth_enabled: bool,
     username: Arc<str>,
-    password: Option<Arc<str>>,
-    password_file: Option<PathBuf>,
+    credential: Option<Arc<RwLock<Credential>>>,
+    data_dir: Option<PathBuf>,
+    throttle: Arc<tokio::sync::Mutex<Throttle>>,
     sessions: Arc<RwLock<HashMap<String, Instant>>>,
     secure_cookie: bool,
     settings: Arc<RwLock<SecuritySettings>>,
@@ -225,65 +250,61 @@ impl AuthState {
             Err(error) => return Err(error),
         };
         settings.validate().map_err(std::io::Error::other)?;
-        let password = if let Some(password) = configured_password {
+        let text_path = data_dir.join(PASSWORD_FILE);
+        let hash_path = data_dir.join(PASSWORD_HASH_FILE);
+        let credential = if let Some(password) = configured_password {
             if password.trim().is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "MKVO_PASSWORD cannot be empty",
                 ));
             }
-            password.to_owned()
-        } else {
-            std::fs::create_dir_all(data_dir)?;
-            let path = data_dir.join("admin-password.txt");
-            if path.exists() {
-                std::fs::read_to_string(path)?.trim().to_owned()
-            } else {
-                let password = format!(
-                    "{}{}",
-                    uuid::Uuid::new_v4().simple(),
-                    uuid::Uuid::new_v4().simple()
-                );
-                use std::io::Write;
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options.open(&path)?;
-                writeln!(file, "{password}")?;
-                file.sync_all()?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-                }
-                warn!(path = %path.display(), "Generated the MKVO administrator password; retrieve it from this file");
-                password
+            Credential::Configured(password.to_owned())
+        } else if text_path.exists() {
+            let password = std::fs::read_to_string(&text_path)?.trim().to_owned();
+            if password.is_empty() {
+                return Err(std::io::Error::other(
+                    "Administrator password file is empty",
+                ));
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&text_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Credential::Generated(password)
+        } else if hash_path.exists() {
+            let hash = std::fs::read_to_string(&hash_path)?.trim().to_owned();
+            PasswordHash::new(&hash).map_err(|_| {
+                std::io::Error::other(format!(
+                    "{} is not a password hash; delete it and restart to generate a new password",
+                    hash_path.display()
+                ))
+            })?;
+            Credential::Hashed(hash)
+        } else {
+            let password = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            write_private(&text_path, &format!("{password}\n"))?;
+            warn!(path = %text_path.display(), "Generated the MKVO administrator password; retrieve it from this file");
+            Credential::Generated(password)
         };
-        if password.trim().is_empty() {
-            return Err(std::io::Error::other(
-                "Administrator password file is empty",
-            ));
-        }
-        #[cfg(unix)]
-        if configured_password.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                data_dir.join("admin-password.txt"),
-                std::fs::Permissions::from_mode(0o600),
-            )?;
+        if let Credential::Configured(password) | Credential::Generated(password) = &credential
+            && password.chars().count() < MIN_PASSWORD_LENGTH
+        {
+            warn!(
+                "The administrator password is shorter than {MIN_PASSWORD_LENGTH} characters; set a longer MKVO_PASSWORD"
+            );
         }
         Ok(Self {
             auth_enabled: true,
             username: username.trim().into(),
-            password: Some(password.into()),
-            password_file: configured_password
-                .is_none()
-                .then(|| data_dir.join("admin-password.txt")),
+            credential: Some(Arc::new(RwLock::new(credential))),
+            data_dir: Some(data_dir.to_owned()),
+            throttle: Arc::default(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie,
             settings: Arc::new(RwLock::new(settings)),
@@ -296,8 +317,10 @@ impl AuthState {
         Self {
             auth_enabled: true,
             username: "admin".into(),
-            password: (!password.is_empty()).then(|| Arc::from(password.to_owned())),
-            password_file: None,
+            credential: (!password.is_empty())
+                .then(|| Arc::new(RwLock::new(Credential::Configured(password.to_owned())))),
+            data_dir: None,
+            throttle: Arc::default(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie: false,
             settings: Arc::new(RwLock::new(SecuritySettings::default())),
@@ -306,7 +329,7 @@ impl AuthState {
     }
 
     pub fn authenticated(&self, headers: &HeaderMap) -> bool {
-        if !self.auth_enabled || self.password.is_none() {
+        if !self.auth_enabled || self.credential.is_none() {
             return true;
         }
         let Some(token) = cookie(headers, COOKIE_NAME) else {
@@ -333,14 +356,23 @@ impl AuthState {
             warn!(
                 "Administrator login is disabled: all connections, including reverse proxies, have full access"
             );
-        } else if let Some(path) = &self.password_file {
-            warn!(
-                username = %self.username,
-                "Administrator login is required: sign in with the password in {} (or set MKVO_PASSWORD)",
-                path.display()
-            );
-        } else {
-            info!(username = %self.username, "Administrator login is required: sign in with MKVO_PASSWORD");
+        } else if let (Some(credential), Some(directory)) = (&self.credential, &self.data_dir) {
+            match &*credential.read().expect("credential lock poisoned") {
+                Credential::Configured(_) => info!(
+                    username = %self.username,
+                    "Administrator login is required: sign in with MKVO_PASSWORD"
+                ),
+                Credential::Generated(_) => warn!(
+                    username = %self.username,
+                    "Administrator login is required: sign in with the password in {} (or set MKVO_PASSWORD); after the first sign-in only its hash is kept",
+                    directory.join(PASSWORD_FILE).display()
+                ),
+                Credential::Hashed(_) => info!(
+                    username = %self.username,
+                    "Administrator login is required: sign in with the password you used before, or set MKVO_PASSWORD; to generate a new one delete {} and restart",
+                    directory.join(PASSWORD_HASH_FILE).display()
+                ),
+            }
         }
         self
     }
@@ -392,11 +424,28 @@ impl AuthState {
     }
 
     pub fn login(&self, username: &str, candidate: &str) -> Option<(String, HeaderValue)> {
-        let password = self.password.as_deref()?;
-        let credentials_match = self.username.as_bytes().ct_eq(username.as_bytes())
-            & password.as_bytes().ct_eq(candidate.as_bytes());
-        if credentials_match.unwrap_u8() != 1 {
+        let credential = self.credential.as_ref()?;
+        let current = credential.read().ok()?.clone();
+        let password_match = match &current {
+            Credential::Configured(password) | Credential::Generated(password) => {
+                bool::from(password.as_bytes().ct_eq(candidate.as_bytes()))
+            }
+            Credential::Hashed(hash) => PasswordHash::new(hash).is_ok_and(|hash| {
+                Argon2::default()
+                    .verify_password(candidate.as_bytes(), &hash)
+                    .is_ok()
+            }),
+        };
+        if !bool::from(self.username.as_bytes().ct_eq(username.as_bytes())) || !password_match {
             return None;
+        }
+        if let Credential::Generated(password) = &current {
+            match self.hash_generated_password(password) {
+                Ok(hash) => *credential.write().ok()? = Credential::Hashed(hash),
+                Err(cause) => {
+                    tracing::error!(%cause, "could not replace the password file with a hash")
+                }
+            }
         }
         let token = uuid::Uuid::new_v4().simple().to_string();
         let timeout = self.security_settings().idle_timeout_minutes;
@@ -411,6 +460,27 @@ impl AuthState {
         Some((token, value))
     }
 
+    /// Swaps the readable password file for its hash once the admin has used it.
+    fn hash_generated_password(&self, password: &str) -> std::io::Result<String> {
+        let directory = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("no data directory"))?;
+        let hash_error =
+            |error: argon2::password_hash::Error| std::io::Error::other(error.to_string());
+        let salt = SaltString::encode_b64(uuid::Uuid::new_v4().as_bytes()).map_err(hash_error)?;
+        let hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(hash_error)?
+            .to_string();
+        let path = directory.join(PASSWORD_HASH_FILE);
+        let temp = path.with_extension("tmp");
+        write_private(&temp, &hash)?;
+        std::fs::rename(&temp, &path)?;
+        std::fs::remove_file(directory.join(PASSWORD_FILE))?;
+        Ok(hash)
+    }
+
     pub fn logout(&self, headers: &HeaderMap) -> HeaderValue {
         if let Some(token) = cookie(headers, COOKIE_NAME)
             && let Ok(mut sessions) = self.sessions.write()
@@ -419,6 +489,67 @@ impl AuthState {
         }
         HeaderValue::from_static("mkvo_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
     }
+}
+
+#[derive(Clone)]
+enum Credential {
+    /// `MKVO_PASSWORD`, kept in memory only.
+    Configured(String),
+    /// `admin-password.txt`, readable until the first sign-in hashes it.
+    Generated(String),
+    /// Argon2 hash from `admin-password.hash`.
+    Hashed(String),
+}
+
+/// One lock for every client, so rotating addresses gains nothing.
+#[derive(Default)]
+struct Throttle {
+    failures: u32,
+    last_failure: Option<Instant>,
+    locked_until: Option<Instant>,
+}
+
+impl Throttle {
+    fn retry_after(&self, now: Instant) -> Option<Duration> {
+        self.locked_until
+            .map(|until| until.saturating_duration_since(now))
+            .filter(|wait| !wait.is_zero())
+    }
+
+    fn fail(&mut self, now: Instant) {
+        if self
+            .last_failure
+            .is_some_and(|last| now.saturating_duration_since(last) > Duration::from_secs(3600))
+        {
+            self.failures = 0;
+        }
+        self.failures += 1;
+        self.last_failure = Some(now);
+        if let Some(over) = self.failures.checked_sub(FREE_LOGIN_FAILURES) {
+            let wait = Duration::from_secs(30) * 2u32.pow(over.min(5));
+            self.locked_until = Some(now + wait.min(Duration::from_secs(900)));
+        }
+    }
+}
+
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn expired(last_activity: Instant, timeout: Option<u32>) -> bool {
@@ -627,5 +758,58 @@ mod tests {
 
         let second = AuthState::load(directory.path(), None, "admin", false).unwrap();
         assert!(second.login("admin", password.trim()).is_some());
+    }
+
+    #[test]
+    fn stored_password_is_hashed_after_the_first_sign_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = directory.path().join("admin-password.txt");
+        let hash = directory.path().join("admin-password.hash");
+        // An existing install may hold a short password someone typed into the file.
+        std::fs::write(&text, "short\n").unwrap();
+        let auth = AuthState::load(directory.path(), None, "admin", false).unwrap();
+        assert!(auth.login("admin", "wrong").is_none());
+        assert!(text.exists() && !hash.exists());
+        assert!(auth.login("admin", "short").is_some());
+        assert!(!text.exists());
+        let stored = std::fs::read_to_string(&hash).unwrap();
+        assert!(stored.starts_with("$argon2"), "{stored}");
+        assert!(!stored.contains("short"));
+        assert!(auth.login("admin", "short").is_some());
+
+        let restarted = AuthState::load(directory.path(), None, "admin", false).unwrap();
+        assert!(restarted.login("admin", "short").is_some());
+        assert!(restarted.login("admin", "wrong").is_none());
+        assert!(restarted.login("other", "short").is_none());
+        // MKVO_PASSWORD still wins and is never written to disk.
+        let configured =
+            AuthState::load(directory.path(), Some("configured-pass"), "admin", false).unwrap();
+        assert!(configured.login("admin", "configured-pass").is_some());
+        assert!(configured.login("admin", "short").is_none());
+        assert_eq!(std::fs::read_to_string(&hash).unwrap(), stored);
+    }
+
+    #[test]
+    fn repeated_failures_lock_sign_in_with_a_growing_delay() {
+        let start = Instant::now();
+        let mut throttle = Throttle::default();
+        for _ in 0..4 {
+            throttle.fail(start);
+            assert_eq!(throttle.retry_after(start), None);
+        }
+        throttle.fail(start);
+        assert_eq!(throttle.retry_after(start), Some(Duration::from_secs(30)));
+        let later = start + Duration::from_secs(31);
+        assert_eq!(throttle.retry_after(later), None);
+        throttle.fail(later);
+        assert_eq!(throttle.retry_after(later), Some(Duration::from_secs(60)));
+        for _ in 0..10 {
+            throttle.fail(later);
+        }
+        assert_eq!(throttle.retry_after(later), Some(Duration::from_secs(900)));
+        // A failure long after the last one starts counting again.
+        let next_day = later + Duration::from_secs(86_400);
+        throttle.fail(next_day);
+        assert_eq!(throttle.retry_after(next_day), None);
     }
 }

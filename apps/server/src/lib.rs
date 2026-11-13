@@ -374,6 +374,40 @@ mod tests {
         assert_eq!(persisted["idle_timeout_minutes"], 30);
     }
 
+    fn login_request(password: &str) -> Request<Body> {
+        Request::post("/api/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"username": "admin", "password": password}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_sign_ins_lock_the_login_for_everyone() {
+        let host = TestHost::new(Some(BasicAuth {
+            username: "admin".to_owned(),
+            password: "correct-password".to_owned(),
+        }));
+        let router = host.router();
+        for _ in 0..5 {
+            let response = router
+                .clone()
+                .oneshot(login_request("guess"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = router
+            .clone()
+            .oneshot(login_request("correct-password"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+    }
+
     #[tokio::test]
     async fn disabled_login_has_no_barrier_and_no_idle_timeout() {
         let host = TestHost::new(None);
