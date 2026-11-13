@@ -349,10 +349,7 @@ export function DashboardPage() {
     // set. An empty list produced by the user's Clear Sources action must not
     // immediately restore those same rows from the cached query response.
     if (sourcesExplicitlyCleared.current) return;
-    // The Library page uses the same backend working set while it builds its
-    // overview. Keep that shared result scoped to the folders selected here,
-    // otherwise a Library scan can replace Dashboard rows with another
-    // library's files when this query refreshes.
+    // Show only the working set's files under the folders selected here.
     syncFromBackend(currentScan.data, sources);
   }, [currentScan.data, sources, syncFromBackend]);
 

@@ -297,7 +297,6 @@ describe("Track Properties template synchronization", () => {
     const first = file("Episode 01.mkv");
     const second = file("Episode 02.mkv");
     const files = [movie, first, second];
-    window.sessionStorage.setItem("mkvo.web.scannedFiles", JSON.stringify(files));
     window.sessionStorage.setItem("mkvo.web.templateFilePath", movie.path);
     const loadPropEditTemplate = vi.fn((request: PropEditTemplateRequest) => Promise.resolve(template(request.templatePath ?? "")));
     const buildPropEditPreview = vi.fn<(request: PropEditPreviewRequest) => Promise<PropEditPreviewResponse>>(() => Promise.resolve({
@@ -376,7 +375,6 @@ describe("Track Properties template synchronization", () => {
     const first = file("Episode 01.mkv");
     const second = file("Episode 02.mkv");
     const files = [first, second];
-    window.sessionStorage.setItem("mkvo.web.scannedFiles", JSON.stringify(files));
     window.sessionStorage.setItem("mkvo.web.templateFilePath", first.path);
     const loadPropEditTemplate = vi.fn((request: PropEditTemplateRequest) => Promise.resolve(template(request.templatePath ?? "")));
 
