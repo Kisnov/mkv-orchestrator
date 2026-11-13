@@ -14,7 +14,7 @@ export function JobLogModal({ title, job, onClose }: { title: string; job: Opera
   const failed = failedFiles(job);
   const counts = `${job.completed} done, ${job.failed} failed, ${job.skipped} skipped of ${job.total}`;
   return (
-    <Dialog title={title} onClose={onClose} className="h-[min(40rem,calc(100vh-3rem))] w-[min(60rem,calc(100vw-3rem))]">
+    <Dialog title={title} onClose={onClose} className="w-[min(60rem,calc(100vw-3rem))]">
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
         <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-input px-4 py-3">
           <div className="min-w-0">
@@ -36,7 +36,7 @@ export function JobLogModal({ title, job, onClose }: { title: string; job: Opera
         <section className="mt-5">
           <h3 className="mb-2 text-sm font-semibold text-text">Job log <span className="text-muted">({job.lines.length})</span></h3>
           {job.lines.length
-            ? <pre className="overflow-x-auto rounded-md border border-border bg-input px-4 py-3 text-xs leading-5 text-muted">{job.lines.join("\n")}</pre>
+            ? <pre className="whitespace-pre-wrap rounded-md [overflow-wrap:anywhere] border border-border bg-input px-4 py-3 text-xs leading-5 text-muted">{job.lines.join("\n")}</pre>
             : <div className="rounded-md border border-border bg-input px-4 py-3 text-sm text-subtle">The job wrote no log lines.</div>}
         </section>
       </div>
