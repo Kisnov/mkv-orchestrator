@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { act, screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, it, vi } from "vitest";
 
@@ -170,13 +170,13 @@ it("reports a failed reorder job and lists its failed files", async () => {
       getOperationJob: () => Promise.resolve({
         id: "reorder-job", kind: "Remux", status: "Failed", createdUtc: "", startedUtc: null, completedUtc: null,
         completed: 0, failed: 2, skipped: 0, total: 2, currentFile: "", currentFilePercent: 0,
-        lines: ["/media/01.mkv: mkvmerge failed", "/media/02.mkv: mkvmerge failed"], muxResult: null, propEditResult: null,
-        error: "2 of 2 files failed: 01.mkv: mkvmerge failed; 02.mkv: mkvmerge failed"
+        lines: ["/media/01.mkv: tool failed", "/media/02.mkv: tool failed"], muxResult: null, propEditResult: null,
+        error: "internal error: 2 of 2 files failed: 01.mkv: tool failed; 02.mkv: tool failed"
       })
     }
   );
 
   await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("2 of 2 files failed"));
   await user.click(screen.getByRole("button", { name: "Show the 2 failed file(s) and job log" }));
-  expect(screen.getByRole("dialog", { name: "Reorder Tracks job log" })).toHaveTextContent("02.mkv: mkvmerge failed");
+  expect(within(screen.getByRole("dialog", { name: "Reorder Tracks job log" })).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["01.mkv: tool failed", "02.mkv: tool failed"]);
 });

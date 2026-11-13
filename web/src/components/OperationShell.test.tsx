@@ -72,20 +72,32 @@ it("offers Cancel while applying and no job log until the job ends", async () =>
   expect(screen.queryByRole("button", { name: /job log/ })).not.toBeInTheDocument();
 });
 
+// The exact strings batch_failure produces (remux_workflow.rs, a_batch_failure_names_the_failed_files_and_ignores_canceled_ones).
 it("shows a finished job's failed files and log lines", async () => {
   const user = userEvent.setup();
   shell({ ...idle, job: job({
-    status: "Failed", completed: 1, failed: 2,
-    error: "2 of 3 files failed: 01.mkv: mkvmerge failed; 03.mkv: The file could not be opened",
-    lines: ["Remux /media/01.mkv", "/media/01.mkv: mkvmerge failed", "/media/03.mkv: The file could not be opened"]
+    status: "Failed", completed: 1, failed: 2, total: 4,
+    error: "internal error: 2 of 4 files failed: a.mkv: tool failed; b.mkv: tool failed",
+    lines: ["Remux /media/a.mkv", "/media/a.mkv: tool failed", "/media/b.mkv: tool failed"]
   }) });
 
   await user.click(screen.getByRole("button", { name: "Show the 2 failed file(s) and job log" }));
   const dialog = screen.getByRole("dialog", { name: "Reorder Tracks job log" });
-  expect(within(dialog).getByText("1 done, 2 failed, 0 skipped of 3")).toBeInTheDocument();
+  expect(within(dialog).getByText("1 done, 2 failed, 0 skipped of 4")).toBeInTheDocument();
   const failed = within(dialog).getAllByRole("listitem").map((item) => item.textContent);
-  expect(failed).toEqual(["01.mkv: mkvmerge failed", "03.mkv: The file could not be opened"]);
-  expect(within(dialog).getByText(/Remux \/media\/01\.mkv/)).toHaveTextContent("/media/03.mkv: The file could not be opened");
+  expect(failed).toEqual(["a.mkv: tool failed", "b.mkv: tool failed"]);
+  expect(within(dialog).getByText(/^Remux \/media\/a\.mkv/)).toHaveTextContent("/media/b.mkv: tool failed");
+});
+
+it("lists the first failed files and says how many more the log holds", async () => {
+  const user = userEvent.setup();
+  const listed = [0, 1, 2, 3, 4].map((index) => `${index}.mkv: tool failed`);
+  shell({ ...idle, job: job({ status: "Failed", completed: 2, failed: 7, total: 9, error: `internal error: 7 of 9 files failed: ${listed.join("; ")}; and 2 more, listed in the job log` }) });
+
+  await user.click(screen.getByRole("button", { name: "Show the 7 failed file(s) and job log" }));
+  const dialog = screen.getByRole("dialog");
+  expect(within(dialog).getAllByRole("listitem").map((item) => item.textContent)).toEqual(listed);
+  expect(within(dialog).getByText("And 2 more, listed in the job log.")).toBeInTheDocument();
 });
 
 it("shows the log of a job that completed, and a single file's error as its failure", async () => {
@@ -96,8 +108,8 @@ it("shows the log of a job that completed, and a single file's error as its fail
   expect(within(screen.getByRole("dialog")).queryByText("Failed files")).not.toBeInTheDocument();
   unmount();
 
-  shell({ ...idle, job: job({ status: "Failed", completed: 0, failed: 1, total: 1, error: "mkvmerge failed: disk full" }) });
+  shell({ ...idle, job: job({ status: "Failed", completed: 0, failed: 1, total: 1, error: "internal error: tool failed" }) });
   await user.click(screen.getByRole("button", { name: "Show the 1 failed file(s) and job log" }));
-  expect(within(screen.getByRole("dialog")).getByRole("listitem")).toHaveTextContent("mkvmerge failed: disk full");
+  expect(within(screen.getByRole("dialog")).getByRole("listitem")).toHaveTextContent("internal error: tool failed");
   expect(within(screen.getByRole("dialog")).getByText("The job wrote no log lines.")).toBeInTheDocument();
 });

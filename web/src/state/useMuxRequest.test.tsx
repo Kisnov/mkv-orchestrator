@@ -94,8 +94,8 @@ describe("useMuxRequest", () => {
     await act(() => result.current.apply(request));
     await waitFor(() => expect(result.current.status).toBe("Applying 1/2 | 02.mkv 40%"));
 
-    current = job({ status: "Failed", completed: 1, failed: 1, error: "1 of 2 files failed: 02.mkv: mkvmerge failed" });
-    await waitFor(() => expect(result.current.status).toBe("1 of 2 files failed: 02.mkv: mkvmerge failed"), { timeout: 3000 });
+    current = job({ status: "Failed", completed: 1, failed: 1, error: "internal error: 1 of 2 files failed: 02.mkv: tool failed" });
+    await waitFor(() => expect(result.current.status).toBe("internal error: 1 of 2 files failed: 02.mkv: tool failed"), { timeout: 3000 });
     expect(result.current.job?.status).toBe("Failed");
     expect(result.current.isApplying).toBe(false);
   });

@@ -3,15 +3,19 @@ import { Copy } from "lucide-react";
 import type { OperationJobResponse } from "../api";
 import { Dialog } from "./Dialog";
 
-/** The failed files a batch error names, one per entry; a single-file job's error is its own entry. */
-function failedFiles(job: OperationJobResponse): string[] {
-  if (!job.error) return [];
-  const batch = /^\d+ of \d+ files failed: ([\s\S]*)$/.exec(job.error);
-  return batch ? batch[1].split("; ") : [job.error];
+/**
+ * The failed files a batch error names (the backend's batch_failure: "internal error: N of M files
+ * failed: a: …; b: …; and K more, listed in the job log"); a single-file job's error is its own entry.
+ */
+function failedFiles(job: OperationJobResponse): { files: string[]; more: string } {
+  if (!job.error) return { files: [], more: "" };
+  const batch = /\d+ of \d+ files failed: ([\s\S]*?)(?:; (and \d+ more, listed in the job log))?$/.exec(job.error);
+  if (!batch) return { files: [job.error], more: "" };
+  return { files: batch[1].split("; "), more: batch[2] ? `${batch[2].charAt(0).toUpperCase()}${batch[2].slice(1)}.` : "" };
 }
 
 export function JobLogModal({ title, job, onClose }: { title: string; job: OperationJobResponse; onClose: () => void }) {
-  const failed = failedFiles(job);
+  const { files: failed, more } = failedFiles(job);
   const counts = `${job.completed} done, ${job.failed} failed, ${job.skipped} skipped of ${job.total}`;
   return (
     <Dialog title={title} onClose={onClose} className="w-[min(60rem,calc(100vw-3rem))]">
@@ -31,6 +35,7 @@ export function JobLogModal({ title, job, onClose }: { title: string; job: Opera
             <ul className="overflow-hidden rounded-md border border-warning bg-input">
               {failed.map((entry, index) => <li key={index} className="break-words border-b border-border px-4 py-2 text-xs leading-5 text-text [overflow-wrap:anywhere] last:border-0">{entry}</li>)}
             </ul>
+            {more ? <p className="mt-2 text-xs text-muted">{more}</p> : null}
           </section>
         ) : null}
         <section className="mt-5">
