@@ -14,7 +14,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mkvo_application::{MediaEnumerationRequest, WatchChange, WatchChangeKind, WatchHealth};
+use mkvo_application::{
+    MediaEnumerationRequest, WatchChange, WatchChangeKind, WatchHealth, path_contains,
+};
 use mkvo_domain::{AppSettings, path_key};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
@@ -345,6 +347,14 @@ async fn reconcile_roots(
                 continue;
             }
         };
+        // As in scans: a share that dropped looks empty, not deleted, so its rows stay.
+        if !fingerprints
+            .iter()
+            .any(|fingerprint| path_contains(&root, &fingerprint.path))
+        {
+            tracing::warn!(root = %root.display(), "watch root lists no media; nothing pruned");
+            continue;
+        }
         match dependencies.cache.list_under(&root).await {
             Ok(cached) => {
                 for file in cached {
@@ -490,6 +500,20 @@ mod tests {
 
         assert_eq!(dependencies.cache.count().await.unwrap(), 1);
         assert_eq!(library.probe.0.load(Ordering::SeqCst), 2);
+    }
+
+    /// A bind mount whose share dropped is an empty folder, not a deleted library.
+    #[tokio::test]
+    async fn reconciliation_keeps_the_rows_of_a_root_that_lists_nothing() {
+        let library = library(&["a.mkv", "b.mkv"]).await;
+        for name in ["a.mkv", "b.mkv"] {
+            std::fs::remove_file(library.root.join(name)).unwrap();
+        }
+
+        let dependencies = library.runtime.dependencies();
+        reconcile_roots(dependencies, &[library.root.clone()], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 2);
     }
 
     /// Settings keep the root as typed, but cache rows carry the spelling the
