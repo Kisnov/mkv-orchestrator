@@ -32,3 +32,10 @@ it("gives the preview summary and the confirmation the same semantics", () => {
   const confirm = screen.getByRole("dialog", { name: "Apply to files that differ?" });
   expect(confirm).toHaveTextContent("Episode 10.mkv");
 });
+
+it("keeps the roomier layout for a confirmation that lists what it reaches", () => {
+  render(<ConfirmModal title="Apply?" message="Check them." confirmLabel="Apply" onConfirm={() => undefined} onClose={() => undefined}><p>Episode 10.mkv</p></ConfirmModal>);
+
+  expect(screen.getByText("Check them.")).toHaveClass("leading-6");
+  expect(screen.getByRole("button", { name: "Apply" }).parentElement).toHaveClass("border-t");
+});

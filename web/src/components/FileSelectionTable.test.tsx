@@ -38,7 +38,7 @@ function Harness({ initialFiles = files, initialTemplatePath = initialFiles[0].p
       <button type="button" onClick={() => setScanned((current) => [...current, file("07.mkv", "jpn")])}>Add a differing file</button>
       <output>{selection.selectedPaths.join(",")}</output>
       <span aria-label="hidden">{selection.selectedPaths.filter(selection.isHidden).length}</span>
-      <FileSelectionTable title="Files" files={scanned} templateFile={templateFile} selection={selection} warnDiffering />
+      <FileSelectionTable title="Files" files={scanned} templateFile={templateFile} selection={selection} warnDiffering tintRows />
     </>
   );
 }
@@ -324,5 +324,21 @@ describe("useLibrarySelection", () => {
     await user.click(screen.getByRole("button", { name: "Select none" }));
     await waitFor(() => expect(setFileSelection).toHaveBeenLastCalledWith(["/media/Movie.mp4"]));
     localStorage.clear();
+  });
+});
+
+describe("FileSelectionTable colours", () => {
+  it("tints whole rows only when asked, and otherwise colours just the status", () => {
+    const { unmount } = render(<Harness />);
+    expect(row("04.mkv")).toHaveClass("text-warning");
+    expect(row("01.mkv")).toHaveClass("text-template");
+    unmount();
+
+    render(<ActiveHarness />);
+    expect(row("04.mkv")).not.toHaveClass("text-warning");
+    expect(row("01.mkv")).not.toHaveClass("text-template");
+    expect(within(row("04.mkv")).getByRole("button", { name: "Warning (1)" }).closest("td")).toHaveClass("text-warning");
+    expect(within(row("01.mkv")).getByText("Template")).toHaveClass("text-template");
+    expect(within(row("02.mkv")).getByText("Scanned")).toHaveClass("text-success");
   });
 });

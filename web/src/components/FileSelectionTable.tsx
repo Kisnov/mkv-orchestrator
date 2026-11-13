@@ -13,7 +13,7 @@ const toolbarButton = "rounded-md border border-border px-3 py-1.5 hover:bg-sele
 const notice = "flex items-center gap-2 rounded-md border border-warning bg-input px-3 py-2 text-xs text-warning";
 const moveKeys = ["ArrowDown", "ArrowUp", "Home", "End"];
 
-export function FileSelectionTable({ title, files, templateFile, selection, columns = defaultColumns, label, warnDiffering = false, matchingAction = true, activePath, onActivate, unavailable }: {
+export function FileSelectionTable({ title, files, templateFile, selection, columns = defaultColumns, label, warnDiffering = false, matchingAction = true, activePath, onActivate, unavailable, tintRows = false }: {
   title: string;
   files: MediaFileRow[];
   templateFile: MediaFileRow | null;
@@ -32,6 +32,8 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
   onActivate?: (path: string) => void;
   /** Why a file cannot be part of this operation right now; it shows unchecked and cannot be checked. */
   unavailable?: (file: MediaFileRow) => string | undefined;
+  /** Colour the whole row by its status, not only the status cell. */
+  tintRows?: boolean;
 }) {
   const detailsId = useId();
   const [sort, setSort] = useState<{ key: string; direction: SortDirection }>({ key: "file", direction: "asc" });
@@ -160,7 +162,7 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
                     className={[
                       active ? "bg-selected" : "bg-card hover:bg-selected",
                       onActivate ? "cursor-pointer" : "",
-                      status === "Template" ? "text-template" : status === "Warning" ? "text-warning" : "text-text"
+                      tintRows && status === "Template" ? "text-template" : tintRows && status === "Warning" ? "text-warning" : "text-text"
                     ].join(" ")}
                   >
                     <td className="border-b border-border px-3 py-2">
@@ -180,7 +182,7 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
                       )}
                     </td>
                     {columns.map((column) => column.key === "status" ? (
-                      <td key={column.key} className={["border-b border-border px-3 py-2", status === "Template" || status === "Warning" ? "" : "text-success"].join(" ")}>
+                      <td key={column.key} className={["border-b border-border px-3 py-2", status === "Template" ? (tintRows ? "" : "text-template") : status === "Warning" ? (tintRows ? "" : "text-warning") : "text-success"].join(" ")}>
                         {status === "Warning" ? (
                           <button type="button" aria-expanded={expanded} aria-controls={`${detailsId}-${index}`} onClick={() => setExpandedPath(expanded ? "" : file.path)} className="inline-flex items-center gap-1 rounded hover:underline">
                             {expanded ? <ChevronDown size={13} aria-hidden="true" /> : <ChevronRight size={13} aria-hidden="true" />}

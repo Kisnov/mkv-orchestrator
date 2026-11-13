@@ -381,7 +381,7 @@ export function TrackPropertiesPage() {
               ))}
             </select>
       </>}
-      files={<FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} warnDiffering />}
+      files={<FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} warnDiffering tintRows />}
       details={<>
             <div className="flex shrink-0 items-center justify-between gap-3">
               <h2 className="text-base font-semibold">Edit Tracks</h2>
