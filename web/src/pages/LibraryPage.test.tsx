@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router-dom";
 
@@ -481,6 +481,67 @@ describe("Library poster workflow", () => {
       "/media/tv/Example Show/Season 1/Episode 02.mkv"
     ], true));
     await waitFor(() => expect(setFileSelection).toHaveBeenLastCalledWith([held.path], true));
+  });
+
+  function openTitleWith(overrides: Partial<BackendClient>) {
+    const backend = posterBackend({ getLibraryCatalog: () => Promise.resolve({ items: [] }), getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")), ...overrides });
+    renderWithBackend(
+      <MediaLibraryProvider>
+        <Routes>
+          <Route path="/" element={<LibraryPage />} />
+          <Route path="/dashboard" element={<h1>Dashboard</h1>} />
+        </Routes>
+      </MediaLibraryProvider>,
+      backend
+    );
+  }
+
+  it("leaves Dashboard alone when none of the title's files can be read", async () => {
+    const user = userEvent.setup();
+    const setFileSelection = vi.fn().mockResolvedValue({ selectedPaths: ["/media/other.mkv"] });
+    openTitleWith({
+      setFileSelection,
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-22T20:00:00Z", files: [media("/media/other.mkv")], selectedPaths: ["/media/other.mkv"], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } })
+    });
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(await within(dialog).findByText(/none of this title's files could be read/i)).toBeInTheDocument();
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("heading", { name: "Dashboard" })).not.toBeInTheDocument();
+  });
+
+  it("says so in the dialog when the sent files cannot be loaded back", async () => {
+    const user = userEvent.setup();
+    openTitleWith({
+      setFileSelection: () => Promise.resolve({ selectedPaths: [] }),
+      getCurrentScanFiles: () => Promise.reject(new Error("server went away"))
+    });
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+
+    expect(await within(screen.getByRole("dialog")).findByText(/server went away/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /send all files to dashboard/i })).toBeEnabled();
+  });
+
+  it("runs one hand-off at a time and shows its progress in the dialog", async () => {
+    const user = userEvent.setup();
+    let release: (value: { selectedPaths: string[] }) => void = () => undefined;
+    const setFileSelection = vi.fn().mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+    openTitleWith({ setFileSelection, getCurrentScanFiles: () => new Promise(() => undefined) });
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    const sendAll = screen.getByRole("button", { name: /send all files to dashboard/i });
+    await user.dblClick(sendAll);
+
+    expect(within(screen.getByRole("dialog")).getByText(/sending example show to dashboard/i)).toBeInTheDocument();
+    expect(sendAll).toBeDisabled();
+    expect(screen.getByRole("button", { name: /send mismatches \+ template to dashboard/i })).toBeDisabled();
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+    release({ selectedPaths: [] });
   });
 
   it("does not save an empty library when the scan's files are no longer held", async () => {
