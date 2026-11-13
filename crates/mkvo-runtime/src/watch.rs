@@ -12,6 +12,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use mkvo_application::{
@@ -162,12 +163,13 @@ impl MkvoRuntime {
         let dependencies = self.dependencies().clone();
         let mut roots = settings.watch.roots.clone();
         let mut ignored = settings.scan.ignored_folder_names.clone();
+        let mut debounce = Duration::from_millis(settings.watch.debounce_millis);
 
         tokio::spawn(async move {
             loop {
                 match changes.recv().await {
                     Ok(change) => {
-                        apply_change(&dependencies, &change, &roots, &ignored).await;
+                        apply_change(&dependencies, &change, &roots, &ignored, debounce).await;
                     }
                     // A lagged receiver means changes were lost, so the cache can
                     // no longer be trusted for these roots and must be rebuilt
@@ -186,6 +188,7 @@ impl MkvoRuntime {
                 if let Ok((loaded, _revision)) = dependencies.settings.load().await {
                     roots = loaded.watch.roots.clone();
                     ignored = loaded.scan.ignored_folder_names.clone();
+                    debounce = Duration::from_millis(loaded.watch.debounce_millis);
                 }
             }
         });
@@ -197,6 +200,7 @@ async fn apply_change(
     change: &WatchChange,
     roots: &[PathBuf],
     ignored: &BTreeSet<String>,
+    debounce: Duration,
 ) {
     tracing::debug!(
         kind = ?change.kind,
@@ -216,7 +220,7 @@ async fn apply_change(
         WatchChangeKind::Created | WatchChangeKind::Modified | WatchChangeKind::Renamed => {
             for path in &change.paths {
                 if path.exists() {
-                    refresh(dependencies, path, ignored).await;
+                    refresh(dependencies, path, ignored, debounce).await;
                 } else {
                     prune(dependencies, path).await;
                 }
@@ -249,8 +253,14 @@ async fn prune(dependencies: &RuntimeDependencies, path: &Path) {
 }
 
 /// Re-probe a single changed file and update its cache entry.
-async fn refresh(dependencies: &RuntimeDependencies, path: &Path, ignored: &BTreeSet<String>) {
-    if path.is_file() && !is_supported_media(path) {
+async fn refresh(
+    dependencies: &RuntimeDependencies,
+    path: &Path,
+    ignored: &BTreeSet<String>,
+    debounce: Duration,
+) {
+    let is_file = path.is_file();
+    if is_file && !is_supported_media(path) {
         return;
     }
     let cancel = CancellationToken::new();
@@ -271,7 +281,13 @@ async fn refresh(dependencies: &RuntimeDependencies, path: &Path, ignored: &BTre
         }
     };
 
+    // In a folder, a file written just now may still be copying; its own events report it.
+    let settled_before = chrono::Utc::now()
+        - chrono::TimeDelta::from_std(debounce).unwrap_or(chrono::TimeDelta::zero());
     for fingerprint in fingerprints {
+        if !is_file && fingerprint.modified_at > settled_before {
+            continue;
+        }
         match dependencies.cache.get_valid(&fingerprint).await {
             Ok(Some(_)) => continue,
             Ok(None) => {}
@@ -480,7 +496,13 @@ mod tests {
         let mut dependencies = built.dependencies().clone();
         dependencies.probe = probe.clone();
         let runtime = MkvoRuntime::from_parts(built.config().clone(), dependencies);
-        refresh(runtime.dependencies(), &root, &BTreeSet::new()).await;
+        refresh(
+            runtime.dependencies(),
+            &root,
+            &BTreeSet::new(),
+            std::time::Duration::ZERO,
+        )
+        .await;
         assert_eq!(probe.0.load(Ordering::SeqCst), names.len());
         Library {
             _directory: directory,
@@ -500,6 +522,27 @@ mod tests {
 
         assert_eq!(dependencies.cache.count().await.unwrap(), 1);
         assert_eq!(library.probe.0.load(Ordering::SeqCst), 2);
+    }
+
+    /// A folder event must not probe a file still being copied into it; that
+    /// file's own events report it once it settles.
+    #[tokio::test]
+    async fn refreshing_a_folder_skips_files_written_within_the_debounce() {
+        let library = library(&[]).await;
+        let copying = library.root.join("copying.mkv");
+        std::fs::write(&copying, b"part").unwrap();
+        let dependencies = library.runtime.dependencies();
+        let debounce = std::time::Duration::from_secs(60);
+
+        refresh(dependencies, &library.root, &BTreeSet::new(), debounce).await;
+        assert_eq!(library.probe.0.load(Ordering::SeqCst), 0);
+
+        refresh(dependencies, &copying, &BTreeSet::new(), debounce).await;
+        assert_eq!(
+            library.probe.0.load(Ordering::SeqCst),
+            1,
+            "its own event still probes it"
+        );
     }
 
     /// A bind mount whose share dropped is an empty folder, not a deleted library.
