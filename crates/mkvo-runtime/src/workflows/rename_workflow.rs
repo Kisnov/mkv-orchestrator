@@ -305,6 +305,13 @@ impl MkvoRuntime {
                                         .ok(),
                                     sidecars: Vec::new(),
                                 };
+                                // Before the watcher reports the move, so it finds the row already moved.
+                                runtime
+                                    .follow_renames(&[(
+                                        entry.original_fingerprint.clone(),
+                                        renamed(&entry),
+                                    )])
+                                    .await;
                                 let mut sidecars_moved = Ok(());
                                 for sidecar in sidecars {
                                     sidecars_moved = file_system
@@ -342,11 +349,6 @@ impl MkvoRuntime {
                             Ok::<(), ApplicationError>(())
                         }
                         .await;
-                        let followed: Vec<_> = moved
-                            .iter()
-                            .map(|entry| (entry.original_fingerprint.clone(), renamed(entry)))
-                            .collect();
-                        runtime.follow_renames(&followed).await;
                         if let Err(error) = mutation {
                             journal.fail_first_pending_item(error.to_string());
                             journal.status = mkvo_application::JournalStatus::Failed;
@@ -611,7 +613,6 @@ impl MkvoRuntime {
                         }
                         let file_system = &runtime.dependencies().file_system;
                         let mut response = RenameBatchUndoResponse::default();
-                        let mut restored = Vec::new();
                         let restoration = async {
                             for entry in &batch.entries {
                                 if runtime
@@ -632,7 +633,7 @@ impl MkvoRuntime {
                                         path: entry.original_path.clone(),
                                         ..current.clone()
                                     };
-                                    restored.push((current, original));
+                                    runtime.follow_renames(&[(current, original)]).await;
                                     response.renamed += 1;
                                     response.lines.push(format!(
                                         "Restored {}",
@@ -674,7 +675,6 @@ impl MkvoRuntime {
                             Ok::<(), ApplicationError>(())
                         }
                         .await;
-                        runtime.follow_renames(&restored).await;
                         restoration?;
                         runtime
                             .dependencies()
@@ -984,6 +984,87 @@ mod tests {
             ]
         );
         assert!(library.batches().await[0].undone_at.is_some());
+    }
+
+    /// Notes which files the cache holds each time a file is about to move.
+    struct CacheAtEachMove {
+        inner: Arc<dyn mkvo_application::FileSystem>,
+        cache: Arc<dyn mkvo_application::MetadataCache>,
+        seen: tokio::sync::Mutex<Vec<Vec<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl mkvo_application::FileSystem for CacheAtEachMove {
+        async fn exists(&self, path: &Path) -> Result<bool, PortError> {
+            self.inner.exists(path).await
+        }
+        async fn is_directory(&self, path: &Path) -> Result<bool, PortError> {
+            self.inner.is_directory(path).await
+        }
+        async fn fingerprint(&self, path: &Path) -> Result<FileFingerprint, PortError> {
+            self.inner.fingerprint(path).await
+        }
+        async fn move_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            let cached = self.cache.list_under(source.parent().unwrap()).await?;
+            let names = cached
+                .into_iter()
+                .map(|file| PathBuf::from(file.path.file_name().unwrap()))
+                .collect();
+            self.seen.lock().await.push(names);
+            self.inner.move_file(source, target).await
+        }
+        async fn remove_file(&self, path: &Path) -> Result<(), PortError> {
+            self.inner.remove_file(path).await
+        }
+        async fn probe_access(
+            &self,
+            path: &Path,
+            access: mkvo_application::RequiredAccess,
+        ) -> Result<mkvo_application::FileAccessState, PortError> {
+            self.inner.probe_access(path, access).await
+        }
+        async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            self.inner.replace_file(source, target).await
+        }
+        async fn list_files(&self, directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+            self.inner.list_files(directory).await
+        }
+    }
+
+    /// The watcher sees each move about a debounce later; the file's cache row
+    /// has to be under its new name by then or the file is probed again.
+    #[tokio::test]
+    async fn each_file_is_followed_as_soon_as_it_moves() {
+        let library = Library::with(&["a.mkv", "b.mkv"]).await;
+        let request = library
+            .plan(&[("a.mkv", "Pilot"), ("b.mkv", "Second")])
+            .await;
+        let dependencies = library.runtime.dependencies();
+        let file_system = Arc::new(CacheAtEachMove {
+            inner: dependencies.file_system.clone(),
+            cache: dependencies.cache.clone(),
+            seen: tokio::sync::Mutex::default(),
+        });
+        let mut dependencies = dependencies.clone();
+        dependencies.file_system = file_system.clone();
+        let runtime = MkvoRuntime::from_parts(library.runtime.config().clone(), dependencies);
+
+        runtime.apply_rename_preview(request).await.unwrap();
+        let batch = library.batches().await[0].id.to_string();
+        runtime.undo_rename_batch(&batch).await.unwrap();
+
+        let seen = file_system.seen.lock().await;
+        let names = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            seen[1],
+            names(&["Pilot.mkv", "b.mkv"]),
+            "second move of the apply"
+        );
+        assert_eq!(
+            seen[3],
+            names(&["Second.mkv", "a.mkv"]),
+            "second move of the undo"
+        );
     }
 
     /// Each renamed file used to be handed to mkvmerge again, one at a time.

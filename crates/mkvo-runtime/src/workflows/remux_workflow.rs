@@ -574,9 +574,8 @@ impl MkvoRuntime {
         let total = u64::try_from(runnable.len()).unwrap_or(u64::MAX);
         let workers = self
             .settings_service()
-            .load()
+            .load_settings()
             .await?
-            .settings
             .workers
             .max_remux_workers;
         let mut executions = stream::iter(runnable.into_iter().enumerate())

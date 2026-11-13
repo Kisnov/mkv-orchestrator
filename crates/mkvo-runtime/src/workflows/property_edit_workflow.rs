@@ -179,9 +179,8 @@ impl MkvoRuntime {
         let total = u64::try_from(runnable.len()).unwrap_or(u64::MAX);
         let workers = self
             .settings_service()
-            .load()
+            .load_settings()
             .await?
-            .settings
             .workers
             .max_edit_workers;
         let halted = &std::sync::atomic::AtomicBool::new(false);

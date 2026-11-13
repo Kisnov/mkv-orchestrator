@@ -12,10 +12,13 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use mkvo_application::{MediaEnumerationRequest, WatchChange, WatchChangeKind, WatchHealth};
-use mkvo_domain::AppSettings;
+use mkvo_application::{
+    MediaEnumerationRequest, WatchChange, WatchChangeKind, WatchHealth, path_contains,
+};
+use mkvo_domain::{AppSettings, path_key};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
@@ -62,7 +65,7 @@ impl MkvoRuntime {
     pub async fn start_watchers(&self) -> RuntimeResult<WatchStartReport> {
         // Every host calls this once at startup, whether or not it watches.
         self.spawn_history_pruning();
-        let settings = self.settings_service().load().await?.settings;
+        let settings = self.settings_service().load_settings().await?;
         let Some(watcher) = self.dependencies().watcher.clone() else {
             return Ok(WatchStartReport {
                 enabled: settings.watch.enabled,
@@ -160,12 +163,13 @@ impl MkvoRuntime {
         let dependencies = self.dependencies().clone();
         let mut roots = settings.watch.roots.clone();
         let mut ignored = settings.scan.ignored_folder_names.clone();
+        let mut debounce = Duration::from_millis(settings.watch.debounce_millis);
 
         tokio::spawn(async move {
             loop {
                 match changes.recv().await {
                     Ok(change) => {
-                        apply_change(&dependencies, &change, &roots, &ignored).await;
+                        apply_change(&dependencies, &change, &roots, &ignored, debounce).await;
                     }
                     // A lagged receiver means changes were lost, so the cache can
                     // no longer be trusted for these roots and must be rebuilt
@@ -184,6 +188,7 @@ impl MkvoRuntime {
                 if let Ok((loaded, _revision)) = dependencies.settings.load().await {
                     roots = loaded.watch.roots.clone();
                     ignored = loaded.scan.ignored_folder_names.clone();
+                    debounce = Duration::from_millis(loaded.watch.debounce_millis);
                 }
             }
         });
@@ -195,6 +200,7 @@ async fn apply_change(
     change: &WatchChange,
     roots: &[PathBuf],
     ignored: &BTreeSet<String>,
+    debounce: Duration,
 ) {
     tracing::debug!(
         kind = ?change.kind,
@@ -214,7 +220,7 @@ async fn apply_change(
         WatchChangeKind::Created | WatchChangeKind::Modified | WatchChangeKind::Renamed => {
             for path in &change.paths {
                 if path.exists() {
-                    refresh(dependencies, path, ignored).await;
+                    refresh(dependencies, path, ignored, debounce).await;
                 } else {
                     prune(dependencies, path).await;
                 }
@@ -247,8 +253,14 @@ async fn prune(dependencies: &RuntimeDependencies, path: &Path) {
 }
 
 /// Re-probe a single changed file and update its cache entry.
-async fn refresh(dependencies: &RuntimeDependencies, path: &Path, ignored: &BTreeSet<String>) {
-    if path.is_file() && !is_supported_media(path) {
+async fn refresh(
+    dependencies: &RuntimeDependencies,
+    path: &Path,
+    ignored: &BTreeSet<String>,
+    debounce: Duration,
+) {
+    let is_file = path.is_file();
+    if is_file && !is_supported_media(path) {
         return;
     }
     let cancel = CancellationToken::new();
@@ -269,7 +281,13 @@ async fn refresh(dependencies: &RuntimeDependencies, path: &Path, ignored: &BTre
         }
     };
 
+    // In a folder, a file written just now may still be copying; its own events report it.
+    let settled_before = chrono::Utc::now()
+        - chrono::TimeDelta::from_std(debounce).unwrap_or(chrono::TimeDelta::zero());
     for fingerprint in fingerprints {
+        if !is_file && fingerprint.modified_at > settled_before {
+            continue;
+        }
         match dependencies.cache.get_valid(&fingerprint).await {
             Ok(Some(_)) => continue,
             Ok(None) => {}
@@ -332,15 +350,31 @@ async fn reconcile_roots(
         }
     };
 
-    let present: BTreeSet<PathBuf> = fingerprints
+    let present: BTreeSet<String> = fingerprints
         .iter()
-        .map(|fingerprint| fingerprint.path.clone())
+        .map(|fingerprint| path_key(&fingerprint.path))
         .collect();
     for root in roots {
-        match dependencies.cache.list_under(root).await {
+        // Rows are keyed by the spelling the filesystem reports, not the one typed in settings.
+        let root = match tokio::fs::canonicalize(root).await {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(root = %root.display(), %error, "watch root could not be resolved");
+                continue;
+            }
+        };
+        // As in scans: a share that dropped looks empty, not deleted, so its rows stay.
+        if !fingerprints
+            .iter()
+            .any(|fingerprint| path_contains(&root, &fingerprint.path))
+        {
+            tracing::warn!(root = %root.display(), "watch root lists no media; nothing pruned");
+            continue;
+        }
+        match dependencies.cache.list_under(&root).await {
             Ok(cached) => {
                 for file in cached {
-                    if !present.contains(&file.path) {
+                    if !present.contains(&path_key(&file.path)) {
                         prune(dependencies, &file.path).await;
                     }
                 }
@@ -388,7 +422,192 @@ async fn reconcile_roots(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
+    use mkvo_application::{MediaProbe, PortError};
+    use mkvo_domain::{ContainerMetadata, FileFingerprint, MediaFile, MediaStatus};
+
     use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// Stands in for mkvmerge and counts how often it is asked.
+    #[derive(Default)]
+    struct CountingProbe(AtomicUsize);
+
+    #[async_trait]
+    impl MediaProbe for CountingProbe {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let metadata =
+                std::fs::metadata(path).map_err(|error| PortError::Other(error.to_string()))?;
+            Ok(MediaFile {
+                path: path.to_path_buf(),
+                original_file_name: None,
+                watch_root: None,
+                relative_path: None,
+                fingerprint: FileFingerprint {
+                    path: path.to_path_buf(),
+                    size_bytes: metadata.len(),
+                    modified_at: metadata.modified().expect("modified").into(),
+                    quick_hash: None,
+                },
+                container: ContainerMetadata::default(),
+                tracks: Vec::new(),
+                attachments: Vec::new(),
+                episode: None,
+                provider_match: None,
+                status: MediaStatus::Ready,
+            })
+        }
+    }
+
+    struct Library {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        runtime: MkvoRuntime,
+        probe: Arc<CountingProbe>,
+    }
+
+    /// A watch root holding `names`, each one cached.
+    async fn library(names: &[&str]) -> Library {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in names {
+            std::fs::write(root.join(name), name.as_bytes()).unwrap();
+        }
+        let built = MkvoRuntimeBuilder::new(&root, directory.path().join("config"))
+            .app_name("test")
+            .disable_legacy_migration()
+            .authorized_root(&root, true)
+            .build()
+            .unwrap();
+        let probe = Arc::new(CountingProbe::default());
+        let mut dependencies = built.dependencies().clone();
+        dependencies.probe = probe.clone();
+        let runtime = MkvoRuntime::from_parts(built.config().clone(), dependencies);
+        refresh(
+            runtime.dependencies(),
+            &root,
+            &BTreeSet::new(),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(probe.0.load(Ordering::SeqCst), names.len());
+        Library {
+            _directory: directory,
+            root,
+            runtime,
+            probe,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_prunes_deleted_files_without_probing_the_rest() {
+        let library = library(&["keep.mkv", "gone.mkv"]).await;
+        std::fs::remove_file(library.root.join("gone.mkv")).unwrap();
+
+        let dependencies = library.runtime.dependencies();
+        reconcile_roots(dependencies, &[library.root.clone()], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 1);
+        assert_eq!(library.probe.0.load(Ordering::SeqCst), 2);
+    }
+
+    /// A folder event must not probe a file still being copied into it; that
+    /// file's own events report it once it settles.
+    #[tokio::test]
+    async fn refreshing_a_folder_skips_files_written_within_the_debounce() {
+        let library = library(&[]).await;
+        let copying = library.root.join("copying.mkv");
+        std::fs::write(&copying, b"part").unwrap();
+        let dependencies = library.runtime.dependencies();
+        let debounce = std::time::Duration::from_secs(60);
+
+        refresh(dependencies, &library.root, &BTreeSet::new(), debounce).await;
+        assert_eq!(library.probe.0.load(Ordering::SeqCst), 0);
+
+        refresh(dependencies, &copying, &BTreeSet::new(), debounce).await;
+        assert_eq!(
+            library.probe.0.load(Ordering::SeqCst),
+            1,
+            "its own event still probes it"
+        );
+    }
+
+    /// A bind mount whose share dropped is an empty folder, not a deleted library.
+    #[tokio::test]
+    async fn reconciliation_keeps_the_rows_of_a_root_that_lists_nothing() {
+        let library = library(&["a.mkv", "b.mkv"]).await;
+        for name in ["a.mkv", "b.mkv"] {
+            std::fs::remove_file(library.root.join(name)).unwrap();
+        }
+
+        let dependencies = library.runtime.dependencies();
+        reconcile_roots(dependencies, &[library.root.clone()], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 2);
+    }
+
+    /// Settings keep the root as typed, but cache rows carry the spelling the
+    /// filesystem reports; reconciliation must still find the rows to prune.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconciliation_prunes_under_a_root_typed_in_another_case() {
+        let library = library(&["keep.mkv", "gone.mkv"]).await;
+        std::fs::remove_file(library.root.join("gone.mkv")).unwrap();
+        let typed = PathBuf::from(format!(
+            "{}\\",
+            mkvo_domain::normalized_path_text(&library.root).to_uppercase()
+        ));
+
+        let dependencies = library.runtime.dependencies();
+        reconcile_roots(dependencies, &[typed], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 1);
+        assert_eq!(
+            library.probe.0.load(Ordering::SeqCst),
+            2,
+            "keep.mkv is not probed again"
+        );
+    }
+
+    /// A row whose path is spelled differently from the enumeration, as one a
+    /// rename carried over is, is the same file and must not be pruned.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconciliation_keeps_a_row_spelled_differently() {
+        let library = library(&["keep.mkv"]).await;
+        let dependencies = library.runtime.dependencies();
+        let path = library.root.join("keep.mkv");
+        let mut file = dependencies
+            .probe
+            .inspect(&path, CancellationToken::new())
+            .await
+            .unwrap();
+        file.path = mkvo_domain::normalized_path(&path);
+        dependencies.cache.upsert(&file).await.unwrap();
+        let probed = library.probe.0.load(Ordering::SeqCst);
+
+        reconcile_roots(dependencies, &[library.root.clone()], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 1);
+        assert_eq!(
+            library.probe.0.load(Ordering::SeqCst),
+            probed,
+            "keep.mkv is not probed again"
+        );
+    }
 
     #[test]
     fn only_supported_media_extensions_refresh() {

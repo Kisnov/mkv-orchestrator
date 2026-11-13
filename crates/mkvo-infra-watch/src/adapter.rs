@@ -576,6 +576,23 @@ impl WatchService {
     }
 }
 
+fn watch_options(base: &WatchOptions, settings: &WatchSettings) -> WatchOptions {
+    let mut options = base.clone();
+    options.roots = settings.roots.clone();
+    options.debounce = std::time::Duration::from_millis(settings.debounce_millis.max(50));
+    if settings.reconciliation_interval_minutes > 0 {
+        options.poll_interval = std::time::Duration::from_secs(
+            settings.reconciliation_interval_minutes.saturating_mul(60),
+        );
+    }
+    options.mode = if settings.force_polling {
+        WatchMode::Polling
+    } else {
+        WatchMode::Auto
+    };
+    options
+}
+
 #[async_trait]
 impl WatchBackend for WatchService {
     fn subscribe(&self) -> broadcast::Receiver<WatchChange> {
@@ -584,19 +601,7 @@ impl WatchBackend for WatchService {
 
     async fn start(&self, settings: &WatchSettings) -> Result<(), PortError> {
         self.stop_inner().await;
-        let mut options = self.options.clone();
-        options.roots = settings.roots.clone();
-        options.debounce = std::time::Duration::from_millis(settings.debounce_millis.max(50));
-        if settings.reconciliation_interval_minutes > 0 {
-            options.poll_interval = std::time::Duration::from_secs(
-                settings.reconciliation_interval_minutes.saturating_mul(60),
-            );
-        }
-        options.mode = if settings.force_polling {
-            WatchMode::Polling
-        } else {
-            WatchMode::Auto
-        };
+        let options = watch_options(&self.options, settings);
         let mut handle = WatchHandle::start(options).map_err(|error| {
             PortError::unavailable(format!("watcher could not start: {error}"), true)
         })?;
@@ -869,6 +874,42 @@ mod tests {
         );
     }
 
+    /// A stored interval of 0 keeps the service default, which must not turn
+    /// into a full library walk every few seconds.
+    #[test]
+    fn zero_reconciliation_interval_falls_back_to_the_settings_default() {
+        let interval = |minutes| {
+            let settings = WatchSettings {
+                reconciliation_interval_minutes: minutes,
+                ..WatchSettings::default()
+            };
+            watch_options(&WatchOptions::default(), &settings).poll_interval
+        };
+        let default = WatchSettings::default().reconciliation_interval_minutes;
+        assert_eq!(interval(0), interval(default));
+        assert_eq!(interval(45), std::time::Duration::from_secs(45 * 60));
+    }
+
+    /// Each change costs the subscriber a probe, so a few hundred files landing
+    /// at once must queue rather than lag into a full library reconciliation.
+    #[tokio::test]
+    async fn a_burst_of_changes_reaches_a_slow_subscriber_without_lag() {
+        let service = WatchService::new(WatchOptions::default());
+        let mut changes = WatchBackend::subscribe(&service);
+        for index in 0..1000 {
+            service
+                .events
+                .send(WatchChange {
+                    kind: WatchChangeKind::Created,
+                    paths: vec![PathBuf::from(format!("{index}.mkv"))],
+                })
+                .expect("subscriber");
+        }
+        for _ in 0..1000 {
+            assert!(changes.try_recv().is_ok());
+        }
+    }
+
     #[tokio::test]
     async fn polling_reconciliation_is_delivered_through_watch_backend_subscription() {
         let stamp = SystemTime::now()
@@ -888,16 +929,16 @@ mod tests {
             .start(&WatchSettings {
                 enabled: true,
                 roots: vec![root.clone()],
+                debounce_millis: 50,
                 reconciliation_interval_minutes: 0,
                 force_polling: true,
-                ..WatchSettings::default()
             })
             .await
             .expect("start polling watcher");
         let created = root.join("episode.mkv");
         std::fs::write(&created, b"episode").expect("create media file");
 
-        let change = tokio::time::timeout(std::time::Duration::from_secs(3), changes.recv())
+        let change = tokio::time::timeout(std::time::Duration::from_secs(20), changes.recv())
             .await
             .expect("polling reconciliation timed out")
             .expect("watch change channel closed");

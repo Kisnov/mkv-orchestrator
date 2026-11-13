@@ -893,10 +893,13 @@ fn volume_listing() -> FileSystemResponse {
 
 /// The shares a server publishes, presented as an ordinary folder listing so
 /// the browser can navigate into one without knowing it came from elsewhere.
-fn server_listing(server: &str) -> RuntimeResult<FileSystemResponse> {
-    let shares = list_server_shares(server).map_err(|error| {
-        RuntimeError::invalid(format!(r"cannot list the shares of \\{server}: {error}"))
-    })?;
+async fn server_listing(server: &str) -> RuntimeResult<FileSystemResponse> {
+    let shares = list_shares_within(
+        server,
+        std::time::Duration::from_secs(15),
+        list_server_shares,
+    )
+    .await?;
 
     Ok(FileSystemResponse {
         path: format!(r"\\{server}"),
@@ -915,6 +918,47 @@ fn server_listing(server: &str) -> RuntimeResult<FileSystemResponse> {
             })
             .collect(),
     })
+}
+
+/// `NetShareEnum` blocks, with no timeout of its own, while an unreachable server is tried.
+async fn list_shares_within(
+    server: &str,
+    bound: std::time::Duration,
+    list: fn(&str) -> std::io::Result<Vec<mkvo_infra_netshare::Share>>,
+) -> RuntimeResult<Vec<mkvo_infra_netshare::Share>> {
+    let owned = server.to_owned();
+    match tokio::time::timeout(bound, tokio::task::spawn_blocking(move || list(&owned))).await {
+        Ok(Ok(Ok(shares))) => Ok(shares),
+        Ok(Ok(Err(error))) => Err(RuntimeError::invalid(format!(
+            r"cannot list the shares of \\{server}: {error}"
+        ))),
+        Ok(Err(error)) => Err(RuntimeError::internal(format!(
+            "share listing task failed: {error}"
+        ))),
+        Err(_) => Err(RuntimeError::invalid(format!(
+            r"\\{server} did not list its shares within {} s",
+            bound.as_secs()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod share_listing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_times_out() {
+        let error = list_shares_within("nas", std::time::Duration::from_millis(50), |_| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(Vec::new())
+        })
+        .await
+        .expect_err("timed out");
+        assert!(
+            error.to_string().contains("did not list its shares"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]

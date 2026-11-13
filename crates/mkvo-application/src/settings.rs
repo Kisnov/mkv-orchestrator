@@ -39,6 +39,11 @@ impl SettingsService {
         })
     }
 
+    /// The settings without the secret statuses, which cost a keyring read each.
+    pub async fn load_settings(&self) -> ApplicationResult<AppSettings> {
+        Ok(self.repository.load().await?.0)
+    }
+
     pub async fn save(&self, request: SaveSettingsRequest) -> ApplicationResult<SettingsResponse> {
         let _save = self.save_lock.lock().await;
         let (old_settings, old_revision) = self.repository.load().await?;
@@ -311,6 +316,31 @@ mod tests {
             self.0.write().await.remove(key);
             Ok(())
         }
+    }
+
+    /// Keyring reads can block or prompt, so callers that only need settings
+    /// must not pay for the secret statuses.
+    #[tokio::test]
+    async fn loading_settings_alone_reads_no_secrets() {
+        struct NoSecrets;
+        #[async_trait]
+        impl SecretStore for NoSecrets {
+            async fn get(&self, key: &str) -> Result<Option<String>, PortError> {
+                panic!("secret {key} was read");
+            }
+            async fn set(&self, _key: &str, _value: &str) -> Result<(), PortError> {
+                unreachable!()
+            }
+            async fn remove(&self, _key: &str) -> Result<(), PortError> {
+                unreachable!()
+            }
+        }
+        let repository = Arc::new(Repository(RwLock::new((AppSettings::default(), 1))));
+        let service = SettingsService::new(repository, Arc::new(NoSecrets), None);
+        assert_eq!(
+            service.load_settings().await.unwrap(),
+            AppSettings::default()
+        );
     }
 
     #[tokio::test]
