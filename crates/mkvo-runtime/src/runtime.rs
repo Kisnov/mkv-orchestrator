@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -74,6 +75,9 @@ struct RuntimeInner {
     media_server_http: MediaServerDiscoveryClient,
     media_server_rejections:
         RwLock<HashMap<MediaServerId, media_server_facade::CredentialRejection>>,
+    /// Bumped when a media server accepts a credential, so a refusal from a
+    /// request that started earlier is not remembered.
+    media_server_acceptances: AtomicU64,
 }
 
 /// HTTP clients for the metadata providers, built once per runtime.
@@ -242,6 +246,7 @@ impl MkvoRuntime {
                 legacy_rename_history,
                 media_server_http: MediaServerDiscoveryClient::new(),
                 media_server_rejections: RwLock::new(HashMap::new()),
+                media_server_acceptances: AtomicU64::new(0),
             }),
         }
     }
