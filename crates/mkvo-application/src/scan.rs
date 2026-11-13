@@ -17,6 +17,7 @@ use crate::{
 };
 
 const MEDIA_CACHE_RETENTION_DAYS: i64 = 7;
+const MEDIA_CACHE_UNSCANNED_RETENTION_DAYS: i64 = 90;
 const CACHE_BATCH: usize = 200;
 const CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -206,6 +207,9 @@ impl ScanService {
                 self.cache.remove_unseen_under(root, cutoff).await?;
             }
         }
+        // Folders that are never scanned again would otherwise keep their entries.
+        let unscanned = Utc::now() - TimeDelta::days(MEDIA_CACHE_UNSCANNED_RETENTION_DAYS);
+        self.cache.remove_older_than(unscanned).await?;
         outcome
             .files
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -751,6 +755,28 @@ mod tests {
         scan("lib", &["lib/one.mkv"], &cache, &probe).await;
         assert!(!cache.contains("lib/gone.mkv").await);
         assert!(cache.contains("lib/unreachable-today.mkv").await);
+    }
+
+    #[tokio::test]
+    async fn entries_of_a_folder_never_scanned_again_are_dropped_eventually() {
+        let cache = Arc::new(Cache::default());
+        let probe = Arc::new(Probe::default());
+        cache
+            .seed(
+                "work/job-1/a.mkv",
+                days_ago(MEDIA_CACHE_UNSCANNED_RETENTION_DAYS + 1),
+            )
+            .await;
+        cache
+            .seed(
+                "work/job-2/a.mkv",
+                days_ago(MEDIA_CACHE_UNSCANNED_RETENTION_DAYS - 1),
+            )
+            .await;
+
+        scan("lib", &["lib/one.mkv"], &cache, &probe).await;
+        assert!(!cache.contains("work/job-1/a.mkv").await);
+        assert!(cache.contains("work/job-2/a.mkv").await);
     }
 
     #[tokio::test]
