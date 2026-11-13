@@ -772,6 +772,28 @@ describe("Settings autosave", () => {
   });
 });
 
+describe("Settings rendering", () => {
+  /// The custom themes were read and parsed from localStorage on every render,
+  /// that is on every keystroke in any field.
+  it("does not read localStorage while typing", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings: vi.fn().mockResolvedValue(settings())
+    });
+    await user.click(await screen.findByRole("button", { name: /^appearance$/i }));
+    const name = await screen.findByLabelText("Custom Theme Name");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    try {
+      await user.type(name, " two");
+      expect(getItem).not.toHaveBeenCalled();
+    } finally {
+      getItem.mockRestore();
+    }
+  });
+});
+
 describe("Settings media server saves", () => {
   /// The reload after a save blanked the key field, so a key still being
   /// typed was cut off at whatever the first save had sent.

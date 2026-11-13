@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -37,7 +37,7 @@ import ffmpegLogo from "../assets/logos/ffmpeg.png";
 import mkvtoolnixLogo from "../assets/logos/mkvtoolnix.png";
 import tmdbLogo from "../assets/logos/tmdb.png";
 import tvdbLogo from "../assets/logos/tvdb.png";
-import { applyWebTheme, getAllWebThemes, getStoredWebThemeName, getWebTheme, loadCustomWebThemes, normalizeWebTheme, removeCustomWebTheme, replaceCustomWebThemes, saveCustomWebTheme, webThemes } from "../theme";
+import { applyWebTheme, getAllWebThemes, getStoredWebThemeName, getWebTheme, normalizeWebTheme, removeCustomWebTheme, replaceCustomWebThemes, saveCustomWebTheme, webThemes } from "../theme";
 
 const settingsTabStorageKey = "mkvo.web.settingsTab";
 const defaultRenameTemplate = "{series} - S{season:00}E{episode:00} - {episodeTitle}";
@@ -142,7 +142,8 @@ export function SettingsPage() {
   const webSettings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
-  const activeTab: SettingsTabId = requestedTab && isSettingsTab(requestedTab) ? requestedTab : readStoredSettingsTab();
+  const [storedTab] = useState(readStoredSettingsTab);
+  const activeTab: SettingsTabId = requestedTab && isSettingsTab(requestedTab) ? requestedTab : storedTab;
   function setActiveTab(tab: SettingsTabId) {
     setSearchParams((current) => { const next = new URLSearchParams(current); next.set("tab", tab); return next; });
   }
@@ -194,6 +195,10 @@ export function SettingsPage() {
   const [themeName, setThemeName] = useState(() => getStoredWebThemeName());
   const [themeJson, setThemeJson] = useState(() => JSON.stringify(getWebTheme(getStoredWebThemeName()), null, 2));
   const [selectedThemeColor, setSelectedThemeColor] = useState<ThemeColorName>("AppTitle");
+  const currentThemeColors = useMemo(
+    () => normalizeWebTheme(availableThemes.find((theme) => theme.name === themeName) ?? webThemes[0]).colors,
+    [availableThemes, themeName]
+  );
   const [customThemeName, setCustomThemeName] = useState("My Theme");
   const [settingsStatus, setSettingsStatus] = useState("");
   const [statusPopupVisible, setStatusPopupVisible] = useState(false);
@@ -278,7 +283,7 @@ export function SettingsPage() {
     watchFolders: normalizeLineList(watchFoldersText),
     enableLiveWatchFolderMonitoring: liveWatcherEnabled,
     selectedThemeName: themeName,
-    customThemes: loadCustomWebThemes(),
+    customThemes: availableThemes.filter((theme) => !webThemes.includes(theme)),
     mediaServers: mediaServers.map((server) => ({
       id: server.id,
       name: server.name,
@@ -1180,7 +1185,7 @@ export function SettingsPage() {
                     <ThemeColorSelect
                       value={selectedThemeColor}
                       onChange={setSelectedThemeColor}
-                      colorFor={(name) => themeColorValue(themeJson, name, getWebTheme(themeName).colors[name] ?? "#000000")}
+                      colorFor={(name) => themeColorValue(themeJson, name, currentThemeColors[name] ?? "#000000")}
                     />
                   </label>
                   <ThemeColorField
@@ -1188,7 +1193,7 @@ export function SettingsPage() {
                     value={themeColorValue(
                       themeJson,
                       selectedThemeColor,
-                      getWebTheme(themeName).colors[selectedThemeColor] ?? "#000000"
+                      currentThemeColors[selectedThemeColor] ?? "#000000"
                     )}
                     onChange={(color) => {
                       const option = themeColorOptions.find((candidate) => candidate.name === selectedThemeColor);
