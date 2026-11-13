@@ -64,12 +64,20 @@ above the sidebar status panel, with header access at narrow browser widths.
 
 ### Failed sign-ins
 
-After 5 failed attempts in a row, sign-in is locked for 30 seconds for every
-client, doubling with each further failure up to 15 minutes (`429` with
-`Retry-After`). A successful sign-in or an hour without failures resets it.
-The lock is global on purpose: a per-address limit is defeated by changing
-address. The cost is that someone guessing can also keep you out for a while;
-wait for the lock to expire, or restart the container to clear it.
+After 5 failed attempts in a row, sign-in is locked for 30 seconds, doubling
+with each further failure up to 15 minutes (`429` with `Retry-After`). A
+successful sign-in or an hour without failures resets it. There are two locks:
+
+- one shared by every remote client, because a per-address limit is defeated
+  by changing address;
+- one for clients connecting directly from a private or loopback address
+  without any `Forwarded`/`X-Forwarded-*`/`X-Real-IP` header, so guessing from
+  outside cannot keep you out when you sign in from your LAN.
+
+Two limits to know: a reverse proxy, port forward or Docker setup that hides
+the real client address makes every visitor look like a LAN client, so they
+all share the LAN lock; and someone on your LAN can still lock you out of it
+for a while. Wait for the lock to expire, or restart the container to clear it.
 
 ## Sessions and preferences
 

@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_failed_sign_ins_lock_the_login_for_everyone() {
+    async fn repeated_failed_sign_ins_lock_remote_clients_but_not_the_lan() {
         let host = TestHost::new(Some(BasicAuth {
             username: "admin".to_owned(),
             password: "correct-password".to_owned(),
@@ -472,6 +472,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "30");
         assert!(!response.headers().contains_key(header::SET_COOKIE));
+
+        // The owner on the LAN has a lock of their own, so outside guessing cannot keep them out.
+        let from = |peer: &str, forwarded: bool| {
+            let mut request = login_request("correct-password");
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<SocketAddr>().unwrap(),
+            ));
+            if forwarded {
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-for", "192.168.1.2".parse().unwrap());
+            }
+            request
+        };
+        for (peer, forwarded, expected) in [
+            ("8.8.8.8:1234", false, StatusCode::TOO_MANY_REQUESTS),
+            ("192.168.1.2:1234", true, StatusCode::TOO_MANY_REQUESTS),
+            ("192.168.1.2:1234", false, StatusCode::OK),
+        ] {
+            let response = router.clone().oneshot(from(peer, forwarded)).await.unwrap();
+            assert_eq!(response.status(), expected, "{peer} {forwarded}");
+        }
     }
 
     #[tokio::test]

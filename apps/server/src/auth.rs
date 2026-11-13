@@ -135,8 +135,14 @@ async fn auth_login(
             "Username and password are required.",
         );
     };
+    // Direct LAN peers get their own lock so guessing from outside cannot keep the owner out.
     // Held through the check so concurrent guesses cannot slip past the lock.
-    let mut throttle = auth.throttle.lock().await;
+    let peer = direct_peer(&headers, peer.map(|info| info.0.0));
+    let mut throttle = if peer.is_some_and(|peer| is_local(peer.ip())) {
+        auth.local_throttle.lock().await
+    } else {
+        auth.throttle.lock().await
+    };
     if let Some(wait) = throttle.retry_after(Instant::now()) {
         let mut response = error(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -165,7 +171,7 @@ async fn auth_login(
         [(header::SET_COOKIE, cookie)],
         Json(status(
             &auth,
-            direct_peer(&headers, peer.map(|info| info.0.0)),
+            peer,
             headers
                 .get(header::HOST)
                 .and_then(|value| value.to_str().ok()),
@@ -334,6 +340,7 @@ pub struct AuthState {
     credential: Option<Arc<RwLock<Credential>>>,
     data_dir: Option<PathBuf>,
     throttle: Arc<tokio::sync::Mutex<Throttle>>,
+    local_throttle: Arc<tokio::sync::Mutex<Throttle>>,
     allowed_hosts: Arc<[String]>,
     sessions: Arc<RwLock<HashMap<String, Instant>>>,
     secure_cookie: bool,
@@ -419,6 +426,7 @@ impl AuthState {
             credential: Some(Arc::new(RwLock::new(credential))),
             data_dir: Some(data_dir.to_owned()),
             throttle: Arc::default(),
+            local_throttle: Arc::default(),
             allowed_hosts: Arc::from([]),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie,
@@ -436,6 +444,7 @@ impl AuthState {
                 .then(|| Arc::new(RwLock::new(Credential::Configured(password.to_owned())))),
             data_dir: None,
             throttle: Arc::default(),
+            local_throttle: Arc::default(),
             allowed_hosts: Arc::from([]),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie: false,
@@ -653,7 +662,7 @@ enum Credential {
     Hashed(String),
 }
 
-/// One lock for every client, so rotating addresses gains nothing.
+/// One lock for every remote client, so rotating addresses gains nothing.
 #[derive(Default)]
 struct Throttle {
     failures: u32,
