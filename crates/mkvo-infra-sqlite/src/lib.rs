@@ -24,7 +24,7 @@ pub use legacy::{
     read_legacy_rename_history,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -39,6 +39,10 @@ pub enum StoreError {
     NumericOverflow,
     #[error("settings revision conflict: expected {expected:?}, actual {actual}")]
     RevisionConflict { expected: Option<u64>, actual: u64 },
+    #[error(
+        "the database was written by a newer version (schema {found}, this version reads up to {supported})"
+    )]
+    NewerSchema { found: u32, supported: u32 },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -189,6 +193,12 @@ fn configure_connection(connection: &Connection, busy_timeout: Duration) -> Stor
 
 fn migrate(connection: &mut Connection) -> StoreResult<()> {
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::NewerSchema {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
     if current < 1 {
         let transaction = connection.transaction()?;
         migration_v1(&transaction)?;
@@ -198,6 +208,12 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
     if current < 2 {
         let transaction = connection.transaction()?;
         migration_v2(&transaction)?;
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+    }
+    if current < 3 {
+        let transaction = connection.transaction()?;
+        migration_v3(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     }
@@ -320,6 +336,15 @@ fn migration_v2(transaction: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
+/// A payload per rename entry, so a move adds a row instead of rewriting its batch.
+fn migration_v3(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        "ALTER TABLE rename_entries ADD COLUMN payload_json TEXT
+            CHECK(payload_json IS NULL OR json_valid(payload_json));",
+    )?;
+    Ok(())
+}
+
 fn load_rename_entries(
     connection: &Connection,
     batch_id: &str,
@@ -398,6 +423,29 @@ mod tests {
         assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         assert_eq!(store.journal_mode().expect("journal mode"), "wal");
         assert!(store.integrity_check().expect("integrity"));
+    }
+
+    /// An older build would read what a newer one stored as if it understood it.
+    #[test]
+    fn a_database_from_a_newer_build_is_refused() {
+        let database = TestDatabase::new("newer");
+        let store = SqliteStore::open(&database.0).expect("open store");
+        store
+            .connection()
+            .expect("connection")
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("version");
+        drop(store);
+
+        let reopened = SqliteStore::open(&database.0);
+        assert!(
+            matches!(
+                reopened,
+                Err(StoreError::NewerSchema { found, supported })
+                    if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
+            ),
+            "{reopened:?}"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use mkvo_domain::{
 
 use super::rename_presentation::{
     file_name, redacted_remux_command, remux_description, remux_mode_label, remux_tool_name,
-    rename_episode_number, same_path,
+    rename_episode_number,
 };
 use crate::compat::{MuxPreviewResponse, PropEditPreviewResponse, RenamePreviewResponse};
 use crate::runtime::display_path;
@@ -30,7 +30,7 @@ pub(super) fn rename_preview_response(
                 .and_then(|file| file.episode.as_ref());
             let (detected, episode_name) =
                 rename_episode_details(&file_name(&item.source), episode);
-            let no_change = same_path(&item.source, &item.target);
+            let no_change = item.source == item.target;
             let status = item
                 .conflicts
                 .first()
@@ -298,11 +298,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn applied_rename_rows_present_the_target_as_the_current_file() {
+    fn rename_plan(old_name: &str, new_name: &str) -> (mkvo_domain::RenamePlan, PathBuf) {
         let created_at = Utc::now();
-        let source = PathBuf::from(r"C:\media\old-name.mkv");
-        let target = PathBuf::from(r"C:\media\new-name.mkv");
+        let source = PathBuf::from("media").join(old_name);
+        let target = PathBuf::from("media").join(new_name);
         let payload = RenamePlanPayload {
             template: "{title}".to_owned(),
             provider: None,
@@ -315,8 +314,9 @@ mod tests {
                     modified_at: created_at,
                     quick_hash: None,
                 },
-                new_file_name: "new-name.mkv".to_owned(),
+                new_file_name: new_name.to_owned(),
                 conflicts: Vec::new(),
+                sidecars: Vec::new(),
             }],
         };
         let plan = OperationPlan::new(
@@ -329,12 +329,28 @@ mod tests {
             IdempotencyKey::generate(),
         )
         .expect("valid rename plan");
+        (plan, target)
+    }
+
+    /// On Windows the two spellings are one path, but the row is still a rename.
+    #[test]
+    fn a_rename_that_only_changes_case_is_not_shown_as_no_change() {
+        let (plan, _) = rename_plan("ep.mkv", "Ep.mkv");
+        let key = plan.metadata.idempotency_key.clone();
+        let response = super::rename_preview_response(&plan, Vec::new(), key, &[]);
+        assert_eq!(response.items[0].status, "Ready");
+        assert!(response.items[0].can_apply);
+    }
+
+    #[test]
+    fn applied_rename_rows_present_the_target_as_the_current_file() {
+        let (plan, target) = rename_plan("old-name.mkv", "new-name.mkv");
 
         let response = rename_apply_response(&plan, false);
         let row = &response.items[0];
 
         assert_eq!(row.current_file_name, "new-name.mkv");
-        assert!(row.source_path.ends_with(r"media\new-name.mkv"));
+        assert_eq!(row.source_path, crate::runtime::display_path(&target));
         assert!(!row.selected);
         assert_eq!(row.status, "Renamed");
     }

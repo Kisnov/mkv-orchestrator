@@ -9,24 +9,12 @@
 
 use std::path::Path;
 
-/// Comparison key for a path: separators unified, case folded, and the Windows
-/// extended-length prefix removed.
+/// The comparison key every crate shares; see [`mkvo_domain::path_key`].
 ///
 /// This is a *textual* key for comparing paths that are already trusted or
 /// already resolved. It is not an authorization decision — that stays with the
 /// `AuthorizedRoots` service, which resolves symlinks.
-#[must_use]
-pub fn path_key(path: &Path) -> String {
-    let value = path.to_string_lossy().replace('\\', "/");
-    let value = value
-        .strip_prefix("//?/UNC/")
-        .map_or_else(
-            || value.strip_prefix("//?/").map(ToOwned::to_owned),
-            |rest| Some(format!("//{rest}")),
-        )
-        .unwrap_or(value);
-    value.to_lowercase()
-}
+pub use mkvo_domain::path_key;
 
 /// True when `child` is `root` itself or sits underneath it.
 ///
@@ -85,11 +73,20 @@ mod tests {
     }
 
     #[test]
-    fn separator_and_case_differences_are_ignored() {
+    fn separator_differences_are_ignored() {
         assert!(path_contains(
-            Path::new(r"C:\Media"),
-            Path::new("c:/media/Show/ep1.mkv")
+            Path::new(r"C:\media"),
+            Path::new("C:/media/Show/ep1.mkv")
         ));
+    }
+
+    /// A root that differs only by case is another directory on Linux.
+    #[test]
+    fn case_differences_are_ignored_only_where_the_filesystem_ignores_them() {
+        assert_eq!(
+            path_contains(Path::new("/Media"), Path::new("/media/Show/ep1.mkv")),
+            cfg!(any(windows, target_os = "macos"))
+        );
     }
 
     #[test]

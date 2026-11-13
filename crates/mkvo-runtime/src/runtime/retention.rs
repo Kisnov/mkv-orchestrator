@@ -203,6 +203,7 @@ mod tests {
                     original_path: original,
                     renamed_path: renamed,
                     renamed_fingerprint: None,
+                    sidecars: Vec::new(),
                 }],
             };
             dependencies.rename_history.add(&batch).await.unwrap();

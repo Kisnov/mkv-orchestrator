@@ -8,8 +8,8 @@ use mkvo_contracts::{
 };
 use mkvo_domain::{
     AppSettings, EpisodeMetadata, FileFingerprint, IdempotencyKey, MediaFile, MediaServerKind,
-    MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchId,
-    RenameBatchRecord, ResourceClaim, StoredPlan, WatchSettings,
+    MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchEntry,
+    RenameBatchId, RenameBatchRecord, ResourceClaim, StoredPlan, WatchSettings,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -123,6 +123,12 @@ pub trait FileSystem: Send + Sync {
     /// Put `source` in place of the existing `target` with a single rename,
     /// once `source` is safely on disk.
     async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError>;
+
+    /// The files directly inside `directory`. A file system that cannot list
+    /// reports none, and a rename then moves no sidecars.
+    async fn list_files(&self, _directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -235,6 +241,8 @@ pub trait JobRepository: Send + Sync {
 #[async_trait]
 pub trait RenameHistoryRepository: Send + Sync {
     async fn add(&self, record: &RenameBatchRecord) -> Result<(), PortError>;
+    /// Add one more moved file to a batch already stored with `add`.
+    async fn append(&self, id: RenameBatchId, entry: &RenameBatchEntry) -> Result<(), PortError>;
     async fn get(&self, id: RenameBatchId) -> Result<Option<RenameBatchRecord>, PortError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<RenameBatchRecord>, PortError>;
     async fn mark_undone(&self, id: RenameBatchId, at: DateTime<Utc>) -> Result<(), PortError>;

@@ -288,24 +288,36 @@ impl FileSystem for LocalFileSystem {
             .authorize_existing(source, AccessMode::Write)
             .map_err(path_port_error)?
             .into_path_buf();
-        let target = self
-            .authorized_roots
-            .authorize_candidate(target, AccessMode::Write)
-            .map_err(path_port_error)?
-            .into_path_buf();
-        if target.exists() {
+        // Resolving the target itself would return the spelling already on disk and undo a case-only rename.
+        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
             return Err(PortError::Conflict(format!(
-                "target already exists: `{}`",
+                "target is not a file path: `{}`",
                 target.display()
             )));
-        }
-        tokio::fs::rename(&source, &target).await.map_err(|error| {
-            PortError::Other(format!(
-                "could not move `{}` to `{}`: {error}",
-                source.display(),
-                target.display()
-            ))
-        })
+        };
+        let target = self
+            .authorized_roots
+            .authorize_existing(parent, AccessMode::Write)
+            .map_err(path_port_error)?
+            .into_path_buf()
+            .join(name);
+        let moved = {
+            let (source, target) = (source.clone(), target.clone());
+            tokio::task::spawn_blocking(move || move_without_replacing(&source, &target))
+        };
+        moved
+            .await
+            .map_err(|error| PortError::Other(format!("move task failed: {error}")))?
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    PortError::Conflict(format!("target already exists: `{}`", target.display()))
+                }
+                _ => PortError::Other(format!(
+                    "could not move `{}` to `{}`: {error}",
+                    source.display(),
+                    target.display()
+                )),
+            })
     }
 
     async fn remove_file(&self, path: &Path) -> Result<(), PortError> {
@@ -352,6 +364,91 @@ impl FileSystem for LocalFileSystem {
                 source.display()
             ))
         })
+    }
+
+    async fn list_files(&self, directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+        let directory = self
+            .authorized_roots
+            .authorize_existing(directory, AccessMode::Read)
+            .map_err(path_port_error)?
+            .into_path_buf();
+        let listed = {
+            let directory = directory.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut files = Vec::new();
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        files.push(entry.path());
+                    }
+                }
+                Ok::<_, std::io::Error>(files)
+            })
+        };
+        listed
+            .await
+            .map_err(|error| PortError::Other(format!("directory listing task failed: {error}")))?
+            .map_err(|error| {
+                PortError::Other(format!("could not list `{}`: {error}", directory.display()))
+            })
+    }
+}
+
+/// Move `source` to `target`, failing if another file is already there.
+fn move_without_replacing(source: &Path, target: &Path) -> std::io::Result<()> {
+    move_linking_with(
+        |source, target| std::fs::hard_link(source, target),
+        source,
+        target,
+    )
+}
+
+/// `link` is `hard_link`, the one call in std that fails on an existing target
+/// instead of replacing it.
+fn move_linking_with(
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    source: &Path,
+    target: &Path,
+) -> std::io::Result<()> {
+    // Held so that a source nobody lets us delete fails here, before it has two names.
+    #[cfg(windows)]
+    let _deletable = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .open(source)?
+    };
+    match link(source, target) {
+        Ok(()) => std::fs::remove_file(source).inspect_err(|_| {
+            let _ = std::fs::remove_file(target);
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            respell(source, target, error)
+        }
+        Err(_) => rename_if_absent(source, target),
+    }
+}
+
+/// Check, then rename: only for filesystems without hard links, because a file
+/// created between the two calls would be replaced.
+fn rename_if_absent(source: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => respell(source, target, std::io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(source, target)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `target` exists. Where case is ignored it may be `source` itself under the
+/// new spelling, and then one rename respells it; any other file is `taken`.
+fn respell(source: &Path, target: &Path, taken: std::io::Error) -> std::io::Result<()> {
+    if same_file::is_same_file(source, target)? {
+        std::fs::rename(source, target)
+    } else {
+        Err(taken)
     }
 }
 
@@ -975,5 +1072,252 @@ mod access_probe_tests {
             "the file is usable again once the other handle closes"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    fn library(name: &str) -> (PathBuf, LocalFileSystem) {
+        let path = std::env::temp_dir().join(format!(
+            "mkvo-move-{}-{name}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        let path = std::fs::canonicalize(path).expect("canonical dir");
+        let roots = AuthorizedRoots::new([crate::AuthorizedRoot::new(&path, true).expect("root")])
+            .expect("roots");
+        (path, LocalFileSystem::new(roots, false))
+    }
+
+    fn names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(directory)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_move_never_replaces_a_file_that_is_already_there() {
+        let (directory, file_system) = library("existing");
+        std::fs::write(directory.join("a.mkv"), b"moved").expect("source");
+        std::fs::write(directory.join("b.mkv"), b"kept").expect("target");
+
+        let moved = file_system
+            .move_file(&directory.join("a.mkv"), &directory.join("b.mkv"))
+            .await;
+
+        assert!(matches!(moved, Err(PortError::Conflict(_))), "{moved:?}");
+        assert_eq!(
+            std::fs::read(directory.join("a.mkv")).expect("source"),
+            b"moved"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("b.mkv")).expect("target"),
+            b"kept"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// On Windows, macOS and case-insensitive shares the new spelling already
+    /// "exists": it is the file being renamed.
+    #[tokio::test]
+    async fn a_rename_that_only_changes_case_reaches_the_disk() {
+        let (directory, file_system) = library("case");
+        std::fs::write(directory.join("ep.mkv"), b"episode").expect("source");
+
+        file_system
+            .move_file(&directory.join("ep.mkv"), &directory.join("Ep.mkv"))
+            .await
+            .expect("case-only rename");
+
+        assert_eq!(names(&directory), ["Ep.mkv"]);
+        assert_eq!(
+            std::fs::read(directory.join("Ep.mkv")).expect("moved"),
+            b"episode"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The rename used to go through `<target>.mkvo-rename.tmp`, where a file
+    /// could be stranded, and which this one found taken.
+    #[tokio::test]
+    async fn a_case_only_rename_goes_through_no_other_name() {
+        let (directory, file_system) = library("case-direct");
+        std::fs::write(directory.join("ep.mkv"), b"episode").expect("source");
+        std::fs::write(directory.join(".Ep.mkv.mkvo-rename.tmp"), b"other").expect("other");
+        std::fs::write(directory.join("Ep.mkv.mkvo-rename.tmp"), b"other").expect("other");
+
+        file_system
+            .move_file(&directory.join("ep.mkv"), &directory.join("Ep.mkv"))
+            .await
+            .expect("case-only rename");
+
+        assert_eq!(
+            names(&directory),
+            [
+                ".Ep.mkv.mkvo-rename.tmp",
+                "Ep.mkv",
+                "Ep.mkv.mkvo-rename.tmp"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Where case matters the other spelling can be another file, and it stays.
+    #[tokio::test]
+    async fn a_case_only_rename_does_not_replace_a_different_file() {
+        let (directory, file_system) = library("case-taken");
+        std::fs::write(directory.join("ep.mkv"), b"moved").expect("source");
+        if directory.join("EP.MKV").exists() {
+            // This filesystem ignores case, so the two cannot coexist.
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+        std::fs::write(directory.join("Ep.mkv"), b"kept").expect("target");
+
+        let moved = file_system
+            .move_file(&directory.join("ep.mkv"), &directory.join("Ep.mkv"))
+            .await;
+
+        assert!(matches!(moved, Err(PortError::Conflict(_))), "{moved:?}");
+        assert_eq!(names(&directory), ["Ep.mkv", "ep.mkv"]);
+        assert_eq!(
+            std::fs::read(directory.join("ep.mkv")).expect("source"),
+            b"moved"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("Ep.mkv")).expect("target"),
+            b"kept"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// What happens where hard links do not exist (exFAT, some shares): the
+    /// move still works, a case-only one too, and still replaces nothing.
+    #[test]
+    fn a_filesystem_without_hard_links_falls_back_to_a_checked_rename() {
+        let (directory, _) = library("fallback");
+        std::fs::write(directory.join("a.mkv"), b"moved").expect("source");
+        std::fs::write(directory.join("b.mkv"), b"kept").expect("target");
+        let unsupported = |_: &Path, _: &Path| Err(std::io::ErrorKind::Unsupported.into());
+        let unlinked = |from: &str, to: &str| {
+            move_linking_with(unsupported, &directory.join(from), &directory.join(to))
+        };
+
+        assert_eq!(
+            unlinked("a.mkv", "b.mkv")
+                .expect_err("existing target")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        unlinked("a.mkv", "c.mkv").expect("free target");
+        unlinked("c.mkv", "C.mkv").expect("case-only");
+
+        assert_eq!(names(&directory), ["C.mkv", "b.mkv"]);
+        assert_eq!(
+            std::fs::read(directory.join("C.mkv")).expect("moved"),
+            b"moved"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("b.mkv")).expect("target"),
+            b"kept"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A player holding the file would let the new name appear and then refuse
+    /// to give up the old one, leaving both.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_source_that_cannot_be_removed_is_not_given_a_second_name() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (directory, file_system) = library("held");
+        std::fs::write(directory.join("a.mkv"), b"episode").expect("source");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(directory.join("a.mkv"))
+            .expect("hold open");
+
+        let moved = file_system
+            .move_file(&directory.join("a.mkv"), &directory.join("b.mkv"))
+            .await;
+
+        drop(holder);
+        assert!(moved.is_err());
+        assert_eq!(names(&directory), ["a.mkv"]);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_file_can_still_be_renamed() {
+        let (directory, file_system) = library("readonly");
+        let source = directory.join("a.mkv");
+        std::fs::write(&source, b"episode").expect("source");
+        let mut permissions = std::fs::metadata(&source).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&source, permissions).expect("set readonly");
+
+        file_system
+            .move_file(&source, &directory.join("b.mkv"))
+            .await
+            .expect("move");
+
+        assert_eq!(names(&directory), ["b.mkv"]);
+        let moved = directory.join("b.mkv");
+        let mut permissions = std::fs::metadata(&moved).expect("metadata").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&moved, permissions);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listing_names_the_files_of_one_folder_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "mkvo-list-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(directory.join("Season 2")).expect("folders");
+        let directory = std::fs::canonicalize(directory).expect("canonical dir");
+        for name in ["a.mkv", "a.srt", "Season 2/b.mkv"] {
+            std::fs::write(directory.join(name), b"file").expect("file");
+        }
+        let roots =
+            AuthorizedRoots::new([crate::AuthorizedRoot::new(&directory, false).expect("root")])
+                .expect("roots");
+
+        let mut listed = LocalFileSystem::new(roots, false)
+            .list_files(&directory)
+            .await
+            .expect("list");
+        listed.sort();
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(listed, [directory.join("a.mkv"), directory.join("a.srt")]);
     }
 }

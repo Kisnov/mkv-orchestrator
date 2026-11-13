@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use mkvo_application::{parse_episode_number, parse_season_episode, try_match_absolute_episode};
+use mkvo_application::{parse_release_episode, parse_season_episode, try_match_absolute_episode};
 use mkvo_contracts::RenameScopeRow;
 use mkvo_domain::{EpisodeMetadata, ExternalSubtitle, RemuxMode, RemuxPlanItem, TrackKind};
 
@@ -45,7 +45,18 @@ pub(super) fn match_episode_for_file<'a>(
             .find(|episode| episode.season == season && episode.episode == number);
     }
 
-    let number = rename_episode_number(file_name)?;
+    let parsed = parse_release_episode(file_name)?;
+    let number = parsed.episode;
+    // `Title S2 - 03` names its season, but an anime provider may list that
+    // season as a series of its own, so a miss here is not final.
+    if let Some(season) = parsed.season
+        && let Some(matched) = episodes
+            .iter()
+            .filter(in_scope)
+            .find(|episode| episode.season == season && episode.episode == number)
+    {
+        return Some(matched);
+    }
     let mut matches = episodes
         .iter()
         .filter(in_scope)
@@ -70,24 +81,10 @@ pub(super) fn match_episode_for_file<'a>(
         .find(|episode| episode.id == absolute.episode.id)
 }
 
-/// Extract an episode number for rename matching.
-///
-/// The shared parser intentionally requires an episode marker or numeric
-/// bracket. Rename additionally accepts the common release form `Title - 55`,
-/// but only when the final stem component is entirely numeric. Keeping this
-/// rule here avoids making library audits mistake unrelated numbers for episode
-/// identities.
+/// The episode number rename matches by, which unlike the library audit's also
+/// accepts the release form `Title - 55`.
 pub(super) fn rename_episode_number(file_name: &str) -> Option<u32> {
-    parse_episode_number(file_name).or_else(|| {
-        let stem = Path::new(file_name).file_stem()?.to_string_lossy();
-        let (_, suffix) = stem.rsplit_once(" - ")?;
-        let suffix = suffix.trim();
-        (!suffix.is_empty()
-            && suffix.len() <= 4
-            && suffix.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| suffix.parse().ok())
-        .flatten()
-    })
+    parse_release_episode(file_name).map(|parsed| parsed.episode)
 }
 
 pub(super) fn track_kind_label(kind: TrackKind) -> &'static str {
@@ -203,21 +200,11 @@ pub(super) fn redacted_remux_command(item: &RemuxPlanItem) -> String {
     )
 }
 
-pub(super) fn same_path(left: &Path, right: &Path) -> bool {
-    path_key(&left.to_string_lossy()) == path_key(&right.to_string_lossy())
-}
+pub(super) use mkvo_domain::same_path;
 
-/// Comparison key for a path in workflow lookups.
-///
-/// Scanned files carry the canonical path, which on Windows has the
-/// extended-length `\\?\` prefix, while rows from the UI carry the plain form.
-/// The prefix is dropped first so both spellings of one file share a key;
-/// otherwise row lookups miss and fall back to re-fingerprinting the file.
+/// [`mkvo_domain::path_key`] for a path that arrives as text from the UI.
 pub(super) fn path_key(value: &str) -> String {
-    mkvo_domain::normalized_path_text(Path::new(value))
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    mkvo_domain::path_key(Path::new(value))
 }
 
 pub(super) fn file_name(path: &Path) -> String {
@@ -283,6 +270,37 @@ mod tests {
         assert_eq!(matched.title, "Third");
     }
 
+    /// `Title S2 - 03` used to be matched as the third episode of the whole
+    /// series, which is S01E03.
+    #[test]
+    fn a_season_written_before_the_dash_picks_that_season() {
+        let episodes = vec![
+            episode(1, 3, "First season"),
+            episode(2, 3, "Second season"),
+        ];
+        let matched = match_episode_for_file("Title S2 - 03.mkv", &episodes, &BTreeSet::new())
+            .expect("season two");
+        assert_eq!(matched.title, "Second season");
+
+        // An anime provider lists that season as a series of its own.
+        let episodes = vec![episode(1, 3, "Its own series")];
+        let matched = match_episode_for_file("Title S2 - 03.mkv", &episodes, &BTreeSet::new())
+            .expect("the only third episode");
+        assert_eq!(matched.title, "Its own series");
+    }
+
+    #[test]
+    fn a_release_name_with_tags_after_the_number_is_matched_by_it() {
+        let episodes = vec![episode(1, 1, "First"), episode(1, 2, "Second")];
+        let matched = match_episode_for_file(
+            "[SubsPlease] Title - 02 (1080p) [ABCD1234].mkv",
+            &episodes,
+            &BTreeSet::new(),
+        )
+        .expect("second episode");
+        assert_eq!(matched.title, "Second");
+    }
+
     #[test]
     fn explicit_season_episode_still_wins_over_release_order() {
         let episodes = vec![episode(1, 1, "First"), episode(2, 1, "Second season")];
@@ -314,7 +332,11 @@ mod tests {
             Path::new(r"\\?\UNC\nas\media\Episode 01.mkv"),
             Path::new(r"\\nas\media\Episode 01.mkv")
         ));
-        assert_eq!(path_key(r"\\?\C:\Media\Show"), path_key("c:/media/show/"));
+        assert_eq!(path_key(r"\\?\C:\Media\Show"), path_key("C:/Media/Show/"));
+        assert_eq!(
+            path_key("/media/Show") == path_key("/media/show"),
+            cfg!(any(windows, target_os = "macos"))
+        );
         assert!(!same_path(
             Path::new(r"\\?\C:\Media\Show\Episode 01.mkv"),
             Path::new(r"C:\Media\Show\Episode 02.mkv")

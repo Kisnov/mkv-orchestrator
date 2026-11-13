@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "fixtureId": "rename.filename-planning.v1",
   "kind": "legacy_parity",
-  "description": "Rename template, sanitizer, absolute matching, movie, special, and duplicate-target behavior.",
+  "description": "Rename template, sanitizer, absolute matching, movie, special, and duplicate-target behavior. The absolute token departs from the C# core on purpose: it is the provider's number or empty, never one made up from season and episode.",
   "sourceOfTruth": [
     "src/MKVOrchestrator.Core/Services/Rename/RenameFileNameBuilder.cs",
     "src/MKVOrchestrator.Core/Services/Rename/RenamePlanner.cs",
@@ -50,7 +50,7 @@
       "expected": "Example Movie (2024).mp4"
     },
     {
-      "id": "special-absolute-token-stays-positive",
+      "id": "absolute-token-is-empty-without-a-provider-number",
       "operation": "RenameFileNameBuilder.Build",
       "input": {
         "sourcePath": "${ROOT}/incoming/special.mkv",
@@ -64,10 +64,10 @@
         "template": "{series} - {absolute:000} - {episodeTitle}",
         "isMovie": false
       },
-      "expected": "Example Show - 003 - OVA.mkv"
+      "expected": "Example Show - - OVA.mkv"
     },
     {
-      "id": "synthetic-absolute-token-uses-thousand-season-blocks",
+      "id": "absolute-token-is-the-provider-number",
       "operation": "RenameFileNameBuilder.Build",
       "input": {
         "sourcePath": "${ROOT}/incoming/episode.mkv",
@@ -76,12 +76,13 @@
         "episode": {
           "seasonNumber": 4,
           "episodeNumber": 23,
+          "absoluteNumber": 75,
           "name": "Finale"
         },
         "template": "{series} - {absolute:000} - {episodeTitle}",
         "isMovie": false
       },
-      "expected": "Example Show - 3023 - Finale.mkv"
+      "expected": "Example Show - 075 - Finale.mkv"
     },
     {
       "id": "filename-builder-invalid-characters-become-hyphens",
@@ -99,12 +100,6 @@
         "isMovie": false
       },
       "expected": "Show - Bad-Name- -Pilot--.mkv"
-    },
-    {
-      "id": "planner-invalid-characters-become-spaces",
-      "operation": "RenamePlanner.SanitizeFileName",
-      "input": "Show: Bad*Name? <Pilot>|",
-      "expected": "Show Bad Name Pilot"
     }
   ],
   "matchingCases": [

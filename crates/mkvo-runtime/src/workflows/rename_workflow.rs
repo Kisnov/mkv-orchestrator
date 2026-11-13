@@ -1,4 +1,17 @@
+use mkvo_application::PortError;
+
 use super::*;
+
+/// The fingerprint of a batch entry's file under its new name.
+fn renamed(entry: &RenameBatchEntry) -> FileFingerprint {
+    entry
+        .renamed_fingerprint
+        .clone()
+        .unwrap_or_else(|| FileFingerprint {
+            path: entry.renamed_path.clone(),
+            ..entry.original_fingerprint.clone()
+        })
+}
 
 impl MkvoRuntime {
     pub(super) async fn build_rename_preview_impl(
@@ -97,6 +110,8 @@ impl MkvoRuntime {
             .idempotency_key
             .unwrap_or_else(IdempotencyKey::generate);
         let files_for_access = files.clone();
+        let (existing_paths, unlisted_folders) =
+            self.existing_paths_around(&files_for_access).await;
         let plan = RenamePlanner.build_plan(RenamePlanRequest {
             files,
             template: request
@@ -104,11 +119,12 @@ impl MkvoRuntime {
                 .unwrap_or_else(|| settings.rename.template.clone()),
             provider: Some(provider),
             check_existing_files: true,
-            existing_paths: self.current_existing_paths().await,
+            existing_paths,
             source_access: self
                 .probe_source_access(&files_for_access, RequiredAccess::ReadWrite)
                 .await,
             existing_parents: self.existing_parents(&files_for_access).await,
+            unlisted_folders,
             authorized_roots: self.authorized_root_paths(),
             settings_fingerprint,
             expires_in_seconds: 900,
@@ -150,6 +166,32 @@ impl MkvoRuntime {
             }
         }
         probed
+    }
+
+    /// The working set plus everything in the files' folders, so the planner
+    /// sees their sidecars and every name that is already taken; and the keys
+    /// of the folders that could not be listed.
+    pub(super) async fn existing_paths_around(
+        &self,
+        files: &[MediaFile],
+    ) -> (BTreeSet<PathBuf>, BTreeSet<String>) {
+        let mut existing = self.current_existing_paths().await;
+        let mut unlisted = BTreeSet::new();
+        let folders: BTreeSet<_> = files.iter().filter_map(|file| file.path.parent()).collect();
+        for folder in folders {
+            match self.dependencies().file_system.list_files(folder).await {
+                Ok(listed) => existing.extend(listed),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %folder.display(),
+                        %error,
+                        "folder could not be listed for a rename preview"
+                    );
+                    unlisted.insert(mkvo_application::paths::path_key(folder));
+                }
+            }
+        }
+        (existing, unlisted)
     }
 
     pub(super) async fn existing_parents(&self, files: &[MediaFile]) -> BTreeSet<String> {
@@ -225,7 +267,7 @@ impl MkvoRuntime {
                         runtime.dependencies().journal.advance(&journal).await?;
 
                         let batch_id = RenameBatchId::new();
-                        let mut batch = RenameBatchRecord {
+                        let batch = RenameBatchRecord {
                             id: batch_id,
                             created_at: Utc::now(),
                             undone_at: None,
@@ -233,12 +275,18 @@ impl MkvoRuntime {
                             template: plan.payload.template.clone(),
                             entries: Vec::new(),
                         };
+                        let items: Vec<_> = plan
+                            .payload
+                            .items
+                            .iter()
+                            .filter(|item| item.can_apply())
+                            .collect();
+                        let file_system = &runtime.dependencies().file_system;
+                        let history = &runtime.dependencies().rename_history;
+                        let mut moved: Vec<RenameBatchEntry> = Vec::new();
                         let mutation = async {
-                            for item in plan.payload.items.iter().filter(|item| item.can_apply()) {
-                                runtime
-                                    .revalidate_fingerprint(&item.source_fingerprint)
-                                    .await
-                                    .map_err(runtime_application_error)?;
+                            let sidecars = runtime.preflight_rename(&items).await?;
+                            for (item, sidecars) in items.iter().zip(sidecars) {
                                 journal.detail = Some(format!(
                                     "prepared move {} -> {}; batchId={batch_id}",
                                     item.source.display(),
@@ -246,32 +294,41 @@ impl MkvoRuntime {
                                 ));
                                 journal.updated_utc = Utc::now();
                                 runtime.dependencies().journal.advance(&journal).await?;
-                                runtime
-                                    .dependencies()
-                                    .file_system
-                                    .move_file(&item.source, &item.target)
-                                    .await?;
-                                runtime
-                                    .apply_renames_to_working_set(&[(
-                                        item.source.clone(),
-                                        item.target.clone(),
-                                    )])
-                                    .await;
-                                let renamed_fingerprint = runtime
-                                    .dependencies()
-                                    .file_system
-                                    .fingerprint(&item.target)
-                                    .await
-                                    .ok();
-                                batch.entries.push(RenameBatchEntry {
+                                file_system.move_file(&item.source, &item.target).await?;
+                                let mut entry = RenameBatchEntry {
                                     original_path: item.source.clone(),
                                     renamed_path: item.target.clone(),
                                     original_fingerprint: item.source_fingerprint.clone(),
-                                    renamed_fingerprint,
-                                });
-                                // Persist after every move. Together with the pre-move journal
-                                // detail this permits deterministic crash reconciliation.
-                                runtime.dependencies().rename_history.add(&batch).await?;
+                                    renamed_fingerprint: file_system
+                                        .fingerprint(&item.target)
+                                        .await
+                                        .ok(),
+                                    sidecars: Vec::new(),
+                                };
+                                let mut sidecars_moved = Ok(());
+                                for sidecar in sidecars {
+                                    sidecars_moved = file_system
+                                        .move_file(&sidecar.source, &sidecar.target)
+                                        .await;
+                                    if sidecars_moved.is_err() {
+                                        break;
+                                    }
+                                    entry.sidecars.push(sidecar);
+                                }
+                                // Stored after every file, with the sidecars that did move, so
+                                // a batch that stops half-way can still be undone.
+                                moved.push(entry.clone());
+                                if moved.len() == 1 {
+                                    let entries = vec![entry];
+                                    let first = RenameBatchRecord {
+                                        entries,
+                                        ..batch.clone()
+                                    };
+                                    history.add(&first).await?;
+                                } else {
+                                    history.append(batch_id, &entry).await?;
+                                }
+                                sidecars_moved?;
                                 journal.step = journal.step.saturating_add(1);
                                 journal.complete_item(&item.source.to_string_lossy());
                                 journal.detail = Some(format!(
@@ -285,6 +342,11 @@ impl MkvoRuntime {
                             Ok::<(), ApplicationError>(())
                         }
                         .await;
+                        let followed: Vec<_> = moved
+                            .iter()
+                            .map(|entry| (entry.original_fingerprint.clone(), renamed(entry)))
+                            .collect();
+                        runtime.follow_renames(&followed).await;
                         if let Err(error) = mutation {
                             journal.fail_first_pending_item(error.to_string());
                             journal.status = mkvo_application::JournalStatus::Failed;
@@ -317,18 +379,113 @@ impl MkvoRuntime {
         // The working set is what later operations run against, so it moves
         // with the files. A replay renamed nothing this time round, but the
         // paths it describes are still the ones that now exist.
-        let moves: Vec<_> = plan
-            .payload
-            .items
-            .iter()
-            .filter(|item| item.can_apply())
-            .map(|item| (item.source.clone(), item.target.clone()))
-            .collect();
-        if replay && !moves.is_empty() {
-            self.apply_renames_to_working_set(&moves).await;
+        if replay {
+            let moves: Vec<_> = plan
+                .payload
+                .items
+                .iter()
+                .filter(|item| item.can_apply())
+                .map(|item| {
+                    let target = FileFingerprint {
+                        path: item.target.clone(),
+                        ..item.source_fingerprint.clone()
+                    };
+                    (item.source_fingerprint.clone(), target)
+                })
+                .collect();
+            self.follow_renames(&moves).await;
         }
 
         Ok(rename_apply_response(&plan, replay))
+    }
+
+    /// Check every move of a batch before the first one, so a collision
+    /// cannot leave it half applied. Returns each item's sidecars that are
+    /// still there to move.
+    async fn preflight_rename(
+        &self,
+        items: &[&mkvo_domain::RenamePlanItem],
+    ) -> Result<Vec<Vec<mkvo_domain::RenameSidecar>>, ApplicationError> {
+        let mut taken = Vec::new();
+        let mut sidecars = Vec::with_capacity(items.len());
+        for item in items {
+            self.revalidate_fingerprint(&item.source_fingerprint)
+                .await
+                .map_err(runtime_application_error)?;
+            if !self.target_is_free(&item.source, &item.target).await? {
+                taken.push(item.target.display().to_string());
+            }
+            let mut present = Vec::new();
+            for sidecar in &item.sidecars {
+                // One deleted since the preview is simply not moved.
+                if !self
+                    .dependencies()
+                    .file_system
+                    .exists(&sidecar.source)
+                    .await?
+                {
+                    continue;
+                }
+                if !self
+                    .target_is_free(&sidecar.source, &sidecar.target)
+                    .await?
+                {
+                    taken.push(sidecar.target.display().to_string());
+                }
+                present.push(sidecar.clone());
+            }
+            sidecars.push(present);
+        }
+        if taken.is_empty() {
+            Ok(sidecars)
+        } else {
+            Err(ApplicationError::Conflict(format!(
+                "nothing was renamed because {} target(s) already exist: {}",
+                taken.len(),
+                taken.join(", ")
+            )))
+        }
+    }
+
+    /// Whether `source` can take the name `target`: nothing has it, or it is
+    /// `source` itself in another case, which the move sorts out.
+    async fn target_is_free(&self, source: &Path, target: &Path) -> Result<bool, PortError> {
+        Ok(
+            mkvo_domain::case_folded_path_key(source) == mkvo_domain::case_folded_path_key(target)
+                || !self.dependencies().file_system.exists(target).await?,
+        )
+    }
+
+    /// Carry cache rows and the working set from each first fingerprint to the
+    /// second. A rename changes no content, so nothing is probed again.
+    async fn follow_renames(&self, renames: &[(FileFingerprint, FileFingerprint)]) {
+        if renames.is_empty() {
+            return;
+        }
+        let cache = &self.dependencies().cache;
+        let mut cached = Vec::new();
+        for (before, after) in renames {
+            if let Ok(Some(mut file)) = cache.get_valid(before).await {
+                file.path = after.path.clone();
+                file.fingerprint = after.clone();
+                cached.push(file);
+            }
+            if let Err(error) = cache.remove(&before.path).await {
+                tracing::warn!(
+                    path = %before.path.display(),
+                    %error,
+                    "renamed file's old cache entry could not be removed"
+                );
+            }
+        }
+        if let Err(error) = cache.upsert_many(&cached).await {
+            tracing::warn!(%error, "renamed files could not be cached under their new names");
+        }
+        let renamed: Vec<_> = renames
+            .iter()
+            .map(|(before, after)| (before.path.clone(), after.clone()))
+            .collect();
+        self.move_working_set_files(&renamed).await;
     }
 
     pub async fn get_rename_batches(&self) -> RuntimeResult<RenameBatchListResponse> {
@@ -376,23 +533,26 @@ impl MkvoRuntime {
         let batch = self.rename_batch(id).await?;
         let mut response = RenameBatchUndoPreviewResponse::default();
         for entry in &batch.entries {
-            let current_exists = self
-                .dependencies()
-                .file_system
-                .exists(&entry.renamed_path)
-                .await?;
-            let target_exists = self
-                .dependencies()
-                .file_system
-                .exists(&entry.original_path)
-                .await?;
-            if current_exists && !target_exists && batch.undone_at.is_none() {
+            if batch.undone_at.is_none()
+                && self
+                    .can_restore(&entry.renamed_path, &entry.original_path)
+                    .await?
+            {
                 response.restorable += 1;
                 response.lines.push(format!(
                     "Restore {} -> {}",
                     entry.renamed_path.display(),
                     entry.original_path.display()
                 ));
+                for sidecar in &entry.sidecars {
+                    if self.can_restore(&sidecar.target, &sidecar.source).await? {
+                        response.lines.push(format!(
+                            "Restore {} -> {}",
+                            sidecar.target.display(),
+                            sidecar.source.display()
+                        ));
+                    }
+                }
             } else {
                 response.skipped += 1;
                 response.lines.push(format!(
@@ -420,11 +580,15 @@ impl MkvoRuntime {
             .entries
             .iter()
             .flat_map(|entry| {
-                [
-                    mkvo_domain::ResourceClaim::write(entry.renamed_path.clone()),
-                    mkvo_domain::ResourceClaim::write(entry.original_path.clone()),
-                ]
+                let sidecars = entry
+                    .sidecars
+                    .iter()
+                    .flat_map(|sidecar| [&sidecar.target, &sidecar.source]);
+                [&entry.renamed_path, &entry.original_path]
+                    .into_iter()
+                    .chain(sidecars)
             })
+            .map(|path| mkvo_domain::ResourceClaim::write(path.clone()))
             .collect();
         let runtime = self.clone();
         let id = id.to_owned();
@@ -445,52 +609,73 @@ impl MkvoRuntime {
                                 "rename batch was already undone".to_owned(),
                             ));
                         }
+                        let file_system = &runtime.dependencies().file_system;
                         let mut response = RenameBatchUndoResponse::default();
-                        for entry in &batch.entries {
-                            let can_restore = runtime
-                                .dependencies()
-                                .file_system
-                                .exists(&entry.renamed_path)
-                                .await?
-                                && !runtime
-                                    .dependencies()
-                                    .file_system
-                                    .exists(&entry.original_path)
-                                    .await?;
-                            if !can_restore {
-                                response.skipped += 1;
-                                response
-                                    .lines
-                                    .push(format!("Skipped {}", entry.renamed_path.display()));
-                                continue;
+                        let mut restored = Vec::new();
+                        let restoration = async {
+                            for entry in &batch.entries {
+                                if runtime
+                                    .can_restore(&entry.renamed_path, &entry.original_path)
+                                    .await?
+                                {
+                                    if let Some(expected) = &entry.renamed_fingerprint {
+                                        runtime
+                                            .revalidate_fingerprint(expected)
+                                            .await
+                                            .map_err(runtime_application_error)?;
+                                    }
+                                    file_system
+                                        .move_file(&entry.renamed_path, &entry.original_path)
+                                        .await?;
+                                    let current = renamed(entry);
+                                    let original = FileFingerprint {
+                                        path: entry.original_path.clone(),
+                                        ..current.clone()
+                                    };
+                                    restored.push((current, original));
+                                    response.renamed += 1;
+                                    response.lines.push(format!(
+                                        "Restored {}",
+                                        entry.original_path.display()
+                                    ));
+                                    response.restored.push(RenameBatchRestoreMove {
+                                        original_path: display_path(&entry.original_path),
+                                        renamed_path: display_path(&entry.renamed_path),
+                                        original_file_name: file_name(&entry.original_path),
+                                    });
+                                } else {
+                                    response.skipped += 1;
+                                    response
+                                        .lines
+                                        .push(format!("Skipped {}", entry.renamed_path.display()));
+                                    // Back already, from an undo that stopped half-way: its
+                                    // sidecars are still owed. Otherwise they stay with it.
+                                    if file_system.exists(&entry.renamed_path).await?
+                                        || !file_system.exists(&entry.original_path).await?
+                                    {
+                                        continue;
+                                    }
+                                }
+                                for sidecar in &entry.sidecars {
+                                    let line = if runtime
+                                        .can_restore(&sidecar.target, &sidecar.source)
+                                        .await?
+                                    {
+                                        file_system
+                                            .move_file(&sidecar.target, &sidecar.source)
+                                            .await?;
+                                        format!("Restored {}", sidecar.source.display())
+                                    } else {
+                                        format!("Skipped {}", sidecar.target.display())
+                                    };
+                                    response.lines.push(line);
+                                }
                             }
-                            if let Some(expected) = &entry.renamed_fingerprint {
-                                runtime
-                                    .revalidate_fingerprint(expected)
-                                    .await
-                                    .map_err(runtime_application_error)?;
-                            }
-                            runtime
-                                .dependencies()
-                                .file_system
-                                .move_file(&entry.renamed_path, &entry.original_path)
-                                .await?;
-                            runtime
-                                .apply_renames_to_working_set(&[(
-                                    entry.renamed_path.clone(),
-                                    entry.original_path.clone(),
-                                )])
-                                .await;
-                            response.renamed += 1;
-                            response
-                                .lines
-                                .push(format!("Restored {}", entry.original_path.display()));
-                            response.restored.push(RenameBatchRestoreMove {
-                                original_path: display_path(&entry.original_path),
-                                renamed_path: display_path(&entry.renamed_path),
-                                original_file_name: file_name(&entry.original_path),
-                            });
+                            Ok::<(), ApplicationError>(())
                         }
+                        .await;
+                        runtime.follow_renames(&restored).await;
+                        restoration?;
                         runtime
                             .dependencies()
                             .rename_history
@@ -506,6 +691,12 @@ impl MkvoRuntime {
             )
             .await
             .map_err(RuntimeError::from)
+    }
+
+    /// Whether undo can move `current` back to `original`.
+    async fn can_restore(&self, current: &Path, original: &Path) -> Result<bool, PortError> {
+        Ok(self.dependencies().file_system.exists(current).await?
+            && self.target_is_free(current, original).await?)
     }
 
     pub async fn clear_rename_batches(&self) -> RuntimeResult<RenameBatchListResponse> {
@@ -586,5 +777,327 @@ impl MkvoRuntime {
             .get(id)
             .await?
             .ok_or_else(|| RuntimeError::not_found(format!("rename batch {id}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use mkvo_application::MediaProbe;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// Stands in for mkvmerge and counts how often it is asked.
+    #[derive(Default)]
+    struct CountingProbe(AtomicUsize);
+
+    #[async_trait]
+    impl MediaProbe for CountingProbe {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let metadata =
+                std::fs::metadata(path).map_err(|error| PortError::Other(error.to_string()))?;
+            Ok(MediaFile {
+                path: path.to_path_buf(),
+                original_file_name: None,
+                watch_root: None,
+                relative_path: None,
+                fingerprint: FileFingerprint {
+                    path: path.to_path_buf(),
+                    size_bytes: metadata.len(),
+                    modified_at: metadata.modified().expect("modified").into(),
+                    quick_hash: None,
+                },
+                container: ContainerMetadata::default(),
+                tracks: Vec::new(),
+                attachments: Vec::new(),
+                episode: None,
+                provider_match: None,
+                status: MediaStatus::Ready,
+            })
+        }
+    }
+
+    struct Library {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        runtime: MkvoRuntime,
+        probe: Arc<CountingProbe>,
+    }
+
+    impl Library {
+        /// A library holding `names`, with its `.mkv` files scanned.
+        async fn with(names: &[&str]) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("library");
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            for name in names {
+                std::fs::write(root.join(name), name.as_bytes()).unwrap();
+            }
+            let built = MkvoRuntimeBuilder::new(&root, directory.path().join("config"))
+                .app_name("test")
+                .disable_legacy_migration()
+                .authorized_root(&root, true)
+                .build()
+                .unwrap();
+            let probe = Arc::new(CountingProbe::default());
+            let mut dependencies = built.dependencies().clone();
+            dependencies.probe = probe.clone();
+            let runtime = MkvoRuntime::from_parts(built.config().clone(), dependencies);
+            let videos: Vec<_> = names
+                .iter()
+                .filter(|name| name.ends_with(".mkv"))
+                .map(|name| root.join(name))
+                .collect();
+            runtime.refresh_working_set(&videos).await;
+            Self {
+                _directory: directory,
+                root,
+                runtime,
+                probe,
+            }
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(&self.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        async fn working_set(&self) -> Vec<PathBuf> {
+            let files = self.runtime.current_domain_files().await;
+            for file in &files {
+                assert_eq!(file.fingerprint.path, file.path);
+            }
+            files.into_iter().map(|file| file.path).collect()
+        }
+
+        /// Plan the rename of each scanned file to the name given for it.
+        async fn plan(&self, new_names: &[(&str, &str)]) -> RenameApplyRequest {
+            let mut files = self.runtime.current_domain_files().await;
+            files.retain_mut(|file| {
+                let new_name = new_names
+                    .iter()
+                    .find(|(old, _)| file.path == self.root.join(old))
+                    .map(|(_, new)| *new);
+                file.episode = new_name.map(|title| EpisodeIdentity {
+                    series_title: None,
+                    season: None,
+                    episode: None,
+                    absolute_episode: None,
+                    episode_title: Some(title.to_owned()),
+                    year: None,
+                    is_movie: false,
+                });
+                new_name.is_some()
+            });
+            let settings = self.runtime.dependencies().settings.load().await.unwrap().0;
+            let plan = RenamePlanner
+                .build_plan(RenamePlanRequest {
+                    existing_paths: self.runtime.existing_paths_around(&files).await.0,
+                    files,
+                    template: "{episodeTitle}".to_owned(),
+                    provider: None,
+                    check_existing_files: true,
+                    source_access: BTreeMap::new(),
+                    existing_parents: BTreeSet::new(),
+                    unlisted_folders: BTreeSet::new(),
+                    authorized_roots: Vec::new(),
+                    settings_fingerprint: stable_fingerprint(&settings).unwrap(),
+                    expires_in_seconds: 60,
+                    idempotency_key: IdempotencyKey::generate(),
+                })
+                .unwrap();
+            assert!(!plan.payload.has_blocking_issues(), "{:?}", plan.payload);
+            self.runtime.persist_plan(&plan).await.unwrap();
+            RenameApplyRequest {
+                plan_id: Some(plan.metadata.id),
+                plan_fingerprint: Some(plan.metadata.fingerprint.clone()),
+                idempotency_key: Some(plan.metadata.idempotency_key.clone()),
+                ..RenameApplyRequest::default()
+            }
+        }
+
+        async fn batches(&self) -> Vec<RenameBatchRecord> {
+            let history = &self.runtime.dependencies().rename_history;
+            history.list_recent(10).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_takes_its_sidecars_along_and_undo_brings_them_back() {
+        let library = Library::with(&[
+            "Show - 01.mkv",
+            "Show - 01.srt",
+            "Show - 01.en.ass",
+            "Show - 02.mkv",
+            "Show - 02.srt",
+        ])
+        .await;
+        let request = library
+            .plan(&[("Show - 01.mkv", "Pilot"), ("Show - 02.mkv", "Second")])
+            .await;
+        // Gone between preview and apply: nothing to move, and no reason to stop.
+        std::fs::remove_file(library.root.join("Show - 02.srt")).unwrap();
+
+        library.runtime.apply_rename_preview(request).await.unwrap();
+
+        assert_eq!(
+            library.names(),
+            ["Pilot.en.ass", "Pilot.mkv", "Pilot.srt", "Second.mkv"]
+        );
+        let batches = library.batches().await;
+        assert_eq!(batches.len(), 1);
+        let sidecars: Vec<_> = batches[0]
+            .entries
+            .iter()
+            .map(|entry| entry.sidecars.len())
+            .collect();
+        assert_eq!(sidecars, [2, 0]);
+
+        let undone = library
+            .runtime
+            .undo_rename_batch(&batches[0].id.to_string())
+            .await
+            .unwrap();
+        assert_eq!((undone.renamed, undone.skipped), (2, 0));
+        assert_eq!(
+            library.names(),
+            [
+                "Show - 01.en.ass",
+                "Show - 01.mkv",
+                "Show - 01.srt",
+                "Show - 02.mkv"
+            ]
+        );
+        assert!(library.batches().await[0].undone_at.is_some());
+    }
+
+    /// Each renamed file used to be handed to mkvmerge again, one at a time.
+    #[tokio::test]
+    async fn renamed_files_are_followed_without_being_probed_again() {
+        let library = Library::with(&["a.mkv", "b.mkv", "c.mkv"]).await;
+        let request = library
+            .plan(&[("a.mkv", "Pilot"), ("b.mkv", "Second")])
+            .await;
+        assert_eq!(library.probe.0.load(Ordering::SeqCst), 3);
+
+        library.runtime.apply_rename_preview(request).await.unwrap();
+
+        let renamed = ["Pilot.mkv", "Second.mkv", "c.mkv"].map(|name| library.root.join(name));
+        assert_eq!(library.working_set().await, renamed);
+        let cache = &library.runtime.dependencies().cache;
+        for file in library.runtime.current_domain_files().await {
+            assert!(cache.get_valid(&file.fingerprint).await.unwrap().is_some());
+        }
+        assert_eq!(cache.count().await.unwrap(), 3);
+
+        let batch = library.batches().await[0].id.to_string();
+        library.runtime.undo_rename_batch(&batch).await.unwrap();
+
+        let original = ["a.mkv", "b.mkv", "c.mkv"].map(|name| library.root.join(name));
+        assert_eq!(library.working_set().await, original);
+        assert_eq!(cache.count().await.unwrap(), 3);
+        assert_eq!(library.probe.0.load(Ordering::SeqCst), 3);
+    }
+
+    /// The batch used to stop at the collision with the files before it
+    /// already renamed.
+    #[tokio::test]
+    async fn a_target_that_appeared_since_the_preview_stops_the_batch_before_it_starts() {
+        let library = Library::with(&["a.mkv", "a.srt", "b.mkv", "c.mkv"]).await;
+        let request = library
+            .plan(&[("a.mkv", "Pilot"), ("b.mkv", "Second"), ("c.mkv", "Third")])
+            .await;
+        std::fs::write(library.root.join("Third.mkv"), b"someone else's").unwrap();
+        std::fs::write(library.root.join("Pilot.srt"), b"someone else's").unwrap();
+
+        let error = library
+            .runtime
+            .apply_rename_preview(request)
+            .await
+            .expect_err("collision");
+
+        assert_eq!(error.code, mkvo_contracts::ApiErrorCode::Conflict);
+        assert!(error.message.contains("Third.mkv"), "{}", error.message);
+        assert!(error.message.contains("Pilot.srt"), "{}", error.message);
+        assert_eq!(
+            library.names(),
+            ["Pilot.srt", "Third.mkv", "a.mkv", "a.srt", "b.mkv", "c.mkv"]
+        );
+        assert_eq!(
+            std::fs::read(library.root.join("Third.mkv")).unwrap(),
+            b"someone else's"
+        );
+        assert_eq!(library.batches().await, []);
+    }
+
+    #[tokio::test]
+    async fn a_rename_that_only_changes_case_is_applied_and_undone() {
+        let library = Library::with(&["ep.mkv", "ep.srt"]).await;
+        let request = library.plan(&[("ep.mkv", "Ep")]).await;
+
+        library.runtime.apply_rename_preview(request).await.unwrap();
+        assert_eq!(library.names(), ["Ep.mkv", "Ep.srt"]);
+        assert_eq!(library.working_set().await, [library.root.join("Ep.mkv")]);
+
+        let batch = library.batches().await[0].id.to_string();
+        let preview = library
+            .runtime
+            .preview_rename_batch_undo(&batch)
+            .await
+            .unwrap();
+        assert_eq!((preview.restorable, preview.skipped), (1, 0));
+        library.runtime.undo_rename_batch(&batch).await.unwrap();
+        assert_eq!(library.names(), ["ep.mkv", "ep.srt"]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_cannot_be_listed_is_reported_to_the_planner() {
+        let library = Library::with(&["a.mkv"]).await;
+        let mut files = library.runtime.current_domain_files().await;
+        files[0].path = library.root.join("gone").join("b.mkv");
+
+        let (existing, unlisted) = library.runtime.existing_paths_around(&files).await;
+
+        assert_eq!(existing, BTreeSet::from([library.root.join("a.mkv")]));
+        let gone = mkvo_domain::path_key(&library.root.join("gone"));
+        assert_eq!(unlisted, BTreeSet::from([gone]));
+    }
+
+    /// An undo that stopped at a locked subtitle left the video back in place;
+    /// the next one skipped the video, forgot its sidecars and called it done.
+    #[tokio::test]
+    async fn an_undo_tried_again_still_brings_back_the_sidecars() {
+        let library = Library::with(&["a.mkv", "a.srt", "b.mkv", "b.srt"]).await;
+        let request = library
+            .plan(&[("a.mkv", "Pilot"), ("b.mkv", "Second")])
+            .await;
+        library.runtime.apply_rename_preview(request).await.unwrap();
+        // What the interrupted undo had already done.
+        std::fs::rename(library.root.join("Pilot.mkv"), library.root.join("a.mkv")).unwrap();
+        // A video that cannot go back keeps its sidecars beside it.
+        std::fs::write(library.root.join("b.mkv"), b"someone else's").unwrap();
+
+        let batch = library.batches().await[0].id.to_string();
+        library.runtime.undo_rename_batch(&batch).await.unwrap();
+
+        assert_eq!(
+            library.names(),
+            ["Second.mkv", "Second.srt", "a.mkv", "a.srt", "b.mkv"]
+        );
     }
 }
