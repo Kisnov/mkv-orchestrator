@@ -198,13 +198,10 @@ impl MkvoRuntime {
             })
             .buffer_unordered(workers);
         let mut failures = Vec::new();
-        let mut recorded = Ok(());
+        let mut first_error = None;
         while let Some((key, result)) = executions.next().await {
             // Returning here would drop, and so kill, the edits still writing: they are drained.
-            if recorded.is_err() {
-                continue;
-            }
-            recorded = async {
+            let recorded = async {
                 match result {
                     Ok(()) => {
                         journal.step = journal.step.saturating_add(1);
@@ -228,9 +225,14 @@ impl MkvoRuntime {
                 Ok::<_, ApplicationError>(())
             }
             .await;
-            halted.store(recorded.is_err(), std::sync::atomic::Ordering::Relaxed);
+            if let Err(error) = recorded {
+                halted.store(true, std::sync::atomic::Ordering::Relaxed);
+                first_error.get_or_insert(error);
+            }
         }
-        recorded?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         if !failures.is_empty() {
             let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
@@ -517,6 +519,8 @@ mod execution_tests {
         assert_eq!(job.status, JobStatus::Failed);
         assert!(job.error.expect("error").contains("journal is unavailable"));
         assert_eq!(tools.finished.load(Ordering::SeqCst), 2);
+        // The edit that landed after the error is still counted.
+        assert_eq!(job.completed, 2);
     }
 
     #[tokio::test]
