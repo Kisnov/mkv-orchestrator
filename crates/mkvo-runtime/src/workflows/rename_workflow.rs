@@ -603,40 +603,48 @@ impl MkvoRuntime {
                         let mut restored = Vec::new();
                         let restoration = async {
                             for entry in &batch.entries {
-                                if !runtime
+                                if runtime
                                     .can_restore(&entry.renamed_path, &entry.original_path)
                                     .await?
                                 {
+                                    if let Some(expected) = &entry.renamed_fingerprint {
+                                        runtime
+                                            .revalidate_fingerprint(expected)
+                                            .await
+                                            .map_err(runtime_application_error)?;
+                                    }
+                                    file_system
+                                        .move_file(&entry.renamed_path, &entry.original_path)
+                                        .await?;
+                                    let current = renamed(entry);
+                                    let original = FileFingerprint {
+                                        path: entry.original_path.clone(),
+                                        ..current.clone()
+                                    };
+                                    restored.push((current, original));
+                                    response.renamed += 1;
+                                    response.lines.push(format!(
+                                        "Restored {}",
+                                        entry.original_path.display()
+                                    ));
+                                    response.restored.push(RenameBatchRestoreMove {
+                                        original_path: display_path(&entry.original_path),
+                                        renamed_path: display_path(&entry.renamed_path),
+                                        original_file_name: file_name(&entry.original_path),
+                                    });
+                                } else {
                                     response.skipped += 1;
                                     response
                                         .lines
                                         .push(format!("Skipped {}", entry.renamed_path.display()));
-                                    continue;
+                                    // Back already, from an undo that stopped half-way: its
+                                    // sidecars are still owed. Otherwise they stay with it.
+                                    if file_system.exists(&entry.renamed_path).await?
+                                        || !file_system.exists(&entry.original_path).await?
+                                    {
+                                        continue;
+                                    }
                                 }
-                                if let Some(expected) = &entry.renamed_fingerprint {
-                                    runtime
-                                        .revalidate_fingerprint(expected)
-                                        .await
-                                        .map_err(runtime_application_error)?;
-                                }
-                                file_system
-                                    .move_file(&entry.renamed_path, &entry.original_path)
-                                    .await?;
-                                let current = renamed(entry);
-                                let original = FileFingerprint {
-                                    path: entry.original_path.clone(),
-                                    ..current.clone()
-                                };
-                                restored.push((current, original));
-                                response.renamed += 1;
-                                response
-                                    .lines
-                                    .push(format!("Restored {}", entry.original_path.display()));
-                                response.restored.push(RenameBatchRestoreMove {
-                                    original_path: display_path(&entry.original_path),
-                                    renamed_path: display_path(&entry.renamed_path),
-                                    original_file_name: file_name(&entry.original_path),
-                                });
                                 for sidecar in &entry.sidecars {
                                     let line = if runtime
                                         .can_restore(&sidecar.target, &sidecar.source)
@@ -1043,5 +1051,28 @@ mod tests {
         assert_eq!((preview.restorable, preview.skipped), (1, 0));
         library.runtime.undo_rename_batch(&batch).await.unwrap();
         assert_eq!(library.names(), ["ep.mkv", "ep.srt"]);
+    }
+
+    /// An undo that stopped at a locked subtitle left the video back in place;
+    /// the next one skipped the video, forgot its sidecars and called it done.
+    #[tokio::test]
+    async fn an_undo_tried_again_still_brings_back_the_sidecars() {
+        let library = Library::with(&["a.mkv", "a.srt", "b.mkv", "b.srt"]).await;
+        let request = library
+            .plan(&[("a.mkv", "Pilot"), ("b.mkv", "Second")])
+            .await;
+        library.runtime.apply_rename_preview(request).await.unwrap();
+        // What the interrupted undo had already done.
+        std::fs::rename(library.root.join("Pilot.mkv"), library.root.join("a.mkv")).unwrap();
+        // A video that cannot go back keeps its sidecars beside it.
+        std::fs::write(library.root.join("b.mkv"), b"someone else's").unwrap();
+
+        let batch = library.batches().await[0].id.to_string();
+        library.runtime.undo_rename_batch(&batch).await.unwrap();
+
+        assert_eq!(
+            library.names(),
+            ["Second.mkv", "Second.srt", "a.mkv", "a.srt", "b.mkv"]
+        );
     }
 }
