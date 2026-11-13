@@ -170,7 +170,7 @@ button[class*="bg-accent"]:not(:disabled):hover {
   position: absolute;
   top: 50%;
   right: -12px;
-  z-index: 55;
+  z-index: 40; /* under the dialog layer (z-50) */
   display: flex;
   width: 24px;
   height: 56px;
