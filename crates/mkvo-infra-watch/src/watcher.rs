@@ -140,7 +140,9 @@ impl WatchHandle {
             }
         })?;
         for root in &options.roots {
-            watcher.watch(root, RecursiveMode::Recursive)?;
+            // Events are reported under the watched spelling; cache rows use the canonical one.
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            watcher.watch(&root, RecursiveMode::Recursive)?;
         }
         let cancellation = CancellationToken::new();
         let bridge_task = tokio::spawn(debounce_native_events(
@@ -324,6 +326,43 @@ mod tests {
             WatchHandle::start(WatchOptions::default()),
             Err(WatchStartError::NoRoots)
         ));
+    }
+
+    /// Cache rows are keyed by canonical paths, so events must arrive in that
+    /// spelling whatever form the root was configured in.
+    #[tokio::test]
+    async fn native_events_report_canonical_paths() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("mkvo-watch-native-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(directory.join("sub")).expect("sub dir");
+        let mut handle = WatchHandle::start(WatchOptions {
+            roots: vec![directory.join("sub").join("..")],
+            mode: WatchMode::Native,
+            debounce: Duration::from_millis(50),
+            ..WatchOptions::default()
+        })
+        .expect("start native watcher");
+        let created = directory.join("episode.mkv");
+        std::fs::write(&created, b"episode").expect("create media file");
+
+        let expected = std::fs::canonicalize(&created).expect("canonical path");
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = handle.recv().await.expect("watch channel closed");
+                if event.paths.iter().any(|path| path.ends_with("episode.mkv")) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("native event timed out");
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(event.paths, [expected]);
     }
 
     #[test]
