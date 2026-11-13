@@ -22,6 +22,7 @@ import { useFileSelection } from "../state/useFileSelection";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { usePropEditTemplate } from "../state/propEditTemplate";
 import { useOperationJob } from "../state/OperationJobContext";
+import { createLocalId } from "../lib/localId";
 
 type TitleMode = "keep" | "remove" | "file" | "episode_title" | "custom";
 type TrackType = "audio" | "subtitle";
@@ -324,7 +325,7 @@ export function TrackPropertiesPage() {
   async function applyPlan(request: PropEditPreviewRequest, plan: PropEditPreviewResponse) {
     // A plan runs once: applying it again would only replay the finished job.
     lastPreview.current = null;
-    await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
+    await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? createLocalId() });
   }
 
   function cancelRunningApply() {

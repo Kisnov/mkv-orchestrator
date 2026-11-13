@@ -7,6 +7,7 @@ import { PreviewSummaryModal } from "../components/PreviewSummaryModal";
 import { SectionHeader } from "../components/SectionHeader";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useOperationJob } from "../state/OperationJobContext";
+import { createLocalId } from "../lib/localId";
 import { builtInSubtitleFonts, deleteImportedFont, fileToSubtitleFont, loadImportedFonts, registerPreviewFont, resolveFontData, type SubtitleFont } from "../lib/subtitleFonts";
 
 export function SubtitleFormatPage() {
@@ -150,7 +151,7 @@ export function SubtitleFormatPage() {
     try {
       const plan = await preview.mutateAsync(request());
       if (!plan.actions.length) { setStatus("No compatible subtitle changes are available."); return; }
-      await apply.mutateAsync({ ...request(plan), idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
+      await apply.mutateAsync({ ...request(plan), idempotencyKey: plan.idempotencyKey ?? createLocalId() });
     } catch { /* Mutation handlers show the failure. */ }
   }
 

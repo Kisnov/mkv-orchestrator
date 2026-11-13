@@ -11,6 +11,7 @@ import { SectionHeader } from "../components/SectionHeader";
 import { SortableColumnHeader, type SortDirection } from "../components/SortableColumnHeader";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useOperationJob } from "../state/OperationJobContext";
+import { createLocalId } from "../lib/localId";
 
 type FileSortKey = "file" | "reader" | "codec" | "audio" | "subtitles" | "status";
 
@@ -102,7 +103,7 @@ export function ReorderTracksPage() {
     try {
       const plan = await preview.mutateAsync(buildRequest());
       if (!plan.actions.length) { setStatusText("No track-order changes are needed for the selected files."); return; }
-      await apply.mutateAsync({ ...buildRequest(plan), idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
+      await apply.mutateAsync({ ...buildRequest(plan), idempotencyKey: plan.idempotencyKey ?? createLocalId() });
     } catch { /* Mutation handlers display the error. */ }
   }
   const busy = preview.isPending || apply.isPending || (operation.activeOperation?.label === "Reorder Tracks" && operation.isRunning);

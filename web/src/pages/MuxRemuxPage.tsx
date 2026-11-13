@@ -19,6 +19,7 @@ import { SectionHeader } from "../components/SectionHeader";
 import { SortableColumnHeader, type SortDirection } from "../components/SortableColumnHeader";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useOperationJob } from "../state/OperationJobContext";
+import { createLocalId } from "../lib/localId";
 
 type FileSortKey = "file" | "reader" | "codec" | "resolution" | "audio" | "subtitles" | "status";
 
@@ -280,7 +281,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
     try {
       const plan = await preview.mutateAsync(request);
       if (!plan.actions.length) { setStatusText("No changes are needed for the selected files."); return; }
-      await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
+      await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? createLocalId() });
     } catch { /* Mutation handlers display the error. */ }
   }
 
