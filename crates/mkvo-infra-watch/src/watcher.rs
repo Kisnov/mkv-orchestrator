@@ -163,7 +163,13 @@ impl WatchHandle {
         })
     }
 
-    fn start_polling(options: WatchOptions) -> Result<Self, WatchStartError> {
+    fn start_polling(mut options: WatchOptions) -> Result<Self, WatchStartError> {
+        // Snapshot keys are canonical, so roots are matched against them in that spelling.
+        for root in &mut options.roots {
+            if let Ok(canonical) = std::fs::canonicalize(&*root) {
+                *root = canonical;
+            }
+        }
         let initial = snapshot_roots(&options.roots, options.media_only)?;
         let (sender, receiver) = mpsc::channel(options.channel_capacity.max(1));
         let cancellation = CancellationToken::new();
@@ -329,6 +335,24 @@ fn queue_notify_event(event: Event, media_only: bool, pending: &mut BTreeMap<Pat
     }
 }
 
+/// A root that listed files and now lists none is a share that dropped, not a
+/// deleted library: it keeps its previous entries until it lists files again.
+fn keep_unavailable_roots(roots: &[PathBuf], previous: &Snapshot, current: &mut Snapshot) {
+    for root in roots {
+        let under = |path: &&PathBuf| path.starts_with(root);
+        if current.keys().any(|path| under(&path)) || !previous.keys().any(|path| under(&path)) {
+            continue;
+        }
+        tracing::warn!(root = %root.display(), "watch root lists no media; treating it as unavailable");
+        current.extend(
+            previous
+                .iter()
+                .filter(|(path, _)| under(path))
+                .map(|(path, identity)| (path.clone(), identity.clone())),
+        );
+    }
+}
+
 async fn poll_loop(
     options: WatchOptions,
     mut previous: Snapshot,
@@ -347,7 +371,8 @@ async fn poll_loop(
                 let media_only = options.media_only;
                 let snapshot = tokio::task::spawn_blocking(move || snapshot_roots(&roots, media_only)).await;
                 match snapshot {
-                    Ok(Ok(current)) => {
+                    Ok(Ok(mut current)) => {
+                        keep_unavailable_roots(&options.roots, &previous, &mut current);
                         let now = Instant::now();
                         for change in diff_snapshots(&previous, &current) {
                             let kind = match change.kind {
@@ -377,6 +402,7 @@ async fn poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileIdentity;
 
     #[test]
     fn rejects_empty_roots() {
@@ -421,6 +447,36 @@ mod tests {
         drop(handle);
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(event.paths, [expected]);
+    }
+
+    /// A polled share that dropped lists nothing; that must not become one
+    /// removal per file, while a root that still lists files reports its own.
+    #[test]
+    fn a_root_that_went_empty_keeps_its_previous_snapshot() {
+        let identity = FileIdentity {
+            size: 1,
+            modified_at_ns: 1,
+        };
+        let (share, local) = (PathBuf::from("share"), PathBuf::from("local"));
+        let previous: Snapshot = [
+            (share.join("a.mkv"), identity.clone()),
+            (share.join("b.mkv"), identity.clone()),
+            (local.join("c.mkv"), identity.clone()),
+            (local.join("d.mkv"), identity.clone()),
+        ]
+        .into();
+        let mut current: Snapshot = [(local.join("c.mkv"), identity)].into();
+
+        keep_unavailable_roots(&[share, local.clone()], &previous, &mut current);
+
+        let changes = diff_snapshots(&previous, &current);
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| (change.path.clone(), change.kind))
+                .collect::<Vec<_>>(),
+            [(local.join("d.mkv"), ReconcileChangeKind::Removed)]
+        );
     }
 
     /// A file still being copied keeps growing between checks, and is only
