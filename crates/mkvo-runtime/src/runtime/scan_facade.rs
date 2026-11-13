@@ -403,25 +403,25 @@ impl MkvoRuntime {
     async fn replace_working_set(&self, paths: &[String]) -> mkvo_contracts::FileSelectionResponse {
         let key = mkvo_application::paths::path_key;
         let wanted: BTreeSet<String> = paths.iter().map(|path| key(Path::new(path))).collect();
-        let mut files = self.working_set_by_key(key, &wanted).await;
+        let held: BTreeSet<String> = {
+            let state = self.inner.current_scan.read().await;
+            let keys = state.files.iter().map(|file| key(&file.path));
+            keys.filter(|key| wanted.contains(key)).collect()
+        };
         let missing: Vec<_> = paths
             .iter()
             .map(PathBuf::from)
-            .filter(|path| !files.contains_key(&key(path)))
+            .filter(|path| !held.contains(&key(path)))
             .collect();
-        let mut read = stream::iter(missing)
+        let read: Vec<MediaFile> = stream::iter(missing)
             .map(|path| self.read_file(path))
-            .buffer_unordered(REFRESH_PROBES);
-        while let Some(file) = read.next().await {
-            if let Some(file) = file {
-                files.insert(key(&file.path), file);
-            }
-        }
-        let mut files: Vec<_> = files.into_values().collect();
-        files.sort_by(|left, right| left.path.cmp(&right.path));
+            .buffer_unordered(REFRESH_PROBES)
+            .filter_map(|file| async move { file })
+            .collect()
+            .await;
 
         let mut state = self.inner.current_scan.write().await;
-        let replaced = state.replace_files(files);
+        let replaced = state.keep_only(&wanted, read);
         // The scan that produced them may not have been asked for its files yet.
         if let Some(job) = state.scan_job.take() {
             self.inner.jobs.attach(job, Arc::new(replaced)).await;

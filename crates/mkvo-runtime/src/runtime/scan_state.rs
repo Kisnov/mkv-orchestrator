@@ -61,9 +61,21 @@ impl CurrentScanState {
         replaced
     }
 
-    /// Make `files` the whole working set, all selected. Returns the files
+    /// Narrow the working set to the files under the `wanted` keys, all
+    /// selected, taking from `read` those it does not hold. Returns the files
     /// it replaced.
-    pub(super) fn replace_files(&mut self, files: Vec<MediaFile>) -> Vec<MediaFile> {
+    pub(super) fn keep_only(
+        &mut self,
+        wanted: &BTreeSet<String>,
+        read: Vec<MediaFile>,
+    ) -> Vec<MediaFile> {
+        let key = |file: &MediaFile| mkvo_application::paths::path_key(&file.path);
+        // What the set holds now wins: an operation may have re-read it since `read` began.
+        let held = self.files.iter().filter(|file| wanted.contains(&key(file)));
+        let mut files: Vec<MediaFile> = held.cloned().collect();
+        let mut taken: BTreeSet<String> = files.iter().map(key).collect();
+        files.extend(read.into_iter().filter(|file| taken.insert(key(file))));
+        files.sort_by(|left, right| left.path.cmp(&right.path));
         let count = |extensions: &[&str]| {
             let matching = files.iter().filter(|file| {
                 let extension = file.extension();
@@ -79,10 +91,7 @@ impl CurrentScanState {
             mp4: count(&["mp4", "m4v"]),
             ..ScanSummary::default()
         };
-        self.selected = files
-            .iter()
-            .map(|file| mkvo_application::paths::path_key(&file.path))
-            .collect();
+        self.selected = taken;
         std::mem::replace(&mut self.files, files)
     }
 
@@ -233,6 +242,26 @@ mod tests {
             state.selected_display_paths(),
             ["/media/b.mkv", "/media/c.mkv"]
         );
+    }
+
+    /// Reading the files a handoff names takes a while, and an operation may
+    /// finish meanwhile: its re-read copy is the newer one.
+    #[test]
+    fn a_handoff_keeps_the_copies_the_working_set_holds_by_then() {
+        let mut state = state_with(&["/media/a.mkv", "/media/other.mkv"]);
+        state.files[0].fingerprint.size_bytes = 99;
+        let wanted = ["/media/a.mkv", "/media/b.mkv"]
+            .map(|path| mkvo_application::paths::path_key(Path::new(path)))
+            .into();
+        let read = ["/media/b.mkv", "/media/a.mkv", "/media/b.mkv"].map(media_at);
+
+        let replaced = state.keep_only(&wanted, read.into());
+
+        assert_eq!(paths(&state), ["/media/a.mkv", "/media/b.mkv"]);
+        assert_eq!(state.files[0].fingerprint.size_bytes, 99);
+        assert_eq!(state.selected_display_paths(), paths(&state));
+        assert_eq!((state.summary.total, state.summary.mkv), (2, 2));
+        assert_eq!(replaced.len(), 2);
     }
 
     #[test]
