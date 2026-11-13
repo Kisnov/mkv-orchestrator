@@ -1640,6 +1640,11 @@ fn validate_imported_font(file_name: &str, data: &str) -> RuntimeResult<()> {
             "Imported font name and data must both be provided.",
         ));
     }
+    if file_name.trim().starts_with('@') {
+        return Err(RuntimeError::invalid(
+            "Imported font name must not start with @.",
+        ));
+    }
     let path = Path::new(file_name.trim());
     if path.file_name().and_then(|value| value.to_str()) != Some(file_name.trim()) {
         return Err(RuntimeError::invalid(
@@ -1671,7 +1676,10 @@ fn imported_font_path(
     attributes: &BTreeMap<String, String>,
 ) -> Option<PathBuf> {
     let name = attributes.get("subtitleFontFileName")?.trim();
-    if name.is_empty() || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+    // mkvmerge would load `--attachment-name @x` as a file of further options.
+    if name.is_empty()
+        || name.starts_with('@')
+        || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
     {
         return None;
     }
@@ -2394,6 +2402,32 @@ pub(super) mod execution_tests {
                 .iter()
                 .any(|line| line.contains("temporary file was left behind"))
         );
+    }
+
+    #[tokio::test]
+    async fn no_argument_can_be_read_by_mkvmerge_as_an_options_file() {
+        assert!(validate_imported_font("@fonts.ttf", "AA==").is_err());
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            // mkvmerge loads any argument that starts with `@` as a file of further options.
+            if invocation
+                .arguments
+                .iter()
+                .any(|argument| argument.starts_with('@'))
+            {
+                exited(invocation, 2, "Error: an options file was read\n")
+            } else {
+                writes_output(invocation)
+            }
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+        let mut plan = remux_plan(vec![episode]);
+        plan.context
+            .attributes
+            .insert("subtitleFontFileName".to_owned(), "@fonts.ttf".to_owned());
+
+        let job = library.run_remux(plan).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
     }
 
     #[tokio::test]
