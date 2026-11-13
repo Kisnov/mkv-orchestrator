@@ -427,6 +427,11 @@ impl RenameHistoryRepository for SqliteRepositories {
         RenameHistoryRepository::add(self, &record).await
     }
 
+    async fn remove_before(&self, before: DateTime<Utc>) -> Result<u64, PortError> {
+        self.blocking(move |store| store.delete_rename_batches_before(before.timestamp_millis()))
+            .await
+    }
+
     async fn clear(&self) -> Result<u64, PortError> {
         self.blocking(|store| store.clear_rename_batches()).await
     }
@@ -1092,6 +1097,59 @@ mod tests {
         let kept = stored_events(&repositories, &scanned).await;
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["event"]["type"], "canceled");
+    }
+
+    fn rename_batch(name: &str, age_days: i64) -> RenameBatchRecord {
+        let original = std::path::PathBuf::from(format!("/library/{name}.mkv"));
+        RenameBatchRecord {
+            id: RenameBatchId::new(),
+            created_at: Utc::now() - chrono::TimeDelta::days(age_days),
+            undone_at: None,
+            provider: None,
+            template: "{title}".to_owned(),
+            entries: vec![mkvo_domain::RenameBatchEntry {
+                renamed_path: original.with_extension("renamed.mkv"),
+                original_fingerprint: FileFingerprint {
+                    path: original.clone(),
+                    size_bytes: 1,
+                    modified_at: Utc::now(),
+                    quick_hash: None,
+                },
+                original_path: original,
+                renamed_fingerprint: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_batches_applied_before_the_cutoff_go_with_their_entries() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let old = rename_batch("old", 31);
+        let recent = rename_batch("recent", 29);
+        for batch in [&old, &recent] {
+            RenameHistoryRepository::add(&repositories, batch)
+                .await
+                .expect("add");
+        }
+
+        let cutoff = Utc::now() - chrono::TimeDelta::days(30);
+        let removed = RenameHistoryRepository::remove_before(&repositories, cutoff)
+            .await
+            .expect("remove");
+        assert_eq!(removed, 1);
+
+        let stored = RenameHistoryRepository::list_recent(&repositories, 10)
+            .await
+            .expect("list");
+        assert_eq!(stored, [recent]);
+        let entries: i64 = repositories
+            .store()
+            .connection()
+            .expect("connection")
+            .query_row("SELECT COUNT(*) FROM rename_entries", [], |row| row.get(0))
+            .expect("entries");
+        assert_eq!(entries, 1);
     }
 
     #[tokio::test]

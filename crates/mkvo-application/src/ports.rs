@@ -194,6 +194,8 @@ pub trait RenameHistoryRepository: Send + Sync {
     async fn get(&self, id: RenameBatchId) -> Result<Option<RenameBatchRecord>, PortError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<RenameBatchRecord>, PortError>;
     async fn mark_undone(&self, id: RenameBatchId, at: DateTime<Utc>) -> Result<(), PortError>;
+    /// Forget the batches applied before `before`; they can no longer be undone.
+    async fn remove_before(&self, before: DateTime<Utc>) -> Result<u64, PortError>;
     async fn clear(&self) -> Result<u64, PortError>;
 }
 

@@ -6,12 +6,14 @@ use super::MkvoRuntime;
 use crate::RuntimeResult;
 
 const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a rename can be undone. Fixed, not a setting.
+const RENAME_UNDO_DAYS: i64 = 30;
 
 impl MkvoRuntime {
     /// Delete expired plans, and the finished jobs, journals and logs older
     /// than `rename.history_retention_days`. Zero days keeps them forever,
     /// but still clears what older builds stored and nothing reads. Rename
-    /// batches are left alone: undo reads them.
+    /// batches go after `RENAME_UNDO_DAYS` whatever that setting says.
     pub async fn prune_history(&self) -> RuntimeResult<u64> {
         let dependencies = &self.inner.dependencies;
         let now = Utc::now();
@@ -20,6 +22,10 @@ impl MkvoRuntime {
         let days = settings.rename.history_retention_days;
         let cutoff = (days > 0).then(|| now - TimeDelta::days(i64::from(days)));
         removed += dependencies.jobs.prune_history(cutoff).await?;
+        removed += dependencies
+            .rename_history
+            .remove_before(now - TimeDelta::days(RENAME_UNDO_DAYS))
+            .await?;
         Ok(removed)
     }
 
@@ -154,6 +160,61 @@ mod tests {
         assert_eq!(runtime.prune_history().await.unwrap(), 2);
         assert_eq!(log_messages(&runtime).await, ["recent", "old"]);
         assert!(jobs.get(scanned.id).await.unwrap().is_some());
+    }
+
+    /// Thirty days, whatever the history setting says: past that, undo is
+    /// knowingly given up.
+    #[tokio::test]
+    async fn a_rename_can_be_undone_for_thirty_days() {
+        use mkvo_domain::{FileFingerprint, RenameBatchEntry, RenameBatchId, RenameBatchRecord};
+
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let runtime = MkvoRuntimeBuilder::new(&library, directory.path().join("config"))
+            .app_name("test")
+            .disable_legacy_migration()
+            .authorized_root(&library, true)
+            .build()
+            .unwrap();
+        let dependencies = &runtime.inner.dependencies;
+        let (mut settings, _revision) = dependencies.settings.load().await.unwrap();
+        settings.rename.history_retention_days = 0;
+        dependencies.settings.save(&settings, None).await.unwrap();
+
+        let mut batches = Vec::new();
+        for (name, age_days) in [("old", 31), ("recent", 29)] {
+            let original = library.join(format!("{name}.mkv"));
+            let renamed = library.join(format!("{name}-renamed.mkv"));
+            std::fs::write(&renamed, b"mkv").unwrap();
+            let batch = RenameBatchRecord {
+                id: RenameBatchId::new(),
+                created_at: Utc::now() - TimeDelta::days(age_days),
+                undone_at: None,
+                provider: None,
+                template: "{title}".to_owned(),
+                entries: vec![RenameBatchEntry {
+                    original_fingerprint: FileFingerprint {
+                        path: original.clone(),
+                        size_bytes: 3,
+                        modified_at: Utc::now(),
+                        quick_hash: None,
+                    },
+                    original_path: original,
+                    renamed_path: renamed,
+                    renamed_fingerprint: None,
+                }],
+            };
+            dependencies.rename_history.add(&batch).await.unwrap();
+            batches.push(batch.id.to_string());
+        }
+
+        assert_eq!(runtime.prune_history().await.unwrap(), 1);
+        assert!(runtime.undo_rename_batch(&batches[0]).await.is_err());
+        assert!(!library.join("old.mkv").exists());
+        let undone = runtime.undo_rename_batch(&batches[1]).await.unwrap();
+        assert_eq!(undone.renamed, 1);
+        assert!(library.join("recent.mkv").exists());
     }
 
     #[tokio::test]
