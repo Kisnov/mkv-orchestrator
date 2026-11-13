@@ -155,3 +155,28 @@ it("takes the backend's selection when a later scan leaves none of the old batch
 
   expect(screen.getByRole("checkbox", { name: "Select 03.mkv" })).not.toBeChecked();
 });
+
+it("reports a failed reorder job and lists its failed files", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "reorder-job", label: "Reorder Tracks" }));
+  const files = [file("01.mkv"), file("02.mkv")];
+  const summary = { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 };
+  const user = userEvent.setup();
+  renderWithBackend(
+    <MediaLibraryProvider><ReorderTracksPage/></MediaLibraryProvider>,
+    {
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-11-12T10:00:00Z", files, selectedPaths: [], summary }),
+      setFileSelection: (paths) => Promise.resolve({ files, selectedPaths: paths, updatedUtc: null, summary }),
+      getOperationJob: () => Promise.resolve({
+        id: "reorder-job", kind: "Remux", status: "Failed", createdUtc: "", startedUtc: null, completedUtc: null,
+        completed: 0, failed: 2, skipped: 0, total: 2, currentFile: "", currentFilePercent: 0,
+        lines: ["/media/01.mkv: mkvmerge failed", "/media/02.mkv: mkvmerge failed"], muxResult: null, propEditResult: null,
+        error: "2 of 2 files failed: 01.mkv: mkvmerge failed; 02.mkv: mkvmerge failed"
+      })
+    }
+  );
+
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("2 of 2 files failed"));
+  await user.click(screen.getByRole("button", { name: "Show the 2 failed file(s) and job log" }));
+  expect(screen.getByRole("dialog", { name: "Reorder Tracks job log" })).toHaveTextContent("02.mkv: mkvmerge failed");
+});
