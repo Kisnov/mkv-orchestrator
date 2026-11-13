@@ -446,7 +446,7 @@ export function TrackPropertiesPage() {
 
         <div ref={panelRef} className="grid min-h-0 min-w-0" style={{ gridTemplateRows: `minmax(0,${filePanelPercent}fr) 12px minmax(0,${100 - filePanelPercent}fr)` }}>
           <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
-            <FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} />
+            <FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} warnDiffering />
           </section>
 
           <PanelDivider containerRef={panelRef} value={filePanelPercent} onChange={setFilePanelPercent} />
