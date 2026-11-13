@@ -880,6 +880,26 @@ mod tests {
         );
     }
 
+    /// Each change costs the subscriber a probe, so a few hundred files landing
+    /// at once must queue rather than lag into a full library reconciliation.
+    #[tokio::test]
+    async fn a_burst_of_changes_reaches_a_slow_subscriber_without_lag() {
+        let service = WatchService::new(WatchOptions::default());
+        let mut changes = WatchBackend::subscribe(&service);
+        for index in 0..1000 {
+            service
+                .events
+                .send(WatchChange {
+                    kind: WatchChangeKind::Created,
+                    paths: vec![PathBuf::from(format!("{index}.mkv"))],
+                })
+                .expect("subscriber");
+        }
+        for _ in 0..1000 {
+            assert!(changes.try_recv().is_ok());
+        }
+    }
+
     #[tokio::test]
     async fn polling_reconciliation_is_delivered_through_watch_backend_subscription() {
         let stamp = SystemTime::now()

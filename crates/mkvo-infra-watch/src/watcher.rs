@@ -43,7 +43,7 @@ impl Default for WatchOptions {
             debounce: Duration::from_secs(3),
             poll_interval: Duration::from_secs(30 * 60),
             media_only: true,
-            channel_capacity: 256,
+            channel_capacity: 4096,
         }
     }
 }
