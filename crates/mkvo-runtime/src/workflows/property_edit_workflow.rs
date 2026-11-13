@@ -449,6 +449,7 @@ mod execution_tests {
         inner: Arc<dyn OperationJournal>,
         updates: AtomicUsize,
         broke: Arc<Notify>,
+        last_rejected: Arc<std::sync::Mutex<Option<JournalRecord>>>,
     }
 
     #[async_trait]
@@ -462,6 +463,7 @@ mod execution_tests {
             if self.updates.fetch_add(1, Ordering::SeqCst) == 0 {
                 return self.inner.advance(record).await;
             }
+            *self.last_rejected.lock().expect("record") = Some(record.clone());
             self.broke.notify_one();
             Err(PortError::Other("the journal is unavailable".to_owned()))
         }
@@ -500,11 +502,13 @@ mod execution_tests {
             finished: Arc::default(),
         };
         let broke = Arc::new(Notify::new());
+        let last_rejected = Arc::default();
         let library = library_with(tools.clone(), |dependencies| {
             dependencies.journal = Arc::new(BrokenJournal {
                 inner: dependencies.journal.clone(),
                 updates: AtomicUsize::new(0),
                 broke: broke.clone(),
+                last_rejected: Arc::clone(&last_rejected),
             });
         });
         let files = vec![
@@ -520,8 +524,14 @@ mod execution_tests {
         assert_eq!(job.status, JobStatus::Failed);
         assert!(job.error.expect("error").contains("journal is unavailable"));
         assert_eq!(tools.finished.load(Ordering::SeqCst), 2);
-        // The edit that landed after the error is still counted.
-        assert_eq!(job.completed, 2);
+        // The edit that landed after the error is still recorded.
+        let record = last_rejected
+            .lock()
+            .expect("record")
+            .clone()
+            .expect("journal update");
+        let completed = mkvo_application::JournalItemStatus::Completed;
+        assert!(record.items.iter().all(|item| item.status == completed));
     }
 
     #[tokio::test]
