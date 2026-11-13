@@ -357,7 +357,8 @@ fn job_events(
     )
 }
 
-/// The snapshot, then the job's events until the one that ends it.
+/// The snapshot, then the job's events until the one that ends it. The first
+/// events may repeat changes the snapshot already shows.
 pub(crate) fn job_event_stream(
     snapshot: Event,
     ended: bool,

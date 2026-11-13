@@ -26,5 +26,8 @@ session expiry, and the explicit local-network bypass warning.
 
 The server preserves the React client's polling endpoints and also exposes
 Server-Sent Events at `/api/scans/{id}/events` and
-`/api/operations/{id}/events`. Unknown `/api` paths always return typed JSON
+`/api/operations/{id}/events`: a `snapshot` event with the job as the matching
+GET returns it, then `job` events until the one that ends the job, when the
+stream closes. The first `job` events may repeat changes the snapshot already
+shows. Unknown `/api` paths always return typed JSON
 errors; only non-API navigation falls back to the React `index.html`.
