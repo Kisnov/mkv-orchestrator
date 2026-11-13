@@ -231,6 +231,7 @@ impl MkvoRuntime {
             .map_err(|error| RuntimeError::internal(error.to_string()))?;
         let key = IdempotencyKey::generate();
         let scan = Arc::clone(&self.inner.scan);
+        let jobs = Arc::clone(&self.inner.jobs);
         let current = Arc::clone(&self.inner.current_scan);
         // Scanning is the most-run operation, so it has to reach the operation
         // log too; otherwise the Logs page stays empty through normal use.
@@ -259,8 +260,13 @@ impl MkvoRuntime {
                 {
                     let mut current = current.write().await;
                     current.updated_utc = Some(Utc::now());
-                    current.scan_job = Some(context.job_id());
-                    current.apply_scan(outcome.files, summary);
+                    let replaced_job = current.scan_job.replace(context.job_id());
+                    let replaced = current.apply_scan(outcome.files, summary);
+                    // The earlier scan's client may not have asked for its
+                    // files yet. Moved, not copied.
+                    if let Some(job) = replaced_job {
+                        jobs.attach(job, Arc::new(replaced)).await;
+                    }
                 }
                 let detail = format!(
                     "{} file(s): {} MKV, {} MP4, {} cached, {} failed",
@@ -460,21 +466,31 @@ impl MkvoRuntime {
 
     pub async fn clear_current_scan_files(&self) -> RuntimeResult<CurrentScanResponse> {
         let mut state = self.inner.current_scan.write().await;
-        *state = CurrentScanState::default();
+        let cleared = std::mem::take(&mut *state);
+        if let Some(job) = cleared.scan_job {
+            self.inner.jobs.attach(job, Arc::new(cleared.files)).await;
+        }
         Ok(current_scan_response(&state))
     }
 
     async fn scan_job_response(&self, snapshot: &JobSnapshot) -> RuntimeResult<ScanJobResponse> {
         let state = scan_state_from_snapshot(snapshot).unwrap_or_default();
-        // The job keeps the counts; the files come from the working set for
-        // as long as it is still this scan's.
+        // The job keeps the counts. The files come from the working set while
+        // it is still this scan's, and afterwards from what was handed to the
+        // job, which lasts until the job leaves memory. The lock is held
+        // across both lookups so a hand-over cannot fall between them.
         let current = self.inner.current_scan.read().await;
-        let files =
-            if snapshot.status == JobStatus::Completed && current.scan_job == Some(snapshot.id) {
-                current.files.iter().map(MediaFileRow::from).collect()
-            } else {
-                Vec::new()
-            };
+        let files = if snapshot.status != JobStatus::Completed {
+            Vec::new()
+        } else if current.scan_job == Some(snapshot.id) {
+            current.files.iter().map(MediaFileRow::from).collect()
+        } else {
+            let handed_over = self.inner.jobs.attachment::<Vec<MediaFile>>(snapshot.id);
+            handed_over
+                .await
+                .map(|files| files.iter().map(MediaFileRow::from).collect())
+                .unwrap_or_default()
+        };
         Ok(ScanJobResponse::from_snapshot(
             snapshot,
             files,
@@ -563,27 +579,28 @@ mod tests {
         }
     }
 
-    async fn scan(host: &Host) -> ScanJobResponse {
-        let started = host
-            .runtime
-            .start_scan(ScanRequest {
-                source_path: Some(display_path(&host.library)),
-                ..ScanRequest::default()
-            })
-            .await
-            .unwrap();
+    async fn start(host: &Host, folder: &Path) -> JobId {
+        let request = ScanRequest {
+            source_path: Some(display_path(folder)),
+            ..ScanRequest::default()
+        };
+        host.runtime.start_scan(request).await.unwrap().id
+    }
+
+    async fn finished(host: &Host, id: JobId) -> ScanJobResponse {
         for _ in 0..4_000 {
-            let job = host
-                .runtime
-                .get_scan_job(&started.id.to_string())
-                .await
-                .unwrap();
+            let job = host.runtime.get_scan_job(&id.to_string()).await.unwrap();
             if job.status.is_terminal() {
                 return job;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("scan did not finish");
+    }
+
+    async fn scan(host: &Host) -> ScanJobResponse {
+        let id = start(host, &host.library).await;
+        finished(host, id).await
     }
 
     /// The scan status still answers with every file, but what the scan
@@ -641,20 +658,36 @@ mod tests {
         assert!(after.files.is_empty());
     }
 
+    /// Two clients, two scans. Whichever finishes first has lost the working
+    /// set to the other by the time its client asks, and an empty answer
+    /// there would be saved by the Library page as an empty library.
     #[tokio::test]
-    async fn only_the_scan_that_owns_the_working_set_serves_files() {
-        let host = host(3);
-        let first = scan(&host).await;
-        let second = scan(&host).await;
+    async fn scans_that_finish_together_each_serve_their_own_files() {
+        let host = host(0);
+        let mut scans = Vec::new();
+        for (name, files) in [("anime", 2), ("films", 3)] {
+            let folder = host.library.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            for index in 0..files {
+                std::fs::write(folder.join(format!("{index}.mkv")), b"mkv").unwrap();
+            }
+            scans.push((start(&host, &folder).await, name, files));
+        }
+        for (id, _, _) in &scans {
+            finished(&host, *id).await;
+        }
 
-        let first = host
-            .runtime
-            .get_scan_job(&first.id.to_string())
-            .await
-            .unwrap();
-        assert!(first.files.is_empty());
-        assert_eq!(first.summary.total, 3);
-        assert_eq!(second.files.len(), 3);
+        let assert_own_files = || async {
+            for (id, name, files) in &scans {
+                let job = host.runtime.get_scan_job(&id.to_string()).await.unwrap();
+                assert_eq!(job.files.len(), *files, "{name}");
+                assert!(job.files.iter().all(|file| file.path.contains(name)));
+            }
+        };
+        assert_own_files().await;
+        // Clearing the working set must not empty an answer either.
+        host.runtime.clear_current_scan_files().await.unwrap();
+        assert_own_files().await;
     }
 
     #[test]

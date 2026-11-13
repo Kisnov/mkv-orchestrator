@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -185,6 +186,7 @@ impl JobSupervisor {
             repository: Arc::clone(&self.repository),
             retained_lines: self.retained_lines,
             saved_at: Mutex::new(Instant::now()),
+            attachment: StdMutex::new(None),
         });
 
         self.repository.insert(&snapshot).await?;
@@ -293,6 +295,28 @@ impl JobSupervisor {
         Ok(jobs)
     }
 
+    /// Keep data in memory with a job until the job leaves it, for output
+    /// too large to store in the job itself. A job no longer in memory keeps
+    /// nothing.
+    pub async fn attach(&self, id: JobId, data: Arc<dyn Any + Send + Sync>) {
+        if let Some(live) = self.live.read().await.get(&id) {
+            *live
+                .attachment
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data);
+        }
+    }
+
+    pub async fn attachment<T: Any + Send + Sync>(&self, id: JobId) -> Option<Arc<T>> {
+        let live = self.live.read().await.get(&id).cloned()?;
+        let data = live
+            .attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        data.downcast().ok()
+    }
+
     pub async fn cancel(&self, id: JobId) -> ApplicationResult<JobSnapshot> {
         let live = self
             .live
@@ -331,6 +355,7 @@ struct LiveJob {
     /// When the snapshot last reached the repository. Held across each write
     /// so an older snapshot can never land after a newer one.
     saved_at: Mutex<Instant>,
+    attachment: StdMutex<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
 impl LiveJob {
@@ -1192,6 +1217,38 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!((recent[0].id, recent[0].completed), (accepted.id, 2));
         assert_eq!(recent[0].current_file, "b.mkv");
+    }
+
+    #[tokio::test]
+    async fn data_attached_to_a_job_lasts_as_long_as_it_stays_in_memory() {
+        let supervisor = Arc::new(
+            JobSupervisor::new(Arc::new(InMemoryJobRepository::default()))
+                .with_completed_job_retention(Duration::from_millis(20)),
+        );
+        let accepted = supervisor
+            .start(spec("attached-key", Vec::new()), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        supervisor
+            .attach(accepted.id, Arc::new(vec!["a.mkv".to_owned()]))
+            .await;
+        supervisor.attach(JobId::new(), Arc::new(0_u8)).await;
+
+        let files = supervisor.attachment::<Vec<String>>(accepted.id).await;
+        assert_eq!(files.as_deref(), Some(&vec!["a.mkv".to_owned()]));
+        assert!(supervisor.attachment::<u8>(accepted.id).await.is_none());
+
+        for _ in 0..400 {
+            if !supervisor.live.read().await.contains_key(&accepted.id) {
+                let gone = supervisor.attachment::<Vec<String>>(accepted.id).await;
+                assert!(gone.is_none());
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("terminal job was not evicted from live memory");
     }
 
     #[tokio::test]

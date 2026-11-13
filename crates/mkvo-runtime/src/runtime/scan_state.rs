@@ -24,7 +24,8 @@ pub(super) struct ScanResultState {
 #[derive(Clone, Debug, Default)]
 pub(super) struct CurrentScanState {
     pub(super) updated_utc: Option<DateTime<Utc>>,
-    /// The scan that produced `files`, whose status response serves them.
+    /// The scan that produced `files`. Its status response serves them from
+    /// here; once it loses them they are handed to its job instead.
     pub(super) scan_job: Option<JobId>,
     pub(super) files: Vec<MediaFile>,
     pub(super) summary: ScanSummary,
@@ -35,10 +36,15 @@ pub(super) struct CurrentScanState {
 impl CurrentScanState {
     /// Replace the working set after a scan, selecting every file the first
     /// time a working set is populated. Later rescans preserve an explicit
-    /// user selection, including a deliberate empty selection.
-    pub(super) fn apply_scan(&mut self, files: Vec<MediaFile>, summary: ScanSummary) {
+    /// user selection, including a deliberate empty selection. Returns the
+    /// files it replaced.
+    pub(super) fn apply_scan(
+        &mut self,
+        files: Vec<MediaFile>,
+        summary: ScanSummary,
+    ) -> Vec<MediaFile> {
         let is_initial_scan = self.files.is_empty() && self.selected.is_empty();
-        self.files = files;
+        let replaced = std::mem::replace(&mut self.files, files);
         self.summary = summary;
         if is_initial_scan {
             self.selected = self
@@ -49,6 +55,7 @@ impl CurrentScanState {
         } else {
             self.reconcile_selection();
         }
+        replaced
     }
 
     /// Move the authoritative working set and selection with completed renames.
