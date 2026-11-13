@@ -300,17 +300,15 @@ async fn inactive(
     let timeout = timeout?;
     // Few checks per timeout: each one may itself hang on the share being watched.
     let interval = timeout / 6;
+    let mut quiet_since = tokio::time::Instant::now();
     let mut seen = progress(printed, outputs, interval).await;
-    let mut idle = Duration::ZERO;
-    while idle < timeout {
+    while quiet_since.elapsed() < timeout {
         tokio::time::sleep(interval).await;
         let now = progress(printed, outputs, interval).await;
-        idle = if now == seen {
-            idle + interval
-        } else {
-            Duration::ZERO
-        };
-        seen = now;
+        if now != seen {
+            quiet_since = tokio::time::Instant::now();
+            seen = now;
+        }
     }
     Some(timeout)
 }
