@@ -127,6 +127,8 @@ export function TrackPropertiesPage() {
   // clobber edits in progress; when it does change, re-seeding is exactly the
   // reload that reflects it.
   const loadedTemplate = templateLoad.data;
+  // The editable tracks lag a newly chosen template until its read lands.
+  const templateReady = template !== null && template === loadedTemplate && !templateLoad.isFetching;
   useEffect(() => {
     if (!loadedTemplate) return;
     const stored = storedConfiguration.current;
@@ -294,7 +296,7 @@ export function TrackPropertiesPage() {
       return;
     }
 
-    if (!template) {
+    if (!templateReady) {
       setStatusText("Select and load a scanned MKV template file first.");
       return;
     }
@@ -305,7 +307,7 @@ export function TrackPropertiesPage() {
   }
 
   async function runApply() {
-    if (selectedMkvPaths.length === 0 || !template) return;
+    if (selectedMkvPaths.length === 0 || !templateReady) return;
     const request = buildRequest();
     try {
       // Apply the plan that was previewed unless the request has changed since.
@@ -431,8 +433,9 @@ export function TrackPropertiesPage() {
 
           </MobileOptions>
       <div className="mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3" aria-label="Operation actions">
-        <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 || !template)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
-        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !template)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
+        <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
+        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)}
+ className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
         <span className="w-full text-xs text-muted">{selectedMkvPaths.length} files selected</span>
         <span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
       </div>

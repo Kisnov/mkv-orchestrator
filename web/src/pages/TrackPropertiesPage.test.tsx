@@ -1,4 +1,5 @@
 import { useMediaLibrary, MediaLibraryProvider } from "../state/MediaLibraryContext";
+import type { BackendClient } from "../backend/client";
 import { renderWithBackend } from "../test/render";
 import type { MediaFileRow, OperationJobResponse, PropEditPreviewRequest, PropEditPreviewResponse, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
 import { act, screen, waitFor, within } from "@testing-library/react";
@@ -372,7 +373,11 @@ describe("Edit Tracks file selection", () => {
     return { trackNumber, trackLabel: `Audio ${trackNumber}`, type: "audio", currentName: name, currentLanguage: language, currentCodec: "AAC", currentChannels: 2, currentDefault: trackNumber === 1, editedName: name, nameFromMetadata: false, editedLanguage: language };
   }
 
-  function renderPage() {
+  function loaded(request: PropEditTemplateRequest) {
+    return { ...template(request.templatePath ?? ""), audioTracks: [audioRow(1, "English", "cat"), audioRow(2, "Japonès", "jpn")] };
+  }
+
+  function renderPage(overrides: Partial<BackendClient> = {}) {
     const plan = vi.fn((request: PropEditPreviewRequest) => Promise.resolve({
       actions: request.selectedPaths.map((path, index) => ({ index, filePath: path, fileName: path.split("/").pop()!, description: "Apply 1 property mutation(s)", command: "" })),
       skipped: [], noChange: [], summary: "ready", status: "Track-properties preview ready",
@@ -384,9 +389,10 @@ describe("Edit Tracks file selection", () => {
       {
         getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-11-12T10:00:00Z", files: scanned, selectedPaths: [], summary: { total: 10, mkv: 10, mp4: 0, failed: 0, cached: 0 } }),
         getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
-        loadPropEditTemplate: (request: PropEditTemplateRequest) => Promise.resolve({ ...template(request.templatePath ?? ""), audioTracks: [audioRow(1, "English", "cat"), audioRow(2, "Japonès", "jpn")] }),
+        loadPropEditTemplate: (request: PropEditTemplateRequest) => Promise.resolve(loaded(request)),
         buildPropEditPreview: plan,
-        startPropEditApply: apply
+        startPropEditApply: apply,
+        ...overrides
       }
     );
     return { plan, apply };
@@ -438,7 +444,33 @@ describe("Edit Tracks file selection", () => {
     expect(plan.mock.calls[0][0]).toMatchObject({ templatePath: differing[0].path, selectedPaths: [differing[0].path, differing[1].path] });
   });
 
+  it("blocks preview and apply until the newly chosen template has loaded", async () => {
+    const user = userEvent.setup();
+    let finishRead = () => {};
+    const { plan, apply } = renderPage({
+      loadPropEditTemplate: (request) => request.templatePath === differing[0].path
+        ? new Promise((resolve) => { finishRead = () => resolve(loaded(request)); })
+        : Promise.resolve(loaded(request))
+    });
+    const applyButton = await ready();
+    const previewButton = screen.getByRole("button", { name: "Preview Summary" });
+
+    await user.selectOptions(screen.getByRole("combobox", { name: /template file/i }), differing[0].path);
+    expect(checked()).toEqual(["Episode 06.mkv", "Episode 07.mkv"]);
+    expect(applyButton).toBeDisabled();
+    expect(previewButton).toBeDisabled();
+    await user.click(applyButton);
+    await user.click(previewButton);
+    expect(plan).not.toHaveBeenCalled();
+    expect(apply).not.toHaveBeenCalled();
+
+    await act(async () => finishRead());
+    await waitFor(() => expect(applyButton).toBeEnabled());
+    expect(previewButton).toBeEnabled();
+  });
+
   it("asks for confirmation, naming the target tracks, before applying to a file that differs", async () => {
+
     const user = userEvent.setup();
     const { plan, apply } = renderPage();
     const applyButton = await ready();
