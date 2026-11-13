@@ -25,6 +25,7 @@ pub struct ServerConfig {
     pub auth_enabled: bool,
     pub auth_username: String,
     pub secure_cookies: bool,
+    pub allowed_hosts: Vec<String>,
     pub tool_directories: Vec<PathBuf>,
     pub provider_secret_overrides: BTreeMap<String, String>,
     pub request_body_limit_bytes: usize,
@@ -115,6 +116,10 @@ impl ServerConfig {
                 config_dir.display()
             );
         }
+        let allowed_hosts = list(get("MKVO_ALLOWED_HOSTS"))
+            .into_iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
         let tool_directories = list(get("MKVO_TOOL_DIRECTORIES"))
             .into_iter()
             .map(PathBuf::from)
@@ -142,6 +147,7 @@ impl ServerConfig {
             auth_enabled,
             auth_username,
             secure_cookies,
+            allowed_hosts,
             tool_directories,
             provider_secret_overrides,
             request_body_limit_bytes,
@@ -358,6 +364,15 @@ mod tests {
             ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).unwrap();
         assert!(config.auth_enabled);
         assert!(config.tool_directories.is_empty());
+    }
+
+    #[test]
+    fn parses_allowed_hosts() {
+        let config = ServerConfig::from_lookup(|key| {
+            (key == "MKVO_ALLOWED_HOSTS").then(|| " NAS.local, mkvo.example.com ;".to_owned())
+        })
+        .unwrap();
+        assert_eq!(config.allowed_hosts, ["nas.local", "mkvo.example.com"]);
     }
 
     #[test]

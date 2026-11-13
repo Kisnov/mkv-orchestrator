@@ -141,7 +141,11 @@ async fn auth_login(
         );
         return response;
     }
-    let Some((_, cookie)) = auth.login(&input.username, &input.password) else {
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
+    let Some((_, cookie)) = auth.sign_in(&input.username, &input.password, https) else {
         throttle.fail(Instant::now());
         return error(
             axum::http::StatusCode::UNAUTHORIZED,
@@ -170,11 +174,68 @@ async fn auth_logout(State(auth): State<AuthState>, request: Request) -> Respons
 }
 
 pub async fn require_auth(State(auth): State<AuthState>, request: Request, next: Next) -> Response {
-    if !auth.password_required(peer(&request)) || auth.authenticated(request.headers()) {
+    if !auth.password_required(peer(&request)) {
+        // Without a session cookie, only a known Host name stops DNS rebinding.
+        if !auth.host_allowed(request_host(&request)) {
+            return error(
+                axum::http::StatusCode::FORBIDDEN,
+                "This host name is not allowed without signing in. Add it to MKVO_ALLOWED_HOSTS or use the IP address.",
+            );
+        }
+        next.run(request).await
+    } else if auth.authenticated(request.headers()) {
         next.run(request).await
     } else {
         unauthorized()
     }
+}
+
+/// Refuses browser state changes sent from another site's page.
+pub async fn check_origin(State(auth): State<AuthState>, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let refused = !request.method().is_safe()
+        && headers.get(header::ORIGIN).is_some_and(|origin| {
+            let origin = origin.to_str().unwrap_or_default();
+            let authority = origin
+                .strip_prefix("https://")
+                .or_else(|| origin.strip_prefix("http://"))
+                .unwrap_or_default();
+            let served_as = [header::HOST.as_str(), "x-forwarded-host"]
+                .into_iter()
+                .filter_map(|name| headers.get(name)?.to_str().ok())
+                .map(|value| value.split(',').next().unwrap_or_default().trim());
+            authority.is_empty()
+                || !(served_as
+                    .into_iter()
+                    .any(|host| host.eq_ignore_ascii_case(authority))
+                    || auth.listed_host(hostname(authority)))
+        });
+    if refused {
+        return error(
+            axum::http::StatusCode::FORBIDDEN,
+            "Cross-site request refused. Behind a reverse proxy that rewrites Host, add the public host name to MKVO_ALLOWED_HOSTS.",
+        );
+    }
+    next.run(request).await
+}
+
+fn request_host(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().host())
+}
+
+/// The host name of `host[:port]`, without IPv6 brackets.
+fn hostname(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or_default();
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host)
 }
 
 async fn auth_activity(State(auth): State<AuthState>, request: Request) -> Response {
@@ -238,6 +299,7 @@ pub struct AuthState {
     credential: Option<Arc<RwLock<Credential>>>,
     data_dir: Option<PathBuf>,
     throttle: Arc<tokio::sync::Mutex<Throttle>>,
+    allowed_hosts: Arc<[String]>,
     sessions: Arc<RwLock<HashMap<String, Instant>>>,
     secure_cookie: bool,
     settings: Arc<RwLock<SecuritySettings>>,
@@ -322,6 +384,7 @@ impl AuthState {
             credential: Some(Arc::new(RwLock::new(credential))),
             data_dir: Some(data_dir.to_owned()),
             throttle: Arc::default(),
+            allowed_hosts: Arc::from([]),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie,
             settings: Arc::new(RwLock::new(settings)),
@@ -338,6 +401,7 @@ impl AuthState {
                 .then(|| Arc::new(RwLock::new(Credential::Configured(password.to_owned())))),
             data_dir: None,
             throttle: Arc::default(),
+            allowed_hosts: Arc::from([]),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             secure_cookie: false,
             settings: Arc::new(RwLock::new(SecuritySettings::default())),
@@ -394,6 +458,27 @@ impl AuthState {
         self
     }
 
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = hosts.into();
+        self
+    }
+
+    fn listed_host(&self, host: &str) -> bool {
+        self.allowed_hosts
+            .iter()
+            .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(host))
+    }
+
+    /// IP addresses and localhost always work; other names must be listed.
+    fn host_allowed(&self, host: Option<&str>) -> bool {
+        let Some(host) = host.map(hostname) else {
+            return true;
+        };
+        host.parse::<IpAddr>().is_ok()
+            || host.eq_ignore_ascii_case("localhost")
+            || self.listed_host(host)
+    }
+
     pub fn password_required(&self, peer: Option<SocketAddr>) -> bool {
         self.auth_enabled && !self.local_bypass(peer)
     }
@@ -439,7 +524,18 @@ impl AuthState {
         false
     }
 
+    #[cfg(test)]
     pub fn login(&self, username: &str, candidate: &str) -> Option<(String, HeaderValue)> {
+        self.sign_in(username, candidate, false)
+    }
+
+    /// `https` marks the cookie Secure even when MKVO_SECURE_COOKIES is off.
+    pub fn sign_in(
+        &self,
+        username: &str,
+        candidate: &str,
+        https: bool,
+    ) -> Option<(String, HeaderValue)> {
         let credential = self.credential.as_ref()?;
         let current = credential.read().ok()?.clone();
         let password_match = match &current {
@@ -468,7 +564,11 @@ impl AuthState {
         let mut sessions = self.sessions.write().ok()?;
         sessions.retain(|_, last_activity| !expired(*last_activity, timeout));
         sessions.insert(token.clone(), Instant::now());
-        let secure = if self.secure_cookie { "; Secure" } else { "" };
+        let secure = if self.secure_cookie || https {
+            "; Secure"
+        } else {
+            ""
+        };
         let value = HeaderValue::from_str(&format!(
             "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict{secure}"
         ))

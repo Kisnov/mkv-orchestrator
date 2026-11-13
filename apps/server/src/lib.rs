@@ -4,12 +4,14 @@ mod error;
 mod request_id;
 mod routes;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
-    Router,
-    extract::{DefaultBodyLimit, Request},
-    middleware,
+    Json, Router,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
 };
 use mkvo_runtime::{MkvoRuntime, MkvoRuntimeBuilder, RuntimeResult};
 use tower_http::{
@@ -55,7 +57,8 @@ pub fn build_router(
         &config.auth_username,
         config.secure_cookies,
     )?
-    .with_authentication(config.auth_enabled);
+    .with_authentication(config.auth_enabled)
+    .with_allowed_hosts(config.allowed_hosts.clone());
     let state = AppState { runtime };
     let protected = routes::api_router(state)
         .merge(auth::protected_router(auth.clone()))
@@ -66,13 +69,19 @@ pub fn build_router(
 
     Ok(Router::new()
         .route("/api/health", axum::routing::get(routes::health))
-        .merge(auth::public_router(auth))
+        .merge(auth::public_router(auth.clone()))
         .merge(protected)
         .fallback_service(
             ServeDir::new(&config.ui_dir)
                 .fallback(ServeFile::new(config.ui_dir.join("index.html"))),
         )
         .layer(DefaultBodyLimit::max(config.request_body_limit_bytes))
+        .layer(middleware::from_fn_with_state(
+            RequestTimeout(Duration::from_secs(120)),
+            request_timeout,
+        ))
+        .layer(middleware::from_fn_with_state(auth, auth::check_origin))
+        .layer(middleware::from_fn(security_headers))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
                 let correlation_id = request
@@ -89,6 +98,58 @@ pub fn build_router(
             }),
         )
         .layer(middleware::from_fn(request_id::attach_correlation_id)))
+}
+
+// The built SPA has no inline scripts; React and Tailwind set styles inline.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::REFERRER_POLICY, "same-origin"),
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    response
+}
+
+#[derive(Clone, Copy)]
+struct RequestTimeout(Duration);
+
+/// Previews, applies, audits and media-server calls run inline for many minutes and
+/// must not be cut halfway, so only the remaining endpoints are timed.
+async fn request_timeout(
+    State(RequestTimeout(limit)): State<RequestTimeout>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if [
+        "/api/media-servers/",
+        "/api/rename/",
+        "/api/mux/",
+        "/api/propedit/",
+        "/api/library/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+    {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "detail": format!("The server stopped this request after {} seconds.", limit.as_secs())
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn shutdown_signal() {
@@ -168,6 +229,7 @@ mod tests {
                     .map_or("admin", |auth| auth.username.as_str())
                     .to_owned(),
                 secure_cookies: false,
+                allowed_hosts: Vec::new(),
                 tool_directories: Vec::new(),
                 auth,
                 provider_secret_overrides,
@@ -650,5 +712,240 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn state_changes_from_another_origin_are_refused() {
+        let mut host = TestHost::new(None);
+        Arc::get_mut(&mut host.config).unwrap().allowed_hosts = vec!["nas.local".to_owned()];
+        let router = host.router();
+        for (headers, expected) in [
+            (vec![], StatusCode::OK),
+            (
+                vec![
+                    ("Host", "192.168.1.10:8886"),
+                    ("Origin", "http://192.168.1.10:8886"),
+                ],
+                StatusCode::OK,
+            ),
+            (
+                vec![
+                    ("Host", "127.0.0.1:8080"),
+                    ("X-Forwarded-Host", "mkvo.example.com"),
+                    ("Origin", "https://mkvo.example.com"),
+                ],
+                StatusCode::OK,
+            ),
+            (
+                vec![
+                    ("Host", "10.0.0.2:8886"),
+                    ("Origin", "http://NAS.local:8886"),
+                ],
+                StatusCode::OK,
+            ),
+            (
+                vec![
+                    ("Host", "192.168.1.10:8886"),
+                    ("Origin", "http://evil.example"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![
+                    ("Host", "192.168.1.10:8886"),
+                    ("Origin", "http://192.168.1.10:9999"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![("Host", "192.168.1.10:8886"), ("Origin", "null")],
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request("POST", "/api/auth/logout", &headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{headers:?}");
+        }
+        // Reads are not state changes; the Host check below covers them.
+        let response = router
+            .oneshot(request(
+                "GET",
+                "/api/auth/status",
+                &[("Origin", "http://evil.example")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn password_free_access_only_answers_known_host_names() {
+        let mut host = TestHost::new(None);
+        Arc::get_mut(&mut host.config).unwrap().allowed_hosts = vec!["nas.local".to_owned()];
+        let router = host.router();
+        for (host_header, expected) in [
+            ("192.168.1.10:8886", StatusCode::OK),
+            ("[fd00::2]:8886", StatusCode::OK),
+            ("localhost:8080", StatusCode::OK),
+            ("nas.local:8886", StatusCode::OK),
+            ("rebound.evil.example:8886", StatusCode::FORBIDDEN),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request("GET", "/api/status", &[("Host", host_header)]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{host_header}");
+        }
+
+        // A signed-in session is not reachable by a rebound page, so any name works.
+        let host = TestHost::new(Some(BasicAuth {
+            username: "admin".to_owned(),
+            password: "correct-password".to_owned(),
+        }));
+        let router = host.router();
+        let login = router
+            .clone()
+            .oneshot(login_request("correct-password"))
+            .await
+            .unwrap();
+        let cookie = login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let response = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/status",
+                &[("Host", "mkvo.example.com"), ("Cookie", &cookie)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The LAN bypass skips the password, so it gets the same Host check.
+        fs::write(
+            host.config.config_dir.join("security-settings.json"),
+            r#"{"idle_timeout_minutes":null,"local_network_bypass":true}"#,
+        )
+        .unwrap();
+        let router = host.router();
+        for (host_header, expected) in [
+            ("192.168.1.10:8886", StatusCode::OK),
+            ("rebound.evil.example", StatusCode::FORBIDDEN),
+        ] {
+            let mut request = request("GET", "/api/status", &[("Host", host_header)]);
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "192.168.1.2:1234".parse::<SocketAddr>().unwrap(),
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{host_header}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_carry_security_headers_and_a_csp_the_spa_can_run_under() {
+        let host = TestHost::new(None);
+        for path in ["/", "/api/status", "/api/does-not-exist"] {
+            let response = host
+                .router()
+                .oneshot(request("GET", path, &[]))
+                .await
+                .unwrap();
+            let headers = response.headers();
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{path}");
+            assert_eq!(headers[header::REFERRER_POLICY], "same-origin", "{path}");
+            let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            for directive in [
+                "default-src 'self'",
+                "script-src 'self'",
+                "img-src 'self' data: blob:",
+                "frame-ancestors 'none'",
+            ] {
+                assert!(csp.contains(directive), "{csp}");
+            }
+            assert!(!csp.contains("unsafe-eval"), "{csp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn https_proxies_get_a_secure_session_cookie() {
+        let host = TestHost::new(Some(BasicAuth {
+            username: "admin".to_owned(),
+            password: "correct-password".to_owned(),
+        }));
+        let mut login = login_request("correct-password");
+        login
+            .headers_mut()
+            .insert("x-forwarded-proto", "https".parse().unwrap());
+        let response = host.router().oneshot(login).await.unwrap();
+        assert!(
+            response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .ends_with("; Secure")
+        );
+        let response = host
+            .router()
+            .oneshot(login_request("correct-password"))
+            .await
+            .unwrap();
+        assert!(
+            !response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Secure")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_timeout_spares_long_operations() {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            "done"
+        }
+        let router = Router::new()
+            .route("/api/status", axum::routing::get(slow))
+            .route("/api/mux/apply", axum::routing::post(slow))
+            .route("/api/rename/apply", axum::routing::post(slow))
+            .route("/api/propedit/preview", axum::routing::post(slow))
+            .route("/api/library/catalog", axum::routing::post(slow))
+            .route("/api/media-servers/test", axum::routing::post(slow))
+            .layer(middleware::from_fn_with_state(
+                RequestTimeout(std::time::Duration::from_millis(50)),
+                request_timeout,
+            ));
+        let response = router
+            .clone()
+            .oneshot(request("GET", "/api/status", &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        for path in [
+            "/api/mux/apply",
+            "/api/rename/apply",
+            "/api/propedit/preview",
+            "/api/library/catalog",
+            "/api/media-servers/test",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request("POST", path, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 }
