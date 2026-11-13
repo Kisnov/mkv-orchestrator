@@ -8,20 +8,23 @@ impl MkvoRuntime {
         let files = if request.paths.is_empty() {
             self.resolve_rows(&request.files, &[]).await?
         } else {
-            let requested: BTreeSet<_> = request.paths.iter().map(|path| path_key(path)).collect();
-            let mut found = self.working_set_by_key(file_key, &requested).await;
-            // A Library scan leaves the working set alone; its files are with its job.
-            if found.len() < requested.len()
-                && let Some(overview) = self.overview_files().await
-            {
-                for file in overview.iter() {
-                    let key = file_key(&file.path);
-                    if requested.contains(&key) {
-                        found.entry(key).or_insert_with(|| file.clone());
-                    }
-                }
+            let mut missing: BTreeSet<_> =
+                request.paths.iter().map(|path| path_key(path)).collect();
+            let mut files = Vec::with_capacity(missing.len());
+            // A Library scan leaves the working set alone: what it just read
+            // is with its job, and is newer than any copy the set holds.
+            if let Some(overview) = self.overview_files().await {
+                let scanned = overview.iter();
+                files.extend(
+                    scanned
+                        .filter(|file| missing.remove(&file_key(&file.path)))
+                        .cloned(),
+                );
             }
-            let mut files: Vec<_> = found.into_values().collect();
+            if !missing.is_empty() {
+                let held = self.working_set_by_key(file_key, &missing).await;
+                files.extend(held.into_values());
+            }
             files.sort_by(|left, right| left.path.cmp(&right.path));
             files
         };

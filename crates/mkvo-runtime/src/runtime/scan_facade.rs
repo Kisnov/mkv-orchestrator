@@ -579,8 +579,12 @@ mod tests {
     use super::*;
     use crate::MkvoRuntimeBuilder;
 
-    /// Stands in for mkvmerge: every file has the same three audio tracks.
-    struct Probe;
+    /// Stands in for mkvmerge: every file has the same three audio tracks,
+    /// Japanese until `english` says the files were changed on disk.
+    #[derive(Default)]
+    struct Probe {
+        english: std::sync::atomic::AtomicBool,
+    }
 
     #[async_trait]
     impl MediaProbe for Probe {
@@ -589,6 +593,8 @@ mod tests {
             path: &Path,
             _cancel: CancellationToken,
         ) -> Result<MediaFile, PortError> {
+            let english = self.english.load(std::sync::atomic::Ordering::SeqCst);
+            let language = if english { "eng" } else { "jpn" };
             let mut file = media_at(&path.to_string_lossy());
             file.tracks = (0..3)
                 .map(|id| MediaTrack {
@@ -597,7 +603,7 @@ mod tests {
                     kind: TrackKind::Audio,
                     codec: "AAC".to_owned(),
                     codec_id: None,
-                    language: Some("jpn".to_owned()),
+                    language: Some(language.to_owned()),
                     name: Some("Stereo".to_owned()),
                     resolution: None,
                     bit_depth: None,
@@ -644,7 +650,7 @@ mod tests {
     }
 
     fn host(files: usize) -> Host {
-        host_with(files, Arc::new(Probe))
+        host_with(files, Arc::new(Probe::default()))
     }
 
     /// A real database and a real folder of `files` MKVs; only the probe is faked.
@@ -860,6 +866,41 @@ mod tests {
         let audit = host.runtime.run_library_audit(request).await.unwrap();
 
         assert_eq!(audit.summary.files, 3);
+    }
+
+    /// A title sent to the Dashboard leaves copies in the working set. When
+    /// the Library rebuilds it later, the audit is of what was just read.
+    #[tokio::test]
+    async fn an_audit_reads_the_overview_scan_before_the_working_set() {
+        let probe = Arc::new(Probe::default());
+        let host = host_with(0, probe.clone());
+        let films = folder(&host, "films", 2);
+        let id = start(&host, &films).await;
+        finished(&host, id).await;
+
+        probe
+            .english
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let rebuild = ScanRequest {
+            source_path: Some(display_path(&films)),
+            keep_working_set: true,
+            force_refresh: true,
+            ..ScanRequest::default()
+        };
+        let id = host.runtime.start_scan(rebuild).await.unwrap().id;
+        let request = crate::compat::LibraryAuditRequest {
+            paths: finished(&host, id)
+                .await
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect(),
+            files: Vec::new(),
+        };
+        let audit = host.runtime.run_library_audit(request).await.unwrap();
+
+        let audio = &audit.items[0].standard_audio;
+        assert!(audio.contains("eng") && !audio.contains("jpn"), "{audio}");
     }
 
     /// Sending a title from the Library to the Dashboard: those files become
