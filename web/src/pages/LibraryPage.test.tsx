@@ -374,4 +374,30 @@ describe("Library poster workflow", () => {
     await waitFor(() => expect(buildLibraryAudit).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/example show rebuilt: 4 files/i)).toBeInTheDocument();
   });
+
+  it("does not save an empty library when the scan's files are no longer held", async () => {
+    const buildLibraryAudit = vi.fn();
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      {
+        getWebSettings: () => Promise.resolve(settings()),
+        getLibraryCatalog: () => Promise.resolve({ items: [] }),
+        startScan: () => Promise.resolve({ id: "lost-scan", status: "Queued", files: [], completed: 0, total: 0 } as ScanJobResponse),
+        getScanJob: (id) => Promise.resolve({
+          id,
+          status: "Completed",
+          completed: 4,
+          total: 4,
+          files: [],
+          summary: { total: 4, mkv: 4, mp4: 0, failed: 0, cached: 0 },
+          skipped: [],
+          error: ""
+        } as ScanJobResponse),
+        buildLibraryAudit
+      }
+    );
+
+    expect(await screen.findByText(/scan results are no longer held/i)).toBeInTheDocument();
+    expect(buildLibraryAudit).not.toHaveBeenCalled();
+  });
 });
