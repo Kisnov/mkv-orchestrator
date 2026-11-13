@@ -219,17 +219,19 @@ fn add_episode_issues(
 ) {
     let numbered: Vec<_> = files
         .iter()
-        .filter_map(|file| parse_episode_number(&file.file_name()).map(|number| (number, *file)))
+        .filter_map(|file| parse_episode(&file.file_name()).map(|parsed| (parsed, *file)))
         .collect();
     if numbered.len() < 2 {
         return;
     }
     let mut by_episode: BTreeMap<u32, Vec<PathBuf>> = BTreeMap::new();
-    for (episode, file) in &numbered {
-        by_episode
-            .entry(*episode)
-            .or_default()
-            .push(file.path.clone());
+    for (parsed, file) in &numbered {
+        for episode in parsed.episode..=parsed.last_episode {
+            by_episode
+                .entry(episode)
+                .or_default()
+                .push(file.path.clone());
+        }
     }
     let duplicate_numbers: Vec<_> = by_episode
         .iter()
@@ -411,51 +413,137 @@ fn parse_season_folder(value: &str) -> Option<(u32, Option<String>)> {
     None
 }
 
-#[must_use]
-pub fn parse_episode_number(file_name: &str) -> Option<u32> {
-    if let Some((_, episode)) = parse_season_episode(file_name) {
-        return Some(episode);
+/// Where a file sits in its series, as its name says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParsedEpisode {
+    /// Written with the episode, as in `S01E02` or `1x02`.
+    pub season: Option<u32>,
+    pub episode: u32,
+    /// The last episode of a file that holds several; otherwise `episode`.
+    pub last_episode: u32,
+}
+
+impl ParsedEpisode {
+    fn single(season: Option<u32>, episode: u32) -> Self {
+        Self {
+            season,
+            episode,
+            last_episode: episode,
+        }
     }
+}
+
+/// The number written at `start` and where it ends, if it has at most `max`
+/// digits: a longer one is something else, and reading part of it is wrong.
+fn number_at(bytes: &[u8], start: usize, max: usize) -> Option<(u32, usize)> {
+    let length = bytes
+        .get(start..)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if length == 0 || length > max {
+        return None;
+    }
+    let digits = std::str::from_utf8(&bytes[start..start + length]).ok()?;
+    Some((digits.parse().ok()?, start + length))
+}
+
+fn starts_word(bytes: &[u8], index: usize) -> bool {
+    index == 0 || !bytes[index - 1].is_ascii_alphanumeric()
+}
+
+fn ends_word(bytes: &[u8], index: usize) -> bool {
+    bytes
+        .get(index)
+        .is_none_or(|byte| !byte.is_ascii_alphanumeric())
+}
+
+/// A number that is far more often a year or a video height than an episode.
+fn is_year_or_resolution(number: u32) -> bool {
+    (1900..=2099).contains(&number)
+        || matches!(
+            number,
+            360 | 480 | 540 | 576 | 720 | 1080 | 1440 | 2160 | 4320
+        )
+}
+
+/// `S01E02`, and with it `S01E01E02`, `S01E01-E03` and `S01E01-02`.
+fn season_episode_marker(bytes: &[u8]) -> Option<ParsedEpisode> {
+    (0..bytes.len()).find_map(|index| {
+        if bytes[index] != b's' || !starts_word(bytes, index) {
+            return None;
+        }
+        let (season, cursor) = number_at(bytes, index + 1, 4)?;
+        if bytes.get(cursor) != Some(&b'e') {
+            return None;
+        }
+        let (episode, mut cursor) = number_at(bytes, cursor + 1, 4)?;
+        let mut last_episode = episode;
+        loop {
+            let rest = &bytes[cursor..];
+            let marked = rest.starts_with(b"-e") || rest.starts_with(b"e");
+            let skipped = if rest.starts_with(b"-e") { 2 } else { 1 };
+            if !marked && !rest.starts_with(b"-") {
+                break;
+            }
+            let Some((next, end)) = number_at(bytes, cursor + skipped, 4) else {
+                break;
+            };
+            // A bare `-02` has to stand alone and look like an episode.
+            if next <= last_episode
+                || !marked && (!ends_word(bytes, end) || is_year_or_resolution(next))
+            {
+                break;
+            }
+            last_episode = next;
+            cursor = end;
+        }
+        Some(ParsedEpisode {
+            season: Some(season),
+            episode,
+            last_episode,
+        })
+    })
+}
+
+/// `1x02`, but not the `1920x1080` of a resolution.
+fn season_x_episode(bytes: &[u8]) -> Option<ParsedEpisode> {
+    (0..bytes.len()).find_map(|index| {
+        if !starts_word(bytes, index) {
+            return None;
+        }
+        let (season, cursor) = number_at(bytes, index, 2)?;
+        if bytes.get(cursor) != Some(&b'x') {
+            return None;
+        }
+        let (episode, end) = number_at(bytes, cursor + 1, 4)?;
+        (end - cursor > 2 && ends_word(bytes, end))
+            .then(|| ParsedEpisode::single(Some(season), episode))
+    })
+}
+
+/// Parse the episode a media filename states with a marker: `S01E02`, `1x02`,
+/// `Episode 7`, `E07`, or a number alone in brackets.
+#[must_use]
+pub fn parse_episode(file_name: &str) -> Option<ParsedEpisode> {
     let lower = file_name.to_ascii_lowercase();
     let bytes = lower.as_bytes();
-    for index in 0..bytes.len() {
-        if bytes[index] != b's' {
-            continue;
-        }
-        let mut cursor = index + 1;
-        let season_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - season_start < 2 {
-            cursor += 1;
-        }
-        if cursor == season_start || cursor >= bytes.len() || bytes[cursor] != b'e' {
-            continue;
-        }
-        cursor += 1;
-        let episode_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - episode_start < 3 {
-            cursor += 1;
-        }
-        if cursor > episode_start {
-            return lower[episode_start..cursor].parse().ok();
-        }
+    if let Some(parsed) = season_episode_marker(bytes).or_else(|| season_x_episode(bytes)) {
+        return Some(parsed);
     }
     for marker in ["episode", "ep", "e"] {
         let mut offset = 0;
         while let Some(found) = lower[offset..].find(marker) {
             let start = offset + found;
-            let boundary_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
             let mut cursor = start + marker.len();
-            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
                 cursor += 1;
             }
-            let digit_start = cursor;
-            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - digit_start < 3
+            if starts_word(bytes, start)
+                && let Some((episode, end)) = number_at(bytes, cursor, 4)
+                && ends_word(bytes, end)
             {
-                cursor += 1;
-            }
-            let boundary_after = cursor == bytes.len() || !bytes[cursor].is_ascii_alphanumeric();
-            if boundary_before && boundary_after && cursor > digit_start {
-                return lower[digit_start..cursor].parse().ok();
+                return Some(ParsedEpisode::single(None, episode));
             }
             offset = start + marker.len();
         }
@@ -463,60 +551,79 @@ pub fn parse_episode_number(file_name: &str) -> Option<u32> {
     // Anime release names commonly put the episode in its own numeric bracket,
     // for example `[VCB-Studio] Show [01][Ma10p_1080p].mkv`. This is checked
     // after explicit SxxExx / Episode markers so a deliberate marker always
-    // wins. Requiring the entire bracket to be 1-3 digits avoids treating
-    // resolution, codec, bit-depth, or CRC tags as episode numbers.
-    let mut cursor = 0usize;
-    while let Some(open_offset) = lower[cursor..].find('[') {
-        let open = cursor + open_offset;
-        let content_start = open + 1;
-        let Some(close_offset) = lower[content_start..].find(']') else {
-            break;
-        };
-        let close = content_start + close_offset;
-        let content = &lower[content_start..close];
-        if !content.is_empty()
-            && content.len() <= 3
-            && content.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return content.parse().ok();
-        }
-        cursor = close + 1;
-    }
-    None
+    // wins. The whole bracket has to be a number, and not one that reads as a
+    // year or a resolution.
+    lower
+        .split('[')
+        .skip(1)
+        .filter_map(|bracket| bracket.split_once(']'))
+        .find_map(|(content, _)| {
+            let (number, end) = number_at(content.as_bytes(), 0, 4)?;
+            (end == content.len() && !is_year_or_resolution(number))
+                .then(|| ParsedEpisode::single(None, number))
+        })
 }
 
-/// Parse the common `SxxExxx` identity embedded in a media filename.
+/// [`parse_episode`], or the release form `Title - 01`, where only the spaced
+/// dash marks the number; `Title S2 - 03` also names the season.
+///
+/// Rename accepts this looser form. The library audit does not, so that it
+/// never takes an unrelated number for an episode.
+#[must_use]
+pub fn parse_release_episode(file_name: &str) -> Option<ParsedEpisode> {
+    if let Some(parsed) = parse_episode(file_name) {
+        return Some(parsed);
+    }
+    let stem = Path::new(file_name).file_stem()?.to_string_lossy();
+    let stem = stem.to_ascii_lowercase().replace('_', " ");
+    let bytes = stem.as_bytes();
+    stem.match_indices(" - ").find_map(|(dash, _)| {
+        let (episode, mut end) = number_at(bytes, dash + 3, 4)?;
+        // `01v2` is a second release of episode 1.
+        if bytes.get(end) == Some(&b'v')
+            && let Some((_, version_end)) = number_at(bytes, end + 1, 1)
+        {
+            end = version_end;
+        }
+        let stands_alone = bytes
+            .get(end)
+            .is_none_or(|byte| matches!(byte, b' ' | b'[' | b'('));
+        // A resolution is not ruled out here: episode 720 of a long show is real.
+        (stands_alone && !(1900..=2099).contains(&episode))
+            .then(|| ParsedEpisode::single(trailing_season(&stem[..dash]), episode))
+    })
+}
+
+/// The season a title ends with: `Title S2`, `Title Season 2`, `Title 2nd Season`.
+fn trailing_season(title: &str) -> Option<u32> {
+    let mut words = title.split_whitespace().rev();
+    let last = words.next()?;
+    let digits = if last == "season" {
+        words
+            .next()?
+            .trim_end_matches(|character: char| character.is_ascii_alphabetic())
+    } else if words.next() == Some("season") {
+        last
+    } else {
+        last.strip_prefix('s')?
+    };
+    ((1..=2).contains(&digits.len())).then(|| digits.parse().ok())?
+}
+
+#[must_use]
+pub fn parse_episode_number(file_name: &str) -> Option<u32> {
+    parse_episode(file_name).map(|parsed| parsed.episode)
+}
+
+/// Parse the season and episode a media filename states together, as in
+/// `S01E02` or `1x02`.
 ///
 /// Keeping the season alongside the episode prevents a multi-season rename
 /// from matching every `E01` to the first season returned by the provider.
 #[must_use]
 pub fn parse_season_episode(file_name: &str) -> Option<(u32, u32)> {
-    let lower = file_name.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    for index in 0..bytes.len() {
-        if bytes[index] != b's' {
-            continue;
-        }
-        let mut cursor = index + 1;
-        let season_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - season_start < 2 {
-            cursor += 1;
-        }
-        if cursor == season_start || cursor >= bytes.len() || bytes[cursor] != b'e' {
-            continue;
-        }
-        let season = lower[season_start..cursor].parse().ok()?;
-        cursor += 1;
-        let episode_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - episode_start < 3 {
-            cursor += 1;
-        }
-        if cursor > episode_start {
-            let episode = lower[episode_start..cursor].parse().ok()?;
-            return Some((season, episode));
-        }
-    }
-    None
+    let parsed = parse_episode(file_name)?;
+    Some((parsed.season?, parsed.episode))
 }
 
 #[cfg(test)]
@@ -590,6 +697,120 @@ mod tests {
             parse_episode_number("[VCB-Studio] Show [Ma10p_1080p][A1B2C3D4].mkv"),
             None
         );
+    }
+
+    fn parsed(season: Option<u32>, episode: u32, last_episode: u32) -> Option<ParsedEpisode> {
+        Some(ParsedEpisode {
+            season,
+            episode,
+            last_episode,
+        })
+    }
+
+    #[test]
+    fn episode_markers_are_read_whole_and_only_where_they_are_markers() {
+        for (name, expected) in [
+            ("Show.S02E013.mkv", parsed(Some(2), 13, 13)),
+            ("Show - S01E05 - Name.mkv", parsed(Some(1), 5, 5)),
+            ("Show S01E01v2.mkv", parsed(Some(1), 1, 1)),
+            ("Show S00E03.mkv", parsed(Some(0), 3, 3)),
+            // A double episode used to lose its second half.
+            ("Show S01E01E02.mkv", parsed(Some(1), 1, 2)),
+            ("Show S01E01-E03.mkv", parsed(Some(1), 1, 3)),
+            ("Show S01E01-02.mkv", parsed(Some(1), 1, 2)),
+            ("Show S01E05-2024.mkv", parsed(Some(1), 5, 5)),
+            ("Show S01E05-1080p.mkv", parsed(Some(1), 5, 5)),
+            // Four digits used to be cut to three: 1071 became 107.
+            ("One Piece S01E1071.mkv", parsed(Some(1), 1071, 1071)),
+            ("Show S01E12345.mkv", None),
+            ("Show E1234.mkv", parsed(None, 1234, 1234)),
+            ("Show - 1x02.mkv", parsed(Some(1), 2, 2)),
+            ("Show 12x103.mkv", parsed(Some(12), 103, 103)),
+            ("Show 1920x1080.mkv", None),
+            ("Show x264.mkv", None),
+            ("Show - Episode 007.mkv", parsed(None, 7, 7)),
+            ("Show Ep 05 [720p].mkv", parsed(None, 5, 5)),
+            (
+                "[VCB-Studio] 7th Time Loop [01][Ma10p_1080p][x265_flac].mkv",
+                parsed(None, 1, 1),
+            ),
+            ("One Piece [1071][1080p].mkv", parsed(None, 1071, 1071)),
+            ("[VCB-Studio] Show [Ma10p_1080p][A1B2C3D4].mkv", None),
+            // A resolution or a year in brackets is not an episode.
+            ("Show [720].mkv", None),
+            ("Show [1080].mkv", None),
+            ("Show [2024].mkv", None),
+            // Numbers that belong to the title.
+            ("86 EIGHTY-SIX.mkv", None),
+            ("Mob Psycho 100.mkv", None),
+            ("Title - OVA [1080p].mkv", None),
+        ] {
+            assert_eq!(parse_episode(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn release_names_mark_the_episode_with_a_spaced_dash() {
+        for (name, expected) in [
+            (
+                "[SubsPlease] Sousou no Frieren - 01 (1080p) [ABCD1234].mkv",
+                parsed(None, 1, 1),
+            ),
+            (
+                "[Erai-raws] Title - 01 [1080p][HEVC].mkv",
+                parsed(None, 1, 1),
+            ),
+            ("[Group] Title - 01v2 [720p].mkv", parsed(None, 1, 1)),
+            ("[HorribleSubs]_Title_-_07_[720p].mkv", parsed(None, 7, 7)),
+            (
+                "[Anime Time] My Hero Academia - 55.mkv",
+                parsed(None, 55, 55),
+            ),
+            ("Title - 05 - 10 Years Later.mkv", parsed(None, 5, 5)),
+            ("Title (2019) - 05 [BD 1080p].mkv", parsed(None, 5, 5)),
+            // A season written before the dash.
+            ("Title S2 - 03.mkv", parsed(Some(2), 3, 3)),
+            ("Title Season 2 - 03 [1080p].mkv", parsed(Some(2), 3, 3)),
+            ("Title 2nd Season - 03 [1080p].mkv", parsed(Some(2), 3, 3)),
+            // Explicit markers still win.
+            ("Title - 1x02.mkv", parsed(Some(1), 2, 2)),
+            ("Title - S01E01-E03 [1080p].mkv", parsed(Some(1), 1, 3)),
+            // Long-running shows.
+            (
+                "[Judas] One Piece - 1071 [1080p][HEVC x265 10bit].mkv",
+                parsed(None, 1071, 1071),
+            ),
+            (
+                "[Group] One Piece - 720 (1080p).mkv",
+                parsed(None, 720, 720),
+            ),
+            ("Title - 100.mkv", parsed(None, 100, 100)),
+            // Numbers in the title are not the episode.
+            ("[Group] 86 EIGHTY-SIX - 05 [1080p].mkv", parsed(None, 5, 5)),
+            ("Mob Psycho 100 - 07.mkv", parsed(None, 7, 7)),
+            ("Mob Psycho 100 III - 12 [1080p].mkv", parsed(None, 12, 12)),
+            ("Mob Psycho 100 [1080p].mkv", None),
+            // A year, a half episode, a special and a number too long to be one.
+            ("Title - 2024 [1080p].mkv", None),
+            ("Title - 12.5 [1080p].mkv", None),
+            ("[Group] Title - OVA 2 [BD].mkv", None),
+            ("Example Show - 20240.mkv", None),
+            ("Example Show 55.mkv", None),
+        ] {
+            assert_eq!(parse_release_episode(name), expected, "{name}");
+        }
+    }
+
+    /// The second half of a double episode was reported as missing.
+    #[test]
+    fn a_double_episode_file_covers_both_of_its_episodes() {
+        let files = vec![
+            media("root/Show/Season 1/Show S01E01E02.mkv", "eng"),
+            media("root/Show/Season 1/Show S01E03.mkv", "eng"),
+            media("root/Show/Season 1/Show S01E04.mkv", "eng"),
+        ];
+        let audit = LibraryAuditService.build("root", &files, &[]);
+        assert_eq!(audit.groups[0].issues, []);
     }
 
     #[test]
