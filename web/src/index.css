@@ -375,3 +375,10 @@ button[class*="bg-accent"]:not(:disabled):hover {
   .mobile-file-browser .file-browser-locations > .relative { width: auto; flex-shrink: 0; }
   .mobile-file-browser .file-browser-toolbar { gap: 4px; }
 }
+
+/* File selection table: the row listing a file's differences spans every column and wraps. */
+.file-selection-table .file-selection-details > td {
+  max-width: none;
+  overflow: visible;
+  white-space: normal;
+}

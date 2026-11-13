@@ -1,7 +1,7 @@
 import { MobileOptions } from "../components/MobileOptions";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, X } from "lucide-react";
 import {
   buildPropEditPreview,
   cancelOperationJob,
@@ -13,10 +13,14 @@ import {
   PropEditTrackConfigRow,
   startPropEditApply
 } from "../api";
+import { FileSelectionTable } from "../components/FileSelectionTable";
+import { PanelDivider } from "../components/PanelDivider";
 import { SectionHeader } from "../components/SectionHeader";
-import { PreviewSummaryModal } from "../components/PreviewSummaryModal";
+import { PreviewSummaryModal, type PreviewSummaryRow } from "../components/PreviewSummaryModal";
+import { describeTrackTargets } from "../lib/templateMatch";
+import { useFileSelection } from "../state/useFileSelection";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
-import { useInvalidatePropEditTemplate, usePropEditTemplate } from "../state/propEditTemplate";
+import { usePropEditTemplate } from "../state/propEditTemplate";
 import { useOperationJob } from "../state/OperationJobContext";
 
 type TitleMode = "keep" | "remove" | "file" | "episode_title" | "custom";
@@ -86,36 +90,46 @@ export function TrackPropertiesPage() {
   const [statusText, setStatusText] = useState("Load scanned files from Dashboard, then select a template.");
   const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
   const [configurationReady, setConfigurationReady] = useState(false);
+  // Holds the request, its plan and the differing files as they were when Apply was pressed.
+  const [pendingApply, setPendingApply] = useState<{ request: PropEditPreviewRequest; plan: PropEditPreviewResponse; rows: PreviewSummaryRow[] } | null>(null);
+  const [filePanelPercent, setFilePanelPercent] = useState(50);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const lastPreview = useRef<{ request: string; plan: PropEditPreviewResponse } | null>(null);
 
   useEffect(() => {
     if (!currentScan.data) return;
     syncFromBackend(currentScan.data);
   }, [currentScan.data]);
 
+  const mkvFiles = useMemo(() => files.filter((file) => file.extension.toLowerCase() === ".mkv"), [files]);
+
   useEffect(() => {
-    const sharedTemplate = files.some((file) => file.path === templateFilePath) ? templateFilePath : "";
-    const currentTemplate = files.some((file) => file.path === templatePath) ? templatePath : "";
-    const nextTemplate = sharedTemplate || currentTemplate || files.find((file) => file.extension.toLowerCase() === ".mkv")?.path || "";
+    // The shared template can be any scanned file; only an MKV can be edited.
+    const sharedTemplate = mkvFiles.some((file) => file.path === templateFilePath) ? templateFilePath : "";
+    const currentTemplate = mkvFiles.some((file) => file.path === templatePath) ? templatePath : "";
+    const nextTemplate = sharedTemplate || currentTemplate || mkvFiles[0]?.path || "";
     if (nextTemplate !== templatePath) setTemplatePath(nextTemplate);
     if (nextTemplate && nextTemplate !== templateFilePath) setTemplateFilePath(nextTemplate);
-  }, [files, templateFilePath, templatePath]);
+  }, [mkvFiles, templateFilePath, templatePath]);
 
-  const mkvFiles = useMemo(() => files.filter((file) => file.extension.toLowerCase() === ".mkv"), [files]);
-  // Edit Tracks is always a complete MKV batch. Selections made in
-  // Rename, Mux/Remux, or the library do not narrow this workflow.
-  const selectedMkvPaths = useMemo(() => mkvFiles.map((file) => file.path), [mkvFiles]);
+  const templateFile = useMemo(() => mkvFiles.find((file) => file.path === templatePath) ?? null, [mkvFiles, templatePath]);
+
+  // Page-local: selections made in Rename, Mux/Remux, or the library do not narrow this workflow.
+  const selection = useFileSelection(mkvFiles, templateFile);
+  const selectedMkvPaths = selection.selectedPaths;
   const nonMkvCount = files.length - mkvFiles.length;
 
   // Cached and warmed while the library loads, so arriving here usually finds
   // the tracks already read rather than starting the read.
   const templateLoad = usePropEditTemplate(templatePath, files);
-  const invalidateTemplate = useInvalidatePropEditTemplate();
 
   // Seeds the editable copies from whatever the cache holds. The query returns
   // the same object until the template genuinely changes, so this does not
   // clobber edits in progress; when it does change, re-seeding is exactly the
   // reload that reflects it.
   const loadedTemplate = templateLoad.data;
+  // The editable tracks lag a newly chosen template until its read lands.
+  const templateReady = template !== null && template === loadedTemplate && !templateLoad.isFetching;
   useEffect(() => {
     if (!loadedTemplate) return;
     const stored = storedConfiguration.current;
@@ -200,7 +214,8 @@ export function TrackPropertiesPage() {
 
   const preview = useMutation({
     mutationFn: buildPropEditPreview,
-    onSuccess: (response) => {
+    onSuccess: (response, request) => {
+      lastPreview.current = { request: JSON.stringify(request), plan: response };
       setPreviewResult(response);
       setStatusText(response.status);
     },
@@ -228,10 +243,6 @@ export function TrackPropertiesPage() {
       setStatusText(`Applying ${runningJob.completed + runningJob.failed + runningJob.skipped}/${runningJob.total}${progress}`);
       return;
     }
-
-    // The edits have landed on disk, so the cached track layout now describes
-    // how the files used to look. Dropping it re-reads them.
-    void invalidateTemplate();
 
     if (runningJob.propEditResult) {
       setPreviewResult(runningJob.propEditResult);
@@ -266,28 +277,54 @@ export function TrackPropertiesPage() {
     };
   }
 
+  // Edits go by position within a track type, so show where they land in files that differ.
+  const differingRows = useMemo(() => {
+    if (!templateFile) return [];
+    const audioLabels = audioTracks.map((track) => track.trackLabel);
+    const subtitleLabels = subtitleTracks.map((track) => track.trackLabel);
+    const selected = new Set(selectedMkvPaths);
+    return mkvFiles
+      .filter((file) => selection.differingPaths.has(file.path) && selected.has(file.path))
+      .map((file) => ({
+        key: file.path,
+        title: file.fileName,
+        detail: [...describeTrackTargets(file, templateFile, "audio", audioLabels), ...describeTrackTargets(file, templateFile, "subtitle", subtitleLabels)].join("\n")
+      }));
+  }, [mkvFiles, templateFile, selection.differingPaths, selectedMkvPaths, audioTracks, subtitleTracks]);
+
   function runPreview() {
     if (mkvFiles.length === 0) {
       setStatusText("Edit Tracks requires scanned MKV files. MP4 files can be inspected and renamed, but cannot be edited with mkvpropedit.");
       return;
     }
 
-    if (!template) {
+    if (!templateReady) {
       setStatusText("Select and load a scanned MKV template file first.");
       return;
     }
 
+    // The backend reads an empty selection as every file.
+    if (selectedMkvPaths.length === 0) return;
     preview.mutate(buildRequest());
   }
 
   async function runApply() {
-    if (selectedMkvPaths.length === 0 || !template) return;
+    if (selectedMkvPaths.length === 0 || !templateReady) return;
     const request = buildRequest();
     try {
-      const plan = await preview.mutateAsync(request);
+      // Apply the plan that was previewed unless the request has changed since.
+      const previewed = lastPreview.current?.request === JSON.stringify(request) ? lastPreview.current.plan : null;
+      const plan = previewed ?? await preview.mutateAsync(request);
       if (!plan.actions.length) { setStatusText("No changes are needed for the selected files."); return; }
-      await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
+      if (differingRows.length > 0) { setPendingApply({ request, plan, rows: differingRows }); return; }
+      await applyPlan(request, plan);
     } catch { /* Mutation handlers display the error. */ }
+  }
+
+  async function applyPlan(request: PropEditPreviewRequest, plan: PropEditPreviewResponse) {
+    // A plan runs once: applying it again would only replay the finished job.
+    lastPreview.current = null;
+    await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? crypto.randomUUID() });
   }
 
   function cancelRunningApply() {
@@ -398,15 +435,20 @@ export function TrackPropertiesPage() {
 
           </MobileOptions>
       <div className="mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3" aria-label="Operation actions">
-        <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 || !template)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
-        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !template)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
+        <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
+        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
         <span className="w-full text-xs text-muted">{selectedMkvPaths.length} files selected</span>
         <span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
       </div>
         </section>
 
-        <div className="min-h-0 min-w-0">
-          <section className="flex h-full min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
+        <div ref={panelRef} className="grid min-h-0 min-w-0" style={{ gridTemplateRows: `minmax(0,${filePanelPercent}fr) 12px minmax(0,${100 - filePanelPercent}fr)` }}>
+          <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
+            <FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} />
+          </section>
+
+          <PanelDivider containerRef={panelRef} value={filePanelPercent} onChange={setFilePanelPercent} />
+          <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
             <div className="flex shrink-0 items-center justify-between gap-3">
               <h2 className="text-base font-semibold">Edit Tracks</h2>
             </div>
@@ -459,6 +501,7 @@ export function TrackPropertiesPage() {
             { label: "Skipped", value: previewResult?.skipped.length ?? 0, tone: "text-warning" }
           ]}
           sections={[
+            ...(differingRows.length > 0 ? [{ title: "Differs from template: tracks that receive the edits", emptyText: "", rows: differingRows }] : []),
             {
               title: "Planned changes",
               emptyText: "No property changes are needed.",
@@ -477,6 +520,35 @@ export function TrackPropertiesPage() {
           ]}
           onClose={() => setIsSummaryExpanded(false)}
         />
+      ) : null}
+      {pendingApply ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6">
+          <section role="dialog" aria-modal="true" aria-label="Apply to files that differ from the template?" className="flex max-h-[calc(100vh-3rem)] w-[min(46rem,calc(100vw-3rem))] flex-col overflow-hidden rounded-lg border-2 border-window bg-card shadow-[0_1.875rem_5.625rem_rgba(0,0,0,0.55)]">
+            <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-window px-4">
+              <div className="text-sm font-semibold text-muted">Apply to files that differ from the template?</div>
+              <button type="button" onClick={() => setPendingApply(null)} className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted hover:bg-button-hover hover:text-text" title="Close">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-5">
+              <p className="text-sm leading-6 text-muted">
+                {pendingApply.rows.length === 1 ? "1 selected file differs" : `${pendingApply.rows.length} selected files differ`} from the template. Each edit goes to the track in the same position within its type, so check that these are the tracks you mean to change.
+              </p>
+              <div className="mt-4 overflow-hidden rounded-md border border-warning bg-input">
+                {pendingApply.rows.map((row) => (
+                  <div key={row.key} className="border-b border-border px-4 py-3 last:border-0">
+                    <div className="font-semibold text-text">{row.title}</div>
+                    <div className="mt-1 whitespace-pre-wrap text-xs leading-5 text-muted">{row.detail}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="flex shrink-0 justify-end gap-2 border-t border-border p-4">
+              <button type="button" onClick={() => setPendingApply(null)} className="h-9 rounded-md border border-border bg-button px-4 text-sm font-semibold">Cancel</button>
+              <button type="button" onClick={() => { setPendingApply(null); applyPlan(pendingApply.request, pendingApply.plan).catch(() => { /* Mutation handlers display the error. */ }); }} className="h-9 rounded-md bg-accent px-4 text-sm font-semibold">Apply to {pendingApply.request.selectedPaths.length} file(s)</button>
+            </div>
+          </section>
+        </div>
       ) : null}
     </div>
   );
