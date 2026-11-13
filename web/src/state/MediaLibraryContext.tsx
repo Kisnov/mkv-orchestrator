@@ -118,12 +118,12 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   }, [templateFilePath]);
 
-  const pushSelection = useCallback((paths: string[]): void => {
+  const pushSelection = useCallback((paths: string[], replaceWorkingSet?: boolean): void => {
     selectionPush.current = selectionPush.current
       .catch(() => undefined)
       .then(async () => {
         try {
-          const response = await setFileSelection(paths);
+          const response = await setFileSelection(paths, replaceWorkingSet);
           setSelectedPathsState(response.selectedPaths);
           setSelectionError(null);
         } catch (error) {
@@ -223,6 +223,8 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
       setFilesState(nextFiles);
       setSelectedPathsState(nextSelectedPaths);
       setTemplateFilePath(nextTemplatePath || nextFiles[0]?.path || "");
+      // A Library scan leaves the backend working set alone, so these files are installed there first.
+      pushSelection(nextFiles.map((file) => file.path), true);
       pushSelection(nextSelectedPaths);
     },
     isWorkingView,

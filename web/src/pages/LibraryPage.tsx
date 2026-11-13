@@ -105,7 +105,7 @@ export function LibraryPage() {
   });
 
   const scanStart = useMutation({
-    mutationFn: startScan,
+    mutationFn: (request: { sources: string[]; ignoredFolderNames: string[]; forceRefresh: boolean }) => startScan({ ...request, keepWorkingSet: true }),
     onSuccess: (job) => {
       setScanJobId(job.id);
       setPendingOverviewScanId(job.id);
@@ -117,7 +117,7 @@ export function LibraryPage() {
     }
   });
   const titleScanStart = useMutation({
-    mutationFn: ({ title: _title, sourceId: _sourceId, ...request }: { title: LibraryTitle; sourceId: string; sources: string[]; ignoredFolderNames: string[]; forceRefresh: boolean }) => startScan(request),
+    mutationFn: ({ title: _title, sourceId: _sourceId, ...request }: { title: LibraryTitle; sourceId: string; sources: string[]; ignoredFolderNames: string[]; forceRefresh: boolean }) => startScan({ ...request, keepWorkingSet: true }),
     onSuccess: (job, variables) => {
       setScanJobId(job.id);
       setPendingTitleRebuild({ jobId: job.id, sourceId: variables.sourceId, title: variables.title });

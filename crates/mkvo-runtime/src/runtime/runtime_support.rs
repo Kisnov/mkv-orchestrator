@@ -90,6 +90,13 @@ impl MkvoRuntime {
             .collect()
     }
 
+    /// The files of the latest scan that left the working set alone, while
+    /// its job is still in memory.
+    pub(crate) async fn overview_files(&self) -> Option<Arc<Vec<MediaFile>>> {
+        let job = self.inner.current_scan.read().await.overview_job?;
+        self.inner.jobs.attachment(job).await
+    }
+
     pub(crate) async fn find_working_set_file(
         &self,
         mut is_it: impl FnMut(&MediaFile) -> bool,

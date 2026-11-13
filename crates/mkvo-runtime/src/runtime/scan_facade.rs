@@ -262,7 +262,11 @@ impl MkvoRuntime {
                     .await?;
                 let state = scan_result_state(&outcome);
                 let summary = outcome.summary;
-                {
+                if request.keep_working_set {
+                    // Attached before the scan is named, so an audit finds the files.
+                    jobs.attach(context.job_id(), Arc::new(outcome.files)).await;
+                    current.write().await.overview_job = Some(context.job_id());
+                } else {
                     let mut current = current.write().await;
                     current.updated_utc = Some(Utc::now());
                     let replaced_job = current.scan_job.replace(context.job_id());
@@ -357,6 +361,9 @@ impl MkvoRuntime {
         &self,
         request: mkvo_contracts::FileSelectionRequest,
     ) -> RuntimeResult<mkvo_contracts::FileSelectionResponse> {
+        if request.replace_working_set {
+            return Ok(self.replace_working_set(&request.paths).await);
+        }
         let mut state = self.inner.current_scan.write().await;
         let available: BTreeSet<String> = state
             .files
@@ -386,6 +393,65 @@ impl MkvoRuntime {
         Ok(mkvo_contracts::FileSelectionResponse {
             selected_paths: state.selected_display_paths(),
         })
+    }
+
+    /// Make exactly these files the working set, all of them selected.
+    ///
+    /// A title sent from the Library arrives here. Its scan left the working
+    /// set alone, so a file the set does not hold is read: from the probe
+    /// cache when that is current. One that cannot be read is left out.
+    async fn replace_working_set(&self, paths: &[String]) -> mkvo_contracts::FileSelectionResponse {
+        let key = mkvo_application::paths::path_key;
+        let wanted: BTreeSet<String> = paths.iter().map(|path| key(Path::new(path))).collect();
+        let mut files = self.working_set_by_key(key, &wanted).await;
+        let missing: Vec<_> = paths
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| !files.contains_key(&key(path)))
+            .collect();
+        let mut read = stream::iter(missing)
+            .map(|path| self.read_file(path))
+            .buffer_unordered(REFRESH_PROBES);
+        while let Some(file) = read.next().await {
+            if let Some(file) = file {
+                files.insert(key(&file.path), file);
+            }
+        }
+        let mut files: Vec<_> = files.into_values().collect();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut state = self.inner.current_scan.write().await;
+        let replaced = state.replace_files(files);
+        // The scan that produced them may not have been asked for its files yet.
+        if let Some(job) = state.scan_job.take() {
+            self.inner.jobs.attach(job, Arc::new(replaced)).await;
+        }
+        state.updated_utc = Some(Utc::now());
+        mkvo_contracts::FileSelectionResponse {
+            selected_paths: state.selected_display_paths(),
+        }
+    }
+
+    /// One file as a scan would report it, or `None` when it cannot be read.
+    async fn read_file(&self, path: PathBuf) -> Option<MediaFile> {
+        let dependencies = &self.inner.dependencies;
+        let read = async {
+            let path = dependencies.paths.authorize_read(&path).await?;
+            let fingerprint = dependencies.file_system.fingerprint(&path).await?;
+            if let Some(cached) = dependencies.cache.get_valid(&fingerprint).await? {
+                return Ok(cached);
+            }
+            let cancel = CancellationToken::new();
+            let mut file = dependencies.probe.inspect(&path, cancel).await?;
+            file.fingerprint = fingerprint;
+            dependencies.cache.upsert(&file).await?;
+            Ok::<_, mkvo_application::PortError>(file)
+        };
+        read.await
+            .inspect_err(|error| {
+                tracing::debug!(path = %path.display(), %error, "file could not be read");
+            })
+            .ok()
     }
 
     /// Move the working set with files a rename just moved on disk.
@@ -464,6 +530,7 @@ impl MkvoRuntime {
     pub async fn clear_current_scan_files(&self) -> RuntimeResult<CurrentScanResponse> {
         let mut state = self.inner.current_scan.write().await;
         let cleared = std::mem::take(&mut *state);
+        state.overview_job = cleared.overview_job;
         if let Some(job) = cleared.scan_job {
             self.inner.jobs.attach(job, Arc::new(cleared.files)).await;
         }
@@ -675,6 +742,7 @@ mod tests {
             let first = scan(&host).await.files.swap_remove(0).path;
             let request = mkvo_contracts::FileSelectionRequest {
                 paths: vec![first.clone()],
+                ..Default::default()
             };
             let response = host.runtime.set_file_selection(request).await.unwrap();
             assert_eq!(response.selected_paths, [first]);
@@ -729,6 +797,117 @@ mod tests {
         // Clearing the working set must not empty an answer either.
         host.runtime.clear_current_scan_files().await.unwrap();
         assert_own_files().await;
+    }
+
+    /// `files` MKVs in a folder of their own under the library.
+    fn folder(host: &Host, name: &str, files: usize) -> PathBuf {
+        let folder = host.library.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        for index in 0..files {
+            std::fs::write(folder.join(format!("{index}.mkv")), b"mkv").unwrap();
+        }
+        folder
+    }
+
+    /// The Library's overview scan, which leaves the working set alone.
+    async fn overview(host: &Host, folder: &Path) -> ScanJobResponse {
+        let request = ScanRequest {
+            source_path: Some(display_path(folder)),
+            keep_working_set: true,
+            ..ScanRequest::default()
+        };
+        let id = host.runtime.start_scan(request).await.unwrap().id;
+        finished(host, id).await
+    }
+
+    /// The Dashboard's files and selection are the user's work in progress;
+    /// reading every library for the overview used to replace them.
+    #[tokio::test]
+    async fn a_library_overview_scan_leaves_the_working_set_alone() {
+        let host = host(0);
+        let dashboard = folder(&host, "dashboard", 2);
+        let library = folder(&host, "films", 3);
+        let id = start(&host, &dashboard).await;
+        let mut working = finished(&host, id).await.files;
+        let selection = mkvo_contracts::FileSelectionRequest {
+            paths: vec![working.swap_remove(0).path],
+            ..Default::default()
+        };
+        host.runtime.set_file_selection(selection).await.unwrap();
+        let before = host.runtime.get_current_scan_files().await.unwrap();
+
+        let scanned = overview(&host, &library).await;
+
+        assert_eq!(scanned.files.len(), 3);
+        assert!(scanned.files.iter().all(|file| file.path.contains("films")));
+        assert_eq!(host.runtime.get_current_scan_files().await.unwrap(), before);
+        assert_eq!(before.files.len(), 2);
+        assert_eq!(before.selected_paths.len(), 1);
+    }
+
+    /// The Library audits what it just scanned by path alone.
+    #[tokio::test]
+    async fn the_files_of_an_overview_scan_can_be_audited_by_path() {
+        let host = host(0);
+        let scanned = overview(&host, &folder(&host, "films", 3)).await;
+        let request = crate::compat::LibraryAuditRequest {
+            paths: scanned.files.into_iter().map(|file| file.path).collect(),
+            files: Vec::new(),
+        };
+
+        let audit = host.runtime.run_library_audit(request).await.unwrap();
+
+        assert_eq!(audit.summary.files, 3);
+    }
+
+    /// Sending a title from the Library to the Dashboard: those files become
+    /// the working set, wherever the runtime has to get them from.
+    #[tokio::test]
+    async fn a_handoff_replaces_the_working_set_with_the_files_it_names() {
+        let host = host(0);
+        let dashboard = folder(&host, "dashboard", 2);
+        let id = start(&host, &dashboard).await;
+        finished(&host, id).await;
+        let mut title = overview(&host, &folder(&host, "films", 3)).await.files;
+        title.truncate(2);
+        let mut paths: Vec<_> = title.iter().map(|file| file.path.clone()).collect();
+        let handoff = mkvo_contracts::FileSelectionRequest {
+            paths: paths.clone(),
+            replace_working_set: true,
+        };
+        // After a restart nothing is in memory, and the files are read again.
+        let restarted = MkvoRuntime::from_parts(
+            host.runtime.inner.config.clone(),
+            host.runtime.inner.dependencies.clone(),
+        );
+
+        for runtime in [&host.runtime, &restarted] {
+            let adopted = runtime.set_file_selection(handoff.clone()).await.unwrap();
+            assert_eq!(adopted.selected_paths, paths);
+            let working = runtime.get_current_scan_files().await.unwrap();
+            let files: Vec<_> = working.files.into_iter().map(|file| file.path).collect();
+            assert_eq!(files, paths);
+            assert_eq!(working.selected_paths, paths);
+            assert_eq!(working.summary.total, 2);
+        }
+        // The scan that lost the working set still answers with its own files.
+        let earlier = host.runtime.get_scan_job(&id.to_string()).await.unwrap();
+        assert_eq!(earlier.files.len(), 2);
+        assert!(
+            earlier
+                .files
+                .iter()
+                .all(|file| file.path.contains("dashboard"))
+        );
+
+        // A file that is gone is left out, not an error.
+        paths.push(display_path(&dashboard.join("gone.mkv")));
+        let handoff = mkvo_contracts::FileSelectionRequest {
+            paths,
+            replace_working_set: true,
+        };
+        let adopted = host.runtime.set_file_selection(handoff).await.unwrap();
+        assert_eq!(adopted.selected_paths.len(), 2);
     }
 
     /// A job of `kind` that runs until the returned sender is dropped.

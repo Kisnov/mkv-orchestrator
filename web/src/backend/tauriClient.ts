@@ -117,8 +117,8 @@ export class TauriBackendClient implements BackendClient {
     return this.invoke<CurrentScanResponse>("clear_current_scan_files", undefined, "CurrentScanResponse");
   }
 
-  setFileSelection(paths: string[]): Promise<FileSelectionResponse> {
-    return this.invoke<FileSelectionResponse>("set_file_selection", { request: { paths } }, "FileSelectionResponse");
+  setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+    return this.invoke<FileSelectionResponse>("set_file_selection", { request: { paths, replaceWorkingSet } }, "FileSelectionResponse");
   }
 
   async authorizeBrowsedRoot(path: string): Promise<void> {

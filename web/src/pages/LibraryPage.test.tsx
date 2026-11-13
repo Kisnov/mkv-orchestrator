@@ -368,7 +368,8 @@ describe("Library poster workflow", () => {
     expect(startScan).toHaveBeenLastCalledWith({
       sources: ["/media/tv/Example Show"],
       ignoredFolderNames: [],
-      forceRefresh: true
+      forceRefresh: true,
+      keepWorkingSet: true
     });
     await waitFor(() => expect(buildLibraryAudit).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/example show rebuilt: 4 files/i)).toBeInTheDocument();

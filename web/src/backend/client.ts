@@ -126,7 +126,8 @@ export interface ScanClient {
   cancelScan(id: string): Promise<ScanJobResponse>;
   getCurrentScanFiles(): Promise<CurrentScanResponse>;
   clearCurrentScanFiles(): Promise<CurrentScanResponse>;
-  setFileSelection(paths: string[]): Promise<FileSelectionResponse>;
+  /** `replaceWorkingSet` makes `paths` the whole working set, all selected. */
+  setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse>;
   /**
    * Authorize a folder found by browsing so it can be scanned.
    *

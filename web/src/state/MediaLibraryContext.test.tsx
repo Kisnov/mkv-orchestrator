@@ -145,6 +145,24 @@ describe("working set persistence", () => {
     await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith(["/media/a.mkv"]));
   });
 
+  /// A Library scan no longer puts its files in the backend working set, so a
+  /// title sent to the Dashboard has to be installed there before it is selected.
+  it("makes a handed-off title the backend working set", async () => {
+    const setFileSelection = vi.fn((paths: string[]) => Promise.resolve({ selectedPaths: paths }));
+    setBackendClient(createMockBackendClient({ setFileSelection }));
+    const title = [file("/media/tv/Show/01.mkv"), file("/media/tv/Show/02.mkv")];
+
+    const { result } = library();
+    act(() => result.current.setWorkingView(title, [title[1].path], title[1].path));
+
+    await waitFor(() => expect(setFileSelection).toHaveBeenCalledTimes(2));
+    expect(setFileSelection.mock.calls).toEqual([
+      [title.map((item) => item.path), true],
+      [[title[1].path]]
+    ]);
+    expect(result.current.selectedPaths).toEqual([title[1].path]);
+  });
+
   /// The backend is authoritative, so what it reports wins over whatever this
   /// tab happened to have cached.
   it("adopts the backend selection without echoing it back", async () => {

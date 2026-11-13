@@ -27,6 +27,9 @@ pub(super) struct CurrentScanState {
     /// The scan that produced `files`. Its status response serves them from
     /// here; once it loses them they are handed to its job instead.
     pub(super) scan_job: Option<JobId>,
+    /// The latest scan that left the working set alone. Its files stay with
+    /// its job, where a Library audit finds them by path.
+    pub(super) overview_job: Option<JobId>,
     pub(super) files: Vec<MediaFile>,
     pub(super) summary: ScanSummary,
     /// Selected paths are normalized so equivalent Windows spellings match.
@@ -56,6 +59,31 @@ impl CurrentScanState {
             self.reconcile_selection();
         }
         replaced
+    }
+
+    /// Make `files` the whole working set, all selected. Returns the files
+    /// it replaced.
+    pub(super) fn replace_files(&mut self, files: Vec<MediaFile>) -> Vec<MediaFile> {
+        let count = |extensions: &[&str]| {
+            let matching = files.iter().filter(|file| {
+                let extension = file.extension();
+                extensions
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            });
+            matching.count() as u64
+        };
+        self.summary = ScanSummary {
+            total: files.len() as u64,
+            mkv: count(&["mkv"]),
+            mp4: count(&["mp4", "m4v"]),
+            ..ScanSummary::default()
+        };
+        self.selected = files
+            .iter()
+            .map(|file| mkvo_application::paths::path_key(&file.path))
+            .collect();
+        std::mem::replace(&mut self.files, files)
     }
 
     /// Move the authoritative working set and selection with completed renames.

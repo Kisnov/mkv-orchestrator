@@ -141,6 +141,11 @@ pub struct ScanRequest {
     pub force_refresh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workers: Option<usize>,
+    /// Leave the working set as it is and serve the files from the job of
+    /// this scan. The Library overview reads every library, not what the
+    /// user is working on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_working_set: bool,
 }
 
 impl ScanRequest {
@@ -188,6 +193,10 @@ pub struct CurrentScanResponse {
 pub struct FileSelectionRequest {
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Make `paths` the whole working set, all selected, instead of selecting
+    /// within it. A title sent from the Library is not in the working set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_working_set: bool,
 }
 
 /// The selection as stored. The files are not repeated: every checkbox click

@@ -206,8 +206,9 @@ export function authorizeBrowsedRoot(path: string): Promise<void> {
   return getBackendClient().authorizeBrowsedRoot(path);
 }
 
-export function setFileSelection(paths: string[]): Promise<FileSelectionResponse> {
-  return getBackendClient().setFileSelection(paths);
+export function setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+  const client = getBackendClient();
+  return replaceWorkingSet ? client.setFileSelection(paths, true) : client.setFileSelection(paths);
 }
 
 export function clearCurrentScanFiles(): Promise<CurrentScanResponse> {
