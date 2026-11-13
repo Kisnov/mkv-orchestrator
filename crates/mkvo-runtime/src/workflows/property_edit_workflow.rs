@@ -473,10 +473,11 @@ mod execution_tests {
         }
     }
 
-    /// Edits `Episode 02` only once released; every other file at once.
+    /// Edits `Episode 02` only once released; every other file once `Episode 02` is in flight.
     #[derive(Clone)]
     struct SlowSecondEdit {
         release: Arc<Semaphore>,
+        second_started: Arc<Notify>,
         finished: Arc<AtomicUsize>,
     }
 
@@ -488,7 +489,10 @@ mod execution_tests {
             _cancel: CancellationToken,
         ) -> Result<ToolExecutionResult, PortError> {
             if invocation.arguments[0].contains("Episode 02") {
+                self.second_started.notify_one();
                 self.release.acquire().await.expect("open").forget();
+            } else {
+                self.second_started.notified().await;
             }
             self.finished.fetch_add(1, Ordering::SeqCst);
             Ok(exited(invocation, 0, "Done.\n"))
@@ -499,6 +503,7 @@ mod execution_tests {
     async fn a_bookkeeping_error_lets_the_edit_in_flight_finish() {
         let tools = SlowSecondEdit {
             release: Arc::new(Semaphore::new(0)),
+            second_started: Arc::default(),
             finished: Arc::default(),
         };
         let broke = Arc::new(Notify::new());
