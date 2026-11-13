@@ -24,7 +24,7 @@ export type OperationRunOptions<Request, Result extends Plan> = {
   onPreview?: (plan: Result, request: Request) => void;
 };
 
-const activeStatuses = new Set(["Running", "Queued", "WaitingForResources", "Canceling"]);
+export const activeStatuses = new Set(["Running", "Queued", "WaitingForResources", "Canceling"]);
 
 /** The preview, apply, progress and cancel flow every track operation shares. */
 export function useOperationRun<Request, Result extends Plan>(options: OperationRunOptions<Request, Result>) {
