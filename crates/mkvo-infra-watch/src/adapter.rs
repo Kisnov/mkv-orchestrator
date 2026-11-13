@@ -922,7 +922,6 @@ mod tests {
                 debounce_millis: 50,
                 reconciliation_interval_minutes: 0,
                 force_polling: true,
-                ..WatchSettings::default()
             })
             .await
             .expect("start polling watcher");
