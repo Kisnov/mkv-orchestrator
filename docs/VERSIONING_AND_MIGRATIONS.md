@@ -28,13 +28,8 @@ SQLite migrations in `mkvo-infra-sqlite` track the schema of the whole
 database (metadata cache, settings, plans, jobs, journals, logs and rename
 history).
 
-Current version (`SCHEMA_VERSION` in `crates/mkvo-infra-sqlite/src/lib.rs`):
-
-```text
-3
-```
-
-The database stores its current migration number in:
+The current version is `SCHEMA_VERSION` in
+`crates/mkvo-infra-sqlite/src/lib.rs`. The database stores its current migration number in:
 
 ```sql
 PRAGMA user_version
@@ -50,9 +45,10 @@ it cannot be written, the database is not migrated and startup fails. A copy
 left by an earlier upgrade from the same version is replaced.
 
 A database with a newer `user_version` than this build supports is refused
-rather than read. To go back to an older build after an upgrade, stop MKVO and
-restore the `.bak` copy of the version that build uses; anything recorded since
-the upgrade is lost.
+rather than read. To go back to an older build after an upgrade, stop MKVO,
+delete `mkvo.db-wal` and `mkvo.db-shm` (a leftover WAL would be applied to the
+restored file), and copy the `.bak` of the version that build uses over
+`mkvo.db`. Anything recorded since the upgrade is lost.
 
 Future changes should add a numbered migration in `mkvo-infra-sqlite`.
 Destructive cache rebuilds are acceptable only for rebuildable scan metadata;
