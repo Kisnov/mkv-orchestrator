@@ -321,6 +321,11 @@ export function DashboardPage() {
 
   useEffect(() => {
     if (!currentScanJob) return;
+    // Counts without files mean the server no longer holds them, not an empty scan.
+    if (currentScanJob.status === "Completed" && currentScanJob.files.length === 0 && currentScanJob.summary.total > 0) {
+      setSkipped(["The scan results are no longer held. Scan again."]);
+      return;
+    }
 
     setFiles(currentScanJob.files);
     setSkipped(currentScanJob.skipped);

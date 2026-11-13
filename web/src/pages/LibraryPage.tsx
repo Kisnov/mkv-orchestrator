@@ -44,6 +44,7 @@ type PendingTitleRebuild = {
 // in memory and mirror completed snapshots to IndexedDB, which avoids the small
 // synchronous Web Storage quota while surviving navigation and browser reloads.
 const libraryViewCache = new Map<string, LibraryViewSnapshot>();
+const scanResultsLost = "The scan results are no longer held. Scan the library again.";
 
 export function resetLibraryViewCacheForTests() {
   libraryViewCache.clear();
@@ -161,7 +162,15 @@ export function LibraryPage() {
         : `Scanning library: ${progressText}`);
       return;
     }
-    if (currentScanJob.status === "Completed" && currentScanJob.id === pendingTitleRebuild?.jobId) {
+    // The server holds a Library scan's files only for a while; counts without them are not an empty library.
+    const filesLost = currentScanJob.status === "Completed" && currentScanJob.files.length === 0 && currentScanJob.summary.total > 0;
+    if (filesLost && currentScanJob.id === pendingTitleRebuild?.jobId) {
+      setPendingTitleRebuild(null);
+      setStatusText(scanResultsLost);
+    } else if (filesLost && currentScanJob.id === pendingOverviewScanId) {
+      setPendingOverviewScanId(null);
+      setStatusText(scanResultsLost);
+    } else if (currentScanJob.status === "Completed" && currentScanJob.id === pendingTitleRebuild?.jobId) {
       const pending = pendingTitleRebuild;
       setPendingTitleRebuild(null);
       setIsAuditingLibraries(true);

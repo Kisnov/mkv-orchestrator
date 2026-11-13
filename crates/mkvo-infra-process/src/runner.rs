@@ -15,6 +15,7 @@ use tokio::{
     process::Command,
     sync::mpsc,
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -297,29 +298,66 @@ async fn inactive(
     printed: &AtomicU64,
     outputs: &[PathBuf],
 ) -> Option<Duration> {
-    let timeout = timeout?;
+    quiet_for(timeout?, printed, outputs, |output| {
+        std::fs::metadata(output).map(|metadata| metadata.len())
+    })
+    .await;
+    timeout
+}
+
+async fn quiet_for<F>(timeout: Duration, printed: &AtomicU64, outputs: &[PathBuf], probe: F)
+where
+    F: Fn(PathBuf) -> std::io::Result<u64> + Clone + Send + 'static,
+{
     // Few checks per timeout: each one may itself hang on the share being watched.
     let interval = timeout / 6;
-    let mut quiet_since = tokio::time::Instant::now();
-    let mut seen = progress(printed, outputs, interval).await;
-    while quiet_since.elapsed() < timeout {
-        tokio::time::sleep(interval).await;
-        let now = progress(printed, outputs, interval).await;
+    // Per output: its last known size and the probe still running for it, if any.
+    let mut watched = outputs.iter().map(|_| (0, None)).collect::<Vec<_>>();
+    let mut deadline = Instant::now() + timeout;
+    let mut seen = progress(
+        printed,
+        outputs,
+        &mut watched,
+        Instant::now() + interval,
+        &probe,
+    )
+    .await;
+    while Instant::now() < deadline {
+        tokio::time::sleep_until(deadline.min(Instant::now() + interval)).await;
+        // A sample that hangs must not carry the wait past the deadline.
+        let until = deadline.min(Instant::now() + interval);
+        let now = progress(printed, outputs, &mut watched, until, &probe).await;
         if now != seen {
-            quiet_since = tokio::time::Instant::now();
+            deadline = Instant::now() + timeout;
             seen = now;
         }
     }
-    Some(timeout)
 }
 
-async fn progress(printed: &AtomicU64, outputs: &[PathBuf], patience: Duration) -> (u64, u64) {
+type Watched = (u64, Option<JoinHandle<std::io::Result<u64>>>);
+
+async fn progress<F>(
+    printed: &AtomicU64,
+    outputs: &[PathBuf],
+    watched: &mut [Watched],
+    until: Instant,
+    probe: &F,
+) -> (u64, u64)
+where
+    F: Fn(PathBuf) -> std::io::Result<u64> + Clone + Send + 'static,
+{
     let mut written = 0;
-    for output in outputs {
-        if let Ok(Ok(metadata)) = tokio::time::timeout(patience, tokio::fs::metadata(output)).await
-        {
-            written += metadata.len();
+    for (output, (size, pending)) in outputs.iter().zip(watched) {
+        // A probe that cannot be cancelled is waited on again, never started twice.
+        let running = pending.get_or_insert_with(|| {
+            let (probe, output) = (probe.clone(), output.clone());
+            tokio::task::spawn_blocking(move || probe(output))
+        });
+        if let Ok(probed) = tokio::time::timeout_at(until, running).await {
+            *pending = None;
+            *size = probed.ok().and_then(Result::ok).unwrap_or(0);
         }
+        written += *size;
     }
     (printed.load(Ordering::Relaxed), written)
 }
@@ -474,6 +512,71 @@ mod tests {
 
         assert_eq!(stopped, Some(timeout));
         assert!(started.elapsed() >= step * 5 + timeout);
+    }
+
+    /// A metadata probe that hangs like one on a dead share, counting how often it starts.
+    fn stalled_probe() -> (
+        impl Fn(PathBuf) -> std::io::Result<u64> + Clone + Send + 'static,
+        Arc<AtomicU64>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let started = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = {
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            move |_: PathBuf| {
+                started.fetch_add(1, Ordering::Relaxed);
+                while !release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(0)
+            }
+        };
+        (probe, started, release)
+    }
+
+    #[tokio::test]
+    async fn a_hung_output_keeps_a_single_probe_in_flight() {
+        let (probe, started, release) = stalled_probe();
+        let printed = AtomicU64::new(0);
+        let outputs = [PathBuf::from("hung.tmp")];
+        let work = async {
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                printed.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        let ((), ()) = tokio::join!(
+            quiet_for(Duration::from_millis(600), &printed, &outputs, probe),
+            work
+        );
+
+        release.store(true, Ordering::Relaxed);
+        assert_eq!(started.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hung_output_does_not_extend_the_inactivity_timeout() {
+        let (probe, _, release) = stalled_probe();
+        let timeout = Duration::from_millis(3000);
+        let started = std::time::Instant::now();
+
+        quiet_for(
+            timeout,
+            &AtomicU64::new(0),
+            &[PathBuf::from("hung.tmp")],
+            probe,
+        )
+        .await;
+
+        release.store(true, Ordering::Relaxed);
+        // Without the bound the last sample waits a full interval past the deadline.
+        assert!(
+            started.elapsed() < timeout + timeout / 12,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

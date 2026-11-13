@@ -305,6 +305,25 @@ describe("Dashboard UI cache reset", () => {
     expect(screen.queryByRole("button", { name: "Rescan Files" })).not.toBeInTheDocument();
   });
 
+  it("asks for a new scan when a finished scan's files are no longer held", async () => {
+    const user = userEvent.setup();
+    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));
+    const now = new Date().toISOString();
+    const job = { id: "lost-job", createdUtc: now, startedUtc: now, completedUtc: now, currentSource: "/media/Show", completed: 2, total: 2, files: [], skipped: [], summary: { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 }, error: "" };
+
+    renderDashboard({
+      getStatus: () => Promise.resolve(emptyStatus),
+      getCurrentScanFiles: () => Promise.resolve(emptyScan),
+      getWebSettings: () => Promise.resolve(settings()),
+      startScan: () => Promise.resolve({ ...job, status: "Queued" as const }),
+      getScanJob: () => Promise.resolve({ ...job, status: "Completed" as const })
+    });
+
+    await user.click(await screen.findByRole("button", { name: /^scan$/i }));
+
+    expect(await screen.findByText(/scan results are no longer held/i)).toBeInTheDocument();
+  });
+
   it("closes the confirmation when a scan turns out to be running", async () => {
     const user = userEvent.setup();
     window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));

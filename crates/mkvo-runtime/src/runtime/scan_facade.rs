@@ -730,13 +730,18 @@ mod tests {
     /// and its event reach the database.
     async fn saved(host: &Host, id: JobId) -> SqliteStore {
         let store = SqliteStore::open(&host.database).unwrap();
+        let id = id.to_string();
         for _ in 0..400 {
-            if store.count_job_events(&id.to_string()).unwrap() > 0 {
-                break;
+            let completed = store
+                .get_job(&id)
+                .unwrap()
+                .is_some_and(|row| row.state == "\"Completed\"");
+            if completed && store.count_job_events(&id).unwrap() > 0 {
+                return store;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        store
+        panic!("scan {id} was not stored as Completed with its final event");
     }
 
     /// The scan status still answers with every file, but what the scan
