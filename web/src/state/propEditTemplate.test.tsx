@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, waitFor } from "@testing-library/react";
 
@@ -6,6 +6,7 @@ import { MediaLibraryProvider, useMediaLibrary } from "./MediaLibraryContext";
 import { PropEditTemplateWarmer, usePropEditTemplate } from "./propEditTemplate";
 import { setBackendClient } from "../backend/runtime";
 import { createMockBackendClient } from "../backend/mockClient";
+import type { BackendClient } from "../backend/client";
 import type { MediaFileRow } from "../api";
 import { useEffect } from "react";
 
@@ -40,7 +41,7 @@ function Harness({ files }: { files: MediaFileRow[] }) {
   return <PropEditTemplateWarmer />;
 }
 
-function renderWarmer(files: MediaFileRow[], loadPropEditTemplate: ReturnType<typeof vi.fn>) {
+function renderWarmer(files: MediaFileRow[], loadPropEditTemplate: Mock<BackendClient["loadPropEditTemplate"]>) {
   setBackendClient(createMockBackendClient({ loadPropEditTemplate }));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const result = render(
