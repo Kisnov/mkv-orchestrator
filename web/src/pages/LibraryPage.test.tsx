@@ -577,6 +577,16 @@ describe("Library poster workflow", () => {
     release({ selectedPaths: [] });
   });
 
+  it("says it is auditing once the scan has finished", async () => {
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({ buildLibraryAudit: () => new Promise(() => undefined) })
+    );
+
+    expect(await screen.findByText(/auditing/i)).toBeInTheDocument();
+    expect(screen.queryByText(/scanning preparing/i)).not.toBeInTheDocument();
+  });
+
   it("does not save an empty library when the scan's files are no longer held", async () => {
     const buildLibraryAudit = vi.fn();
     renderWithBackend(

@@ -524,7 +524,7 @@ export function LibraryPage() {
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {isBusy && !auditResult ? (
-            <div className="grid h-full min-h-72 place-items-center text-sm text-muted"><div className="text-center"><RefreshCw size={28} className="mx-auto mb-3 animate-spin text-accent" />Scanning {progressText}</div></div>
+            <div className="grid h-full min-h-72 place-items-center text-sm text-muted"><div className="text-center"><RefreshCw size={28} className="mx-auto mb-3 animate-spin text-accent" />{isAuditingLibraries ? "Auditing the scanned files..." : `Scanning ${progressText}`}</div></div>
           ) : displayedTitles.length > 0 ? (
             <div className="grid gap-x-5 gap-y-6 [grid-template-columns:repeat(auto-fill,minmax(9.375rem,1fr))]">
               {displayedTitles.map((title) => {
