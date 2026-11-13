@@ -962,10 +962,8 @@ impl MkvoRuntime {
             arguments.push("--no-attachments".to_owned());
         }
         let source = self
-            .current_domain_files()
-            .await
-            .into_iter()
-            .find(|file| same_path(&file.path, &item.source));
+            .find_working_set_file(|file| same_path(&file.path, &item.source))
+            .await;
         if let Some(source) = source.as_ref() {
             append_track_selection(&mut arguments, source, &item.selected_track_ids);
             if preserve_attachments && !item.subtitle_transforms.is_empty() {

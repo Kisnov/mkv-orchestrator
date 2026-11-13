@@ -72,8 +72,35 @@ impl MkvoRuntime {
         }
     }
 
-    pub(crate) async fn current_domain_files(&self) -> Vec<MediaFile> {
-        self.inner.current_scan.read().await.files.clone()
+    /// The working-set files whose `key` is in `wanted`, by that key. Only
+    /// those are copied, however large the set is.
+    pub(crate) async fn working_set_by_key(
+        &self,
+        key: impl Fn(&Path) -> String,
+        wanted: &BTreeSet<String>,
+    ) -> HashMap<String, MediaFile> {
+        let state = self.inner.current_scan.read().await;
+        state
+            .files
+            .iter()
+            .filter_map(|file| {
+                let key = key(&file.path);
+                wanted.contains(&key).then(|| (key, file.clone()))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn find_working_set_file(
+        &self,
+        mut is_it: impl FnMut(&MediaFile) -> bool,
+    ) -> Option<MediaFile> {
+        let state = self.inner.current_scan.read().await;
+        state.files.iter().find(|file| is_it(file)).cloned()
+    }
+
+    pub(crate) async fn working_set_paths(&self) -> BTreeSet<PathBuf> {
+        let state = self.inner.current_scan.read().await;
+        state.files.iter().map(|file| file.path.clone()).collect()
     }
 
     pub(crate) fn dependencies(&self) -> &RuntimeDependencies {

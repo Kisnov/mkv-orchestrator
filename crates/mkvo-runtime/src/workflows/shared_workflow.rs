@@ -9,8 +9,12 @@ impl MkvoRuntime {
             self.resolve_rows(&request.files, &[]).await?
         } else {
             let requested: BTreeSet<_> = request.paths.iter().map(|path| path_key(path)).collect();
-            let mut files = self.current_domain_files().await;
-            files.retain(|file| requested.contains(&path_key(&display_path(&file.path))));
+            let mut files: Vec<_> = self
+                .working_set_by_key(file_key, &requested)
+                .await
+                .into_values()
+                .collect();
+            files.sort_by(|left, right| left.path.cmp(&right.path));
             files
         };
         let audit = LibraryAuditService.build(&self.config().media_root, &files, &[]);
@@ -78,18 +82,16 @@ impl MkvoRuntime {
         rows: &[mkvo_contracts::MediaFileRow],
         selected_paths: &[String],
     ) -> RuntimeResult<Vec<MediaFile>> {
-        let current = self.current_domain_files().await;
         let selected: BTreeSet<_> = selected_paths.iter().map(|path| path_key(path)).collect();
         let source_rows: Vec<_> = rows
             .iter()
             .filter(|row| selected.is_empty() || selected.contains(&path_key(&row.path)))
             .collect();
+        let wanted: BTreeSet<_> = source_rows.iter().map(|row| path_key(&row.path)).collect();
+        let current = self.working_set_by_key(file_key, &wanted).await;
         let mut files = Vec::with_capacity(source_rows.len());
         for row in source_rows {
-            if let Some(file) = current
-                .iter()
-                .find(|file| same_path(&file.path, Path::new(&row.path)))
-            {
+            if let Some(file) = current.get(&path_key(&row.path)) {
                 // The row is the track layout the user is looking at. Keep
                 // the runtime's fingerprint and rich file metadata, but plan
                 // track operations against the exact IDs displayed in the UI
@@ -201,11 +203,7 @@ impl MkvoRuntime {
     }
 
     pub(super) async fn current_existing_paths(&self) -> BTreeSet<PathBuf> {
-        self.current_domain_files()
-            .await
-            .into_iter()
-            .map(|file| file.path)
-            .collect()
+        self.working_set_paths().await
     }
 
     pub(super) fn authorized_root_paths(&self) -> Vec<PathBuf> {
@@ -324,4 +322,9 @@ impl MkvoRuntime {
         }
         Ok(PathBuf::from(status.resolved_path))
     }
+}
+
+/// `path_key` of a scanned file, so it matches the key of a row's path.
+fn file_key(path: &Path) -> String {
+    path_key(&path.to_string_lossy())
 }
