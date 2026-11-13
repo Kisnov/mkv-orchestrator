@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ApplicationError, ApplicationResult, AuthorizedPathPolicy, EnumeratedMedia, JobContext,
-    MediaCatalog, MediaEnumerationRequest, MediaProbe, MetadataCache,
+    MediaCatalog, MediaEnumerationRequest, MediaProbe, MetadataCache, PortError,
 };
 
 const MEDIA_CACHE_RETENTION_DAYS: i64 = 7;
@@ -53,6 +53,7 @@ impl ScanOutcome {
 pub trait ScanEventSink: Send + Sync {
     async fn progress(&self, completed: u64, total: u64, current: &str) -> ApplicationResult<()>;
     async fn skipped(&self, path: &str, reason: &str) -> ApplicationResult<()>;
+    async fn warning(&self, message: &str) -> ApplicationResult<()>;
 }
 
 pub struct NoopScanEventSink;
@@ -71,6 +72,10 @@ impl ScanEventSink for NoopScanEventSink {
     async fn skipped(&self, _path: &str, _reason: &str) -> ApplicationResult<()> {
         Ok(())
     }
+
+    async fn warning(&self, _message: &str) -> ApplicationResult<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -87,6 +92,11 @@ impl ScanEventSink for JobContext {
         )
         .await
     }
+
+    async fn warning(&self, message: &str) -> ApplicationResult<()> {
+        self.log(mkvo_contracts::JobLogLevel::Warning, message)
+            .await
+    }
 }
 
 /// Cache writes held back so that a batch is one SQLite transaction.
@@ -95,6 +105,7 @@ struct CacheWrites {
     probed: Vec<MediaFile>,
     seen: Vec<PathBuf>,
     probed_since: Option<Instant>,
+    failed: bool,
 }
 
 impl CacheWrites {
@@ -190,17 +201,38 @@ impl ScanService {
             )
             .await;
         // A canceled scan still keeps what it probed.
-        self.flush(&mut writes).await?;
+        let flushed = self.flush(&mut writes, sink).await;
         let unreadable = scanned?;
+        flushed?;
 
+        // Entries that could not be marked seen would look gone, so nothing is pruned.
+        if !writes.failed
+            && let Err(error) = self
+                .prune(&enumeration.roots, &outcome.files, &unreadable)
+                .await
+        {
+            sink.warning(&format!("Probe cache could not be pruned: {error}"))
+                .await?;
+        }
+        outcome
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(outcome)
+    }
+
+    async fn prune(
+        &self,
+        roots: &[PathBuf],
+        files: &[MediaFile],
+        unreadable: &[PathBuf],
+    ) -> Result<(), PortError> {
         // Files that moved away must not pile up in the cache. Everything found was
         // just marked seen, so this drops only what has been gone from these roots
         // for the whole retention. A share that dropped looks empty or unreadable,
         // not deleted, so such a root keeps its entries.
         let cutoff = Utc::now() - TimeDelta::days(MEDIA_CACHE_RETENTION_DAYS);
-        for root in &enumeration.roots {
-            let listed = outcome
-                .files
+        for root in roots {
+            let listed = files
                 .iter()
                 .any(|file| file.fingerprint.path.starts_with(root));
             if listed && !unreadable.iter().any(|path| path.starts_with(root)) {
@@ -210,20 +242,32 @@ impl ScanService {
         // Folders that are never scanned again would otherwise keep their entries.
         let unscanned = Utc::now() - TimeDelta::days(MEDIA_CACHE_UNSCANNED_RETENTION_DAYS);
         self.cache.remove_older_than(unscanned).await?;
-        outcome
-            .files
-            .sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(outcome)
+        Ok(())
     }
 
-    async fn flush(&self, writes: &mut CacheWrites) -> ApplicationResult<()> {
-        if !writes.probed.is_empty() {
-            self.cache.upsert_many(&writes.probed).await?;
+    /// A failed cache write costs a probe next time; it must not fail the scan.
+    async fn flush(
+        &self,
+        writes: &mut CacheWrites,
+        sink: &dyn ScanEventSink,
+    ) -> ApplicationResult<()> {
+        let probed = std::mem::take(&mut writes.probed);
+        let seen = std::mem::take(&mut writes.seen);
+        writes.probed_since = None;
+        let written = async {
+            if !probed.is_empty() {
+                self.cache.upsert_many(&probed).await?;
+            }
+            if !seen.is_empty() {
+                self.cache.mark_seen(&seen, Utc::now()).await?;
+            }
+            Ok::<(), PortError>(())
+        };
+        if let Err(error) = written.await {
+            writes.failed = true;
+            sink.warning(&format!("Probe cache could not be updated: {error}"))
+                .await?;
         }
-        if !writes.seen.is_empty() {
-            self.cache.mark_seen(&writes.seen, Utc::now()).await?;
-        }
-        *writes = CacheWrites::default();
         Ok(())
     }
 
@@ -357,7 +401,7 @@ impl ScanService {
             }
         }
         if writes.is_due() {
-            self.flush(writes).await?;
+            self.flush(writes, sink).await?;
         }
         Ok(())
     }
@@ -375,7 +419,6 @@ mod tests {
     use tokio::sync::{Notify, RwLock};
 
     use super::*;
-    use crate::PortError;
 
     struct Catalog(Vec<FileFingerprint>);
     #[async_trait]
@@ -469,6 +512,7 @@ mod tests {
     struct Cache {
         files: RwLock<HashMap<PathBuf, (MediaFile, DateTime<Utc>)>>,
         writes: AtomicUsize,
+        read_only: bool,
     }
     impl Cache {
         async fn seed(&self, path: &str, seen_at: DateTime<Utc>) {
@@ -480,6 +524,12 @@ mod tests {
         }
         async fn contains(&self, path: &str) -> bool {
             self.files.read().await.contains_key(Path::new(path))
+        }
+        fn writable(&self) -> Result<(), PortError> {
+            if self.read_only {
+                return Err(PortError::Other("database is locked".to_owned()));
+            }
+            Ok(())
         }
     }
     #[async_trait]
@@ -495,6 +545,7 @@ mod tests {
             self.upsert_many(std::slice::from_ref(file)).await
         }
         async fn upsert_many(&self, batch: &[MediaFile]) -> Result<(), PortError> {
+            self.writable()?;
             self.writes.fetch_add(1, Ordering::Relaxed);
             let mut files = self.files.write().await;
             for file in batch {
@@ -520,6 +571,7 @@ mod tests {
             paths: &[PathBuf],
             seen_at: DateTime<Utc>,
         ) -> Result<(), PortError> {
+            self.writable()?;
             let mut files = self.files.write().await;
             for path in paths {
                 if let Some(entry) = files.get_mut(path) {
@@ -626,6 +678,25 @@ mod tests {
             Ok(())
         }
         async fn skipped(&self, _path: &str, _reason: &str) -> ApplicationResult<()> {
+            Ok(())
+        }
+        async fn warning(&self, _message: &str) -> ApplicationResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct Warnings(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl ScanEventSink for Warnings {
+        async fn progress(&self, _done: u64, _total: u64, _current: &str) -> ApplicationResult<()> {
+            Ok(())
+        }
+        async fn skipped(&self, _path: &str, _reason: &str) -> ApplicationResult<()> {
+            Ok(())
+        }
+        async fn warning(&self, message: &str) -> ApplicationResult<()> {
+            self.0.lock().unwrap().push(message.to_owned());
             Ok(())
         }
     }
@@ -777,6 +848,64 @@ mod tests {
         scan("lib", &["lib/one.mkv"], &cache, &probe).await;
         assert!(!cache.contains("work/job-1/a.mkv").await);
         assert!(cache.contains("work/job-2/a.mkv").await);
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_be_written_does_not_fail_the_scan() {
+        let cache = Arc::new(Cache {
+            read_only: true,
+            ..Cache::default()
+        });
+        let probe = Arc::new(Probe::default());
+
+        let warnings = Warnings::default();
+        let outcome = service(&["lib/1.mkv", "lib/2.mkv"], &cache, &probe)
+            .scan(&request("lib"), CancellationToken::new(), &warnings)
+            .await
+            .unwrap();
+        assert_eq!(outcome.files.len(), 2);
+        assert_eq!(outcome.summary.failed, 0);
+        assert_eq!(
+            *warnings.0.lock().unwrap(),
+            ["Probe cache could not be updated: adapter failure: database is locked"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_cache_does_not_hide_why_the_scan_stopped() {
+        let cache = Arc::new(Cache {
+            read_only: true,
+            ..Cache::default()
+        });
+        let probe = Arc::new(Probe::default());
+        let cancel = CancellationToken::new();
+
+        let result = service(&["lib/1.mkv", "lib/2.mkv"], &cache, &probe)
+            .scan(&request("lib"), cancel.clone(), &CancelOnProgress(cancel))
+            .await;
+        assert!(matches!(result, Err(ApplicationError::Canceled)));
+    }
+
+    #[tokio::test]
+    async fn entries_that_could_not_be_marked_seen_are_not_pruned() {
+        let cache = Arc::new(Cache {
+            read_only: true,
+            ..Cache::default()
+        });
+        let probe = Arc::new(Probe::default());
+        cache
+            .seed("lib/one.mkv", days_ago(MEDIA_CACHE_RETENTION_DAYS + 1))
+            .await;
+        cache
+            .seed(
+                "lib/two.mkv",
+                days_ago(MEDIA_CACHE_UNSCANNED_RETENTION_DAYS + 1),
+            )
+            .await;
+
+        scan("lib", &["lib/one.mkv", "lib/two.mkv"], &cache, &probe).await;
+        assert!(cache.contains("lib/one.mkv").await);
+        assert!(cache.contains("lib/two.mkv").await);
     }
 
     #[tokio::test]
