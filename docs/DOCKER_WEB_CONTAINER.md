@@ -65,7 +65,7 @@ MKVO_SOURCE_ROOTS=downloads=/downloads
 | `MKVO_USERNAME` / `MKVO_PASSWORD` | admin / generated | Use a password of at least 12 characters. Blank generates one in `/config/admin-password.txt`, replaced by `admin-password.hash` after the first sign-in. Never publish either file. |
 | `MKVO_ALLOWED_HOSTS` | unset | Extra host names (comma separated, `name` or `name:port`) accepted without login and as request origins; a bare name matches origins only on the port MKVO is served on, and `*` turns the checks off; IP addresses and `localhost` always work. Needed for a host name with login off, or behind a proxy that rewrites `Host`. |
 | `MKVO_TOOL_DIRECTORIES` | unset | Directories the Settings page may choose for MKVToolNix/FFmpeg. The image finds its bundled tools on its own, so leave the Settings fields blank; any other directory is refused. |
-| `RUST_LOG` | `info` in compose and Unraid, errors only otherwise | Log level. At `info` the startup log names the file that holds the generated password. |
+| `RUST_LOG` | `info` (set in the image) | Log level. At `info` the startup log names the file that holds the generated password. |
 | `MKVO_SECURE_COOKIES` | false | Enable for HTTPS; leave false for plain HTTP. A proxy sending `X-Forwarded-Proto: https` gets a Secure cookie anyway. |
 | `MKVO_AUTH_MODE`, `MKVO_AUTH_USERNAME`, `MKVO_AUTH_PASSWORD` | legacy | Existing settings are honored unless their new equivalents are explicitly set; blank values count as unset. |
 | `MKVO_TVDB_API_KEY`, `MKVO_TVDB_PIN`, `MKVO_TMDB_API_KEY` | unset | Optional provider credentials; Settings-page values take effect otherwise. |
@@ -86,12 +86,13 @@ a value entered through the web UI.
   HTTPS plus network restrictions before exposing MKVO beyond a trusted network.
   See [authentication notes](AUTHENTICATION.md).
 - The compose file and Unraid template drop every Linux capability except
-  `CHOWN`, `SETUID`, `SETGID` and `DAC_READ_SEARCH` (the entrypoint fixes `/config`
+  `CHOWN`, `SETUID`, `SETGID` and `DAC_OVERRIDE` (the entrypoint fixes `/config`
   ownership and switches to `PUID`/`PGID`; the last one lets it, and `docker exec`,
-  read inside folders the app user keeps private) and set `no-new-privileges`.
-  The app itself runs as `PUID` with no capabilities at all. With `PUID=0` the app
-  runs as root without `DAC_OVERRIDE`/`FOWNER`, so it cannot write files owned
-  by other users; add those two capabilities or use a real PUID/PGID.
+  reach into folders the app user keeps private) and set `no-new-privileges`.
+  All four are in Docker's default set. The app itself runs as `PUID` with no
+  capabilities at all. With `PUID=0` the app runs as root and keeps these four
+  but not `FOWNER`, so changing permissions on files owned by other users fails;
+  add `FOWNER` or, better, use a real PUID/PGID.
 - Media-server URLs must be HTTP(S) and cannot use link-local addresses
   (`169.254.0.0/16`, `fe80::/10`). LAN addresses and container names work.
 - Manual subtitle files for muxing must be inside the source roots.

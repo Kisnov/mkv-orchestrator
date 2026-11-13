@@ -36,16 +36,16 @@ services:
       - ${MKVO_MEDIA_PATH:-./tmp/docker-media}:/media
       - ${MKVO_DOWNLOADS_PATH:-./tmp/docker-downloads}:/downloads
       - ${MKVO_CONFIG_PATH:-./tmp/docker-config}:/config
-    # The entrypoint only fixes /config ownership and switches to PUID/PGID; DAC_READ_SEARCH
-    # lets it (and docker exec) look inside folders the app user keeps private.
-    # PUID=0 (run as root) also needs DAC_OVERRIDE and FOWNER to write other users' files.
+    # Only root steps use these: the entrypoint fixing /config ownership (DAC_OVERRIDE lets it
+    # reach into folders the app user keeps private) and docker exec. The app runs as
+    # PUID/PGID with none of them. PUID=0 (run as root) also needs FOWNER.
     cap_drop:
       - ALL
     cap_add:
       - CHOWN
       - SETUID
       - SETGID
-      - DAC_READ_SEARCH
+      - DAC_OVERRIDE
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

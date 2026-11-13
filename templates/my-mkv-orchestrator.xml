@@ -15,7 +15,7 @@
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/templates/my-mkv-orchestrator.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/web/src/assets/mkvo-icon-purple.png</Icon>
-  <ExtraParams>--cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --cap-add=DAC_READ_SEARCH --security-opt=no-new-privileges:true</ExtraParams>
+  <ExtraParams>--cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges:true</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DonateText/>
