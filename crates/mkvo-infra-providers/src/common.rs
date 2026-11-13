@@ -261,12 +261,16 @@ where
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.trim().parse::<u64>().ok())
             }
-            // A timeout already cost the caller its full wait, so only failures
-            // that return quickly (refused, reset) are sent again.
-            Err(error) if last_attempt || error.is_timeout() || error.is_builder() => {
-                return Err(ProviderError::network(provider, error));
+            // A timeout already cost the caller its full wait, so only transport
+            // failures that return quickly (refused, reset) are sent again.
+            Err(error)
+                if !last_attempt
+                    && !error.is_timeout()
+                    && (error.is_connect() || error.is_request() || error.is_body()) =>
+            {
+                None
             }
-            Err(_) => None,
+            Err(error) => return Err(ProviderError::network(provider, error)),
         };
         let delay = retry_delay(retry_after, attempt);
         wait_or_cancel(provider, cancellation, tokio::time::sleep(delay)).await?;
