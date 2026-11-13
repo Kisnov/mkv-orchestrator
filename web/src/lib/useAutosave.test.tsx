@@ -75,7 +75,7 @@ describe("useAutosave", () => {
     await act(async () => { first.resolve("first"); });
 
     expect(save.mock.calls.map(([request]) => request.value)).toEqual(["one", "three"]);
-    expect(onSaved.mock.calls.at(-1)).toEqual(["second", true]);
+    expect(onSaved.mock.calls.at(-1)).toEqual(["second", true, { value: "three" }]);
     expect(onSaved.mock.calls.filter(([, latest]) => latest)).toHaveLength(1);
   });
 
@@ -92,6 +92,37 @@ describe("useAutosave", () => {
     await act(async () => { first.resolve("first"); });
 
     expect(save.mock.calls.map(([request]) => request.value)).toEqual(["one", "loaded"]);
+  });
+
+  /// "Saved" while a newer edit still waits for its debounce would be untrue.
+  it("does not report the latest save while an edit is still pending", async () => {
+    const first = deferred<string>();
+    const save = vi.fn().mockImplementationOnce(() => first.promise).mockResolvedValue("second");
+    const { rerender, onSaved } = setup(save);
+
+    rerender({ value: "one", ready: true });
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    rerender({ value: "two", ready: true });
+    await act(async () => { first.resolve("first"); });
+
+    expect(onSaved).toHaveBeenLastCalledWith("first", false, { value: "one" });
+  });
+
+  /// A flush during the debounce must not leave the timer to queue a second,
+  /// identical save (Sync then hit a revision conflict).
+  it("cancels the pending debounce when flushed", async () => {
+    const first = deferred<string>();
+    const save = vi.fn().mockImplementationOnce(() => first.promise).mockResolvedValue("again");
+    const { result, rerender } = setup(save);
+
+    rerender({ value: "one", ready: true });
+    let flushed: Promise<string | null> | undefined;
+    act(() => { flushed = result.current(); });
+    await act(() => vi.advanceTimersByTimeAsync(500));
+    await act(async () => { first.resolve("first"); await flushed; });
+    await act(() => vi.advanceTimersByTimeAsync(500));
+
+    expect(save).toHaveBeenCalledTimes(1);
   });
 
   it("flushes on demand behind the save in flight and returns its response", async () => {

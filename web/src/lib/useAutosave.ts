@@ -9,8 +9,8 @@ export type AutosaveOptions<Request, Response> = {
   save: (request: Request) => Promise<Response>;
   onPending: () => void;
   onSaving: () => void;
-  /** `latest` is false when another save is already queued behind this one. */
-  onSaved: (response: Response, latest: boolean) => void;
+  /** `latest` is false while a newer edit is still waiting to be saved. */
+  onSaved: (response: Response, latest: boolean, sent: Request) => void;
   onError: (error: unknown) => void;
 };
 
@@ -35,6 +35,11 @@ export function useAutosave<Request, Response>(options: AutosaveOptions<Request,
   });
 
   const flush = useCallback((): Promise<Response | null> => {
+    // This save covers the pending edit; left alone, the timer would queue the same save again.
+    if (timer.current !== null) {
+      window.clearTimeout(timer.current);
+      timer.current = null;
+    }
     function enqueue(): Promise<Response | null> {
       if (waiting.current) return waiting.current;
       const run = async () => {
@@ -46,7 +51,8 @@ export function useAutosave<Request, Response>(options: AutosaveOptions<Request,
           savedFingerprint.current = sentFingerprint;
           // An edit back to the old value schedules nothing, yet differs from what was just saved.
           if (!waiting.current && !timer.current && latest.current.fingerprint !== sentFingerprint) void enqueue();
-          latest.current.options.onSaved(response, waiting.current === null);
+          const isLatest = !waiting.current && !timer.current && latest.current.fingerprint === sentFingerprint;
+          latest.current.options.onSaved(response, isLatest, sent);
           return response;
         } catch (error) {
           latest.current.options.onError(error);
