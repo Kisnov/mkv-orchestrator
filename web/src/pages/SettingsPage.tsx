@@ -37,6 +37,7 @@ import ffmpegLogo from "../assets/logos/ffmpeg.png";
 import mkvtoolnixLogo from "../assets/logos/mkvtoolnix.png";
 import tmdbLogo from "../assets/logos/tmdb.png";
 import tvdbLogo from "../assets/logos/tvdb.png";
+import { createLocalId } from "../lib/localId";
 import { applyWebTheme, getAllWebThemes, getStoredWebThemeName, getWebTheme, normalizeWebTheme, removeCustomWebTheme, replaceCustomWebThemes, saveCustomWebTheme, webThemes } from "../theme";
 
 const settingsTabStorageKey = "mkvo.web.settingsTab";
@@ -349,6 +350,7 @@ export function SettingsPage() {
     }
 
     const nextServer: EditableMediaServer = {
+      // Always a UUID: the backend replaces any other id, and Sync could then not find the server.
       id: createLocalId(),
       name: newServerName.trim() || newServerType,
       type: newServerType,
@@ -1638,17 +1640,6 @@ function sameServerUrl(left: string, right: string) {
   } catch {
     return false;
   }
-}
-
-// Always a UUID: the backend replaces any other id, and Sync could then not find the server.
-// `randomUUID` needs a secure context, which plain HTTP to a LAN address is not.
-function createLocalId() {
-  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function formatDateTime(value: string) {

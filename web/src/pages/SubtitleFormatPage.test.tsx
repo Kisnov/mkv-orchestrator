@@ -137,3 +137,21 @@ it("shows an imported font immediately and saves it in MKVO settings", async () 
     expect.objectContaining({ family: "DrawingBrutalDemo", fileName: "DrawingBrutalDemo.otf", dataBase64: "T1RUTw==" })
   ]);
 });
+
+it("shows the progress of its running job and lets it be canceled", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "format-job", label: "Subtitle Format" }));
+  const cancelOperationJob = vi.fn(() => Promise.resolve({} as never));
+  const user = userEvent.setup();
+  renderWithBackend(<MediaLibraryProvider><Scan/><SubtitleFormatPage/></MediaLibraryProvider>, {
+    cancelOperationJob,
+    getOperationJob: () => Promise.resolve({
+      id: "format-job", kind: "Remux", status: "Running", createdUtc: "", startedUtc: null, completedUtc: null,
+      completed: 1, failed: 0, skipped: 0, total: 2, currentFile: "02.mkv", currentFilePercent: 30, lines: [], muxResult: null, propEditResult: null, error: ""
+    })
+  });
+
+  expect(await screen.findByText("Applying 1/2 | 02.mkv 30%")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(cancelOperationJob).toHaveBeenCalledWith("format-job");
+});

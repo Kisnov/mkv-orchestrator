@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { act, screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, it, vi } from "vitest";
 
@@ -8,7 +8,7 @@ import { ReorderTracksPage } from "./ReorderTracksPage";
 import { MediaLibraryProvider, useMediaLibrary } from "../state/MediaLibraryContext";
 import { OperationJobProvider } from "../state/OperationJobContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, MuxPreviewRequest } from "../api";
+import type { MediaFileRow, MuxPreviewRequest, MuxPreviewResponse } from "../api";
 
 const tracks = [
   { id: 0, trackNumber: 1, type: "video", codec: "HEVC", language: "und", name: "", channels: null, default: true, forced: false },
@@ -154,4 +154,57 @@ it("takes the backend's selection when a later scan leaves none of the old batch
   await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
 
   expect(screen.getByRole("checkbox", { name: "Select 03.mkv" })).not.toBeChecked();
+});
+
+it("reports a failed reorder job and lists its failed files", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "reorder-job", label: "Reorder Tracks" }));
+  const files = [file("01.mkv"), file("02.mkv")];
+  const summary = { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 };
+  const user = userEvent.setup();
+  renderWithBackend(
+    <MediaLibraryProvider><ReorderTracksPage/></MediaLibraryProvider>,
+    {
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-11-12T10:00:00Z", files, selectedPaths: [], summary }),
+      setFileSelection: (paths) => Promise.resolve({ files, selectedPaths: paths, updatedUtc: null, summary }),
+      getOperationJob: () => Promise.resolve({
+        id: "reorder-job", kind: "Remux", status: "Failed", createdUtc: "", startedUtc: null, completedUtc: null,
+        completed: 0, failed: 2, skipped: 0, total: 2, currentFile: "", currentFilePercent: 0,
+        lines: ["/media/01.mkv: tool failed", "/media/02.mkv: tool failed"], muxResult: null, propEditResult: null,
+        error: "internal error: 2 of 2 files failed: 01.mkv: tool failed; 02.mkv: tool failed"
+      })
+    }
+  );
+
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("2 of 2 files failed"));
+  await user.click(screen.getByRole("button", { name: "Show the 2 failed file(s) and job log" }));
+  expect(within(screen.getByRole("dialog", { name: "Reorder Tracks job log" })).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["01.mkv: tool failed", "02.mkv: tool failed"]);
+});
+
+function Reordered({ files }: { files: MediaFileRow[] }) {
+  const library = useMediaLibrary();
+  // What a rescan after the apply brings back: the same paths, the tracks renumbered in their new order.
+  const after = files.map((item) => ({ ...item, tracks: [tracks[0], { ...tracks[2], id: 1, trackNumber: 2 }, { ...tracks[1], id: 2, trackNumber: 3 }] }));
+  return <button type="button" onClick={() => library.setFiles(after)}>Rescan after apply</button>;
+}
+
+it("starts the order over when the template's tracks change under the same path", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  const files = [file("01.mkv"), file("02.mkv")];
+  const buildMuxPreview = vi.fn<(request: MuxPreviewRequest) => Promise<MuxPreviewResponse>>(() => Promise.resolve({ actions: [], noChangeFiles: [], summary: "ready", status: "ready", planId: null, planFingerprint: null, idempotencyKey: null }));
+  const user = userEvent.setup();
+  renderWithBackend(
+    <MediaLibraryProvider><OperationJobProvider><Scan files={files}/><Reordered files={files}/><ReorderTracksPage/></OperationJobProvider></MediaLibraryProvider>,
+    { buildMuxPreview, setFileSelection: (paths) => Promise.resolve({ files, selectedPaths: paths, updatedUtc: null, summary: { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 } }) }
+  );
+
+  await screen.findByText("Dialogue");
+  await user.click(screen.getByRole("button", { name: "Move Dialogue down" }));
+  await user.click(screen.getByRole("button", { name: "Rescan after apply" }));
+  await user.click(screen.getByRole("button", { name: "Preview Summary" }));
+
+  await waitFor(() => expect(buildMuxPreview).toHaveBeenCalled());
+  expect(buildMuxPreview.mock.calls[0][0].reorderTemplateTrackIds).toEqual([0, 1, 2]);
+  const names = screen.getAllByRole("button", { name: /^Move .* up$/ }).map((button) => button.getAttribute("aria-label"));
+  expect(names).toEqual(["Move track 0 up", "Move Signs/Songs up", "Move Dialogue up"]);
 });

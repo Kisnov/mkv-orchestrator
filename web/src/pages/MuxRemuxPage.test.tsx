@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { buildRemovedTrackDetails, MuxRemuxPage } from "./MuxRemuxPage";
@@ -181,7 +181,7 @@ describe("MKV Operations file selection", () => {
     expect(await screen.findByText(/Applying 10\/283.*Episode 11\.mkv 50%/i)).toBeInTheDocument();
   });
 
-  it("selects every current file by default and offers select-all controls on right click", async () => {
+  it("selects every current file by default and picks the detail file by click or keyboard", async () => {
     const user = userEvent.setup();
     const files = [mediaFile("Episode 01.mkv"), { ...mediaFile("Episode 02.mkv"), subtitleSummary: "eng x2" }];
     const setFileSelection = vi.fn((selectedPaths: string[]) => Promise.resolve({
@@ -225,23 +225,26 @@ describe("MKV Operations file selection", () => {
     const rows = within(selection).getAllByRole("row").slice(1);
     expect(rows[0]).toHaveTextContent("Template");
     expect(rows[1]).toHaveTextContent("Warning");
-    await user.click(rows[0]);
-    fireEvent.click(rows[1], { ctrlKey: true });
-    fireEvent.keyDown(selection, { key: " " });
-    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).not.toBeChecked()));
 
-    fireEvent.keyDown(selection, { key: " " });
-    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).toBeChecked()));
+    // A click picks the file whose details show, without touching the selection.
+    await user.click(within(rows[1]).getByText("Episode 02.mkv"));
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    checkboxes.forEach((checkbox) => expect(checkbox).toBeChecked());
 
-    await user.click(rows[0]);
-    fireEvent.contextMenu(rows[0], { clientX: 120, clientY: 140 });
-    await user.click(screen.getByRole("menuitem", { name: "Deselect highlighted rows" }));
+    // The keyboard does the same: arrows pick, Space checks.
+    rows[1].focus();
+    await user.keyboard("{ArrowUp}");
+    expect(rows[0]).toHaveFocus();
+    expect(rows[0]).toHaveAttribute("aria-current", "true");
+    await user.keyboard(" ");
     await waitFor(() => expect(checkboxes[0]).not.toBeChecked());
     expect(checkboxes[1]).toBeChecked();
+    await waitFor(() => expect(setFileSelection).toHaveBeenLastCalledWith([files[1].path]));
 
-    fireEvent.contextMenu(rows[0], { clientX: 120, clientY: 140 });
-    await user.click(screen.getByRole("menuitem", { name: "Select highlighted rows" }));
-    await waitFor(() => expect(checkboxes[0]).toBeChecked());
+    await user.click(within(selection.parentElement!).getByRole("button", { name: "Select none" }));
+    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).not.toBeChecked()));
+    await user.click(within(selection.parentElement!).getByRole("button", { name: "Select all" }));
+    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).toBeChecked()));
   });
 
   it("sorts the visible file rows while preserving path-based selection", async () => {
@@ -318,4 +321,37 @@ it("builds a fresh plan and applies without a manual preview", async () => {
   await user.click(applyButton);
   await waitFor(() => expect(startMuxApply).toHaveBeenCalledWith(expect.objectContaining({ planId: "fresh-plan", planFingerprint: "fresh-fingerprint", idempotencyKey: "fresh-key" })));
   expect(buildMuxPreview).toHaveBeenCalledTimes(1);
+});
+
+it("counts only what it will send: an MP4 is unavailable until conversion is on", async () => {
+  const user = userEvent.setup();
+  const mkv = mediaFile("Episode 01.mkv");
+  const mp4 = { ...mediaFile("Movie.mp4"), extension: ".mp4", reader: "ffprobe" };
+  const files = [mkv, mp4];
+  const scan = { updatedUtc: "2026-11-13T10:00:00Z", files, selectedPaths: files.map((file) => file.path), summary: { total: 2, mkv: 1, mp4: 1, failed: 0, cached: 0 } };
+  const backend = {
+    getCurrentScanFiles: () => Promise.resolve(scan),
+    getWebSettings: () => Promise.resolve({ mkvMergeDefaultAudioLanguages: "eng", mkvMergeDefaultSubtitleLanguages: "eng" } as WebSettings),
+    setFileSelection: (selectedPaths: string[]) => Promise.resolve({ ...scan, selectedPaths })
+  };
+  const { unmount } = renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="remove" /></MediaLibraryProvider>, backend);
+
+  const box = await screen.findByRole("checkbox", { name: "Select Movie.mp4" });
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Episode 01.mkv" })).toBeChecked());
+  expect(box).toBeDisabled();
+  expect(box).not.toBeChecked();
+  expect(box).toHaveAttribute("title", "MP4 files can only be converted, on Convert / Remux.");
+  expect(screen.getByText("1 of 2 selected")).toBeInTheDocument();
+  expect(screen.getByText("1 files selected")).toBeInTheDocument();
+  unmount();
+
+  renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="convert" /></MediaLibraryProvider>, backend);
+  const convertBox = await screen.findByRole("checkbox", { name: "Select Movie.mp4" });
+  await waitFor(() => expect(convertBox).toBeChecked());
+  expect(screen.getByText("2 of 2 selected")).toBeInTheDocument();
+  expect(screen.getByText("2 files selected")).toBeInTheDocument();
+  await user.click(screen.getByRole("checkbox", { name: "Convert selected MP4 files to MKV" }));
+  expect(screen.getByRole("checkbox", { name: "Select Movie.mp4" })).toHaveAttribute("title", "Turn on MP4 conversion to include this file.");
+  expect(screen.getByText("1 of 2 selected")).toBeInTheDocument();
+  expect(screen.getByText("1 files selected")).toBeInTheDocument();
 });
