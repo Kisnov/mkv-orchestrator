@@ -8,14 +8,14 @@
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
   <Support>https://github.com/bamcel/mkv-orchestrator/issues</Support>
-  <Project>https://github.com/bamcel/mkv-orchestrator</Project>
+  <Project>https://github.com/Kisnov/mkv-orchestrator</Project>
   <Overview>MKV Orchestrator is a media operations console for scanning MKV/MP4 files, reviewing media and track metadata, renaming files from TVDB/TMDB metadata, mux/remux planning, track property edits, and library overview workflows. The container includes MKVToolNix and FFmpeg/FFprobe. Mount your Unraid shares into /media and optionally /downloads; configure provider API keys in the web Settings page or through the optional masked environment variables below.</Overview>
   <Description>Manage MKV and MP4 libraries from a browser with metadata scanning, provider-backed renaming, mux/remux planning, track property editing, and library workflows. MKVToolNix and FFmpeg/FFprobe are included.</Description>
   <Category>MediaApp:Video Tools:Utilities</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/bamcel/mkv-orchestrator/main/templates/my-mkv-orchestrator.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/bamcel/mkv-orchestrator/main/web/src/assets/mkvo-icon-purple.png</Icon>
-  <ExtraParams/>
+  <TemplateURL>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/templates/my-mkv-orchestrator.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/web/src/assets/mkvo-icon-purple.png</Icon>
+  <ExtraParams>--cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --security-opt=no-new-privileges:true</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DonateText/>
@@ -29,6 +29,7 @@
   <Config Name="Administrator Username" Target="MKVO_USERNAME" Default="admin" Mode="" Description="Case-sensitive administrator username. Blank uses admin. Credentials are preserved while login is disabled." Type="Variable" Display="always" Required="false" Mask="false">admin</Config>
   <Config Name="Administrator Password" Target="MKVO_PASSWORD" Default="" Mode="" Description="Administrator password, at least 12 characters. Leave blank to generate one in /config/admin-password.txt (appdata folder); read it from that file, it is never shown in logs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
   <Config Name="Allow No Login" Target="MKVO_ALLOW_NO_LOGIN" Default="false|true" Mode="" Description="Only for Require Login false on a trusted network: confirms that everyone who can reach MKVO may rename, remux and delete your media without signing in." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Allowed Host Names" Target="MKVO_ALLOWED_HOSTS" Default="" Mode="" Description="Extra host names, comma separated, for a reverse proxy that rewrites Host or for reaching MKVO by name with login off. IP addresses and localhost always work." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
   <Config Name="Media Root" Target="MKVO_MEDIA_ROOT" Default="/media" Mode="" Description="Default root used by the Dashboard browser." Type="Variable" Display="advanced" Required="true" Mask="false">/media</Config>
   <Config Name="Source Roots" Target="MKVO_SOURCE_ROOTS" Default="downloads=/downloads" Mode="" Description="Additional named source roots. /media is added automatically; use name=/container/path entries separated by commas." Type="Variable" Display="advanced" Required="false" Mask="false">downloads=/downloads</Config>
   <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns files created by MKVO. Unraid default: 99 (nobody)." Type="Variable" Display="always" Required="false" Mask="false">99</Config>
