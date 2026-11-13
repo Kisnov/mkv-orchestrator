@@ -444,7 +444,9 @@ impl MkvoRuntime {
             let cancel = CancellationToken::new();
             let mut file = dependencies.probe.inspect(&path, cancel).await?;
             file.fingerprint = fingerprint;
-            dependencies.cache.upsert(&file).await?;
+            if let Err(error) = dependencies.cache.upsert(&file).await {
+                tracing::warn!(path = %path.display(), %error, "file could not be cached");
+            }
             Ok::<_, mkvo_application::PortError>(file)
         };
         read.await
