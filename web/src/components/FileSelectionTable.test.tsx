@@ -22,8 +22,8 @@ function file(name: string, audioLanguage = "cat"): MediaFileRow {
 // 01-03 are identical, 04-06 carry a different audio language.
 const files = [file("01.mkv"), file("02.mkv"), file("03.mkv"), file("04.mkv", "jpn"), file("05.mkv", "jpn"), file("06.mkv", "jpn")];
 
-function Harness({ initialFiles = files }: { initialFiles?: MediaFileRow[] }) {
-  const [templatePath, setTemplatePath] = useState(initialFiles[0].path);
+function Harness({ initialFiles = files, initialTemplatePath = initialFiles[0].path }: { initialFiles?: MediaFileRow[]; initialTemplatePath?: string }) {
+  const [templatePath, setTemplatePath] = useState(initialTemplatePath);
   const [scanned, setScanned] = useState(initialFiles);
   const templateFile = scanned.find((item) => item.path === templatePath) ?? null;
   const selection = useFileSelection(scanned, templateFile);
@@ -169,5 +169,18 @@ describe("FileSelectionTable", () => {
 
     expect(checkedNames()).toHaveLength(3);
     expect(screen.queryByText(/from the template/)).not.toBeInTheDocument();
+  });
+
+  it("selects nothing while there is no template", async () => {
+    const user = userEvent.setup();
+    render(<Harness initialTemplatePath="" />);
+
+    expect(checkedNames()).toEqual([]);
+    expect(screen.getByText("0 of 6 selected")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Only equal to template" }));
+    expect(checkedNames()).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: "Use 04 as template" }));
+    expect(checkedNames()).toEqual(["Select 04.mkv", "Select 05.mkv", "Select 06.mkv"]);
   });
 });

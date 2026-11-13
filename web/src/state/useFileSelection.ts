@@ -9,9 +9,10 @@ export function useFileSelection(files: MediaFileRow[], templateFile: MediaFileR
     () => new Set(files.filter((file) => hasTemplateMismatch(file, templateFile)).map((file) => file.path)),
     [files, templateFile]
   );
+  // Without a template nothing is known to match, so nothing starts selected.
   const defaultPaths = useMemo(
-    () => files.filter((file) => !differingPaths.has(file.path)).map((file) => file.path),
-    [files, differingPaths]
+    () => templateFile ? files.filter((file) => !differingPaths.has(file.path)).map((file) => file.path) : [],
+    [files, templateFile, differingPaths]
   );
   // A manual selection lasts only while the template and the files equal to it stay the same.
   const scope = [templateFile?.path ?? "", ...defaultPaths].join("\u0000");
