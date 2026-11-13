@@ -324,10 +324,11 @@ impl MkvoRuntime {
 
     pub async fn cancel_scan(&self, id: &str) -> RuntimeResult<ScanJobResponse> {
         let id = parse_job_id(id)?;
-        let snapshot = self.inner.jobs.cancel(id).await?;
-        if snapshot.kind != JobKind::Scan {
+        let job = self.inner.jobs.get(id).await?;
+        if job.is_none_or(|job| job.kind != JobKind::Scan) {
             return Err(RuntimeError::not_found(format!("scan job {id}")));
         }
+        let snapshot = self.inner.jobs.cancel(id).await?;
         self.scan_job_response(&snapshot).await
     }
 
@@ -688,6 +689,47 @@ mod tests {
         // Clearing the working set must not empty an answer either.
         host.runtime.clear_current_scan_files().await.unwrap();
         assert_own_files().await;
+    }
+
+    /// A job of `kind` that runs until the returned sender is dropped.
+    async fn held_job(host: &Host, kind: JobKind) -> (JobId, tokio::sync::oneshot::Sender<()>) {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let spec = JobSpec {
+            kind,
+            idempotency_key: IdempotencyKey::generate(),
+            request_fingerprint: "held".to_owned(),
+            plan_id: None,
+            total: 0,
+            resources: Vec::new(),
+        };
+        let task = |_| async move {
+            let _ = released.await;
+            Ok(JobCompletion::default())
+        };
+        let accepted = host.runtime.inner.jobs.start(spec, task).await.unwrap();
+        (accepted.id, release)
+    }
+
+    #[tokio::test]
+    async fn cancelling_through_the_other_kind_of_endpoint_cancels_nothing() {
+        let host = host(0);
+        let (scan, _hold_scan) = held_job(&host, JobKind::Scan).await;
+        let (remux, _hold_remux) = held_job(&host, JobKind::Remux).await;
+
+        let as_operation = host.runtime.cancel_operation_job(&scan.to_string()).await;
+        let as_scan = host.runtime.cancel_scan(&remux.to_string()).await;
+
+        for error in [as_operation.unwrap_err(), as_scan.unwrap_err()] {
+            assert_eq!(error.code, mkvo_contracts::ApiErrorCode::NotFound);
+        }
+        for id in [scan, remux] {
+            let job = host.runtime.inner.jobs.get(id).await.unwrap().unwrap();
+            assert!(
+                !matches!(job.status, JobStatus::Canceling | JobStatus::Canceled),
+                "{:?} was canceled",
+                job.kind
+            );
+        }
     }
 
     #[test]
