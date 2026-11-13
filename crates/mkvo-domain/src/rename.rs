@@ -76,6 +76,9 @@ pub struct RenameTokens {
     pub season: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub episode: Option<u32>,
+    /// The last episode of a file that holds several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_episode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absolute: Option<u32>,
     pub episode_title: String,

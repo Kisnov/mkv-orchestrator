@@ -371,12 +371,21 @@ pub fn rename_tokens(file: &MediaFile) -> RenameTokens {
     let absolute = episode
         .and_then(|value| value.absolute_episode)
         .filter(|number| *number > 0);
+    // The range a name like `S01E01E02` states, when the file was matched to its first episode.
+    let last_episode = crate::library::parse_episode(&file.file_name())
+        .filter(|parsed| {
+            parsed.last_episode > parsed.episode
+                && parsed.season == season
+                && Some(parsed.episode) == episode_number
+        })
+        .map(|parsed| parsed.last_episode);
     RenameTokens {
         title: series.clone(),
         series,
         year: episode.and_then(|value| value.year),
         season,
         episode: episode_number,
+        last_episode,
         absolute,
         episode_title,
     }
@@ -427,10 +436,16 @@ pub fn build_file_name(file: &MediaFile, template: &str) -> String {
         ("{episodeTitle}", tokens.episode_title),
         ("{absolute:000}", format_optional(tokens.absolute, 3)),
         ("{season:00}", format_optional(tokens.season, 2)),
-        ("{episode:00}", format_optional(tokens.episode, 2)),
+        (
+            "{episode:00}",
+            format_episodes(tokens.episode, tokens.last_episode, 2),
+        ),
         ("{absolute}", format_optional(tokens.absolute, 0)),
         ("{season}", format_optional(tokens.season, 0)),
-        ("{episode}", format_optional(tokens.episode, 0)),
+        (
+            "{episode}",
+            format_episodes(tokens.episode, tokens.last_episode, 0),
+        ),
         ("{series}", tokens.series),
         ("{title}", tokens.title),
         (
@@ -599,6 +614,15 @@ fn format_optional(value: Option<u32>, width: usize) -> String {
             format!("{number:0width$}")
         }
     })
+}
+
+/// `01`, or `01-E02` for a file that holds several episodes.
+fn format_episodes(first: Option<u32>, last: Option<u32>, width: usize) -> String {
+    let first = format_optional(first, width);
+    match last {
+        Some(_) => format!("{first}-E{}", format_optional(last, width)),
+        None => first,
+    }
 }
 
 fn first_non_blank<const N: usize>(values: [Option<&str>; N]) -> String {
@@ -817,6 +841,24 @@ mod tests {
         // TVDB answers 0 for a series it has no absolute order for.
         file.episode.as_mut().expect("episode").absolute_episode = Some(0);
         assert_eq!(rename_tokens(&file).absolute, None);
+    }
+
+    /// `Show S01E01E02.mkv` used to come out as `S01E01`, its second episode gone.
+    #[test]
+    fn a_file_that_holds_two_episodes_keeps_both_numbers() {
+        let mut file = media("Show S01E01E02.mkv", 1);
+        assert_eq!(
+            build_file_name(&file, "S{season:00}E{episode:00} - {episodeTitle}"),
+            "S01E01-E02 - Pilot - Part 1.mkv"
+        );
+        assert_eq!(build_file_name(&file, "{season}x{episode}"), "1x1-E2.mkv");
+
+        // Matched to an episode other than the one it names: its range says nothing.
+        file.episode.as_mut().expect("episode").episode = Some(5);
+        assert_eq!(
+            build_file_name(&file, "S{season:00}E{episode:00}"),
+            "S01E05.mkv"
+        );
     }
 
     #[test]
