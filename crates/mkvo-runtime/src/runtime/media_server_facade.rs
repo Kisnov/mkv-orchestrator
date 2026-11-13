@@ -121,6 +121,18 @@ impl MkvoRuntime {
         &self,
         request: LibraryArtworkRequest,
     ) -> RuntimeResult<LibraryArtworkResponse> {
+        let artwork = self.get_library_artwork_bytes(request).await?;
+        Ok(LibraryArtworkResponse {
+            content_type: artwork.content_type,
+            data_base64: STANDARD.encode(artwork.bytes),
+        })
+    }
+
+    /// The poster of an item on a configured media server, as image bytes.
+    pub async fn get_library_artwork_bytes(
+        &self,
+        request: LibraryArtworkRequest,
+    ) -> RuntimeResult<mkvo_application::MediaServerArtwork> {
         if request.item_id.is_empty()
             || request.item_id.len() > 128
             || !request
@@ -162,10 +174,7 @@ impl MkvoRuntime {
                 "media server returned a non-image poster response",
             ));
         }
-        Ok(LibraryArtworkResponse {
-            content_type: artwork.content_type,
-            data_base64: STANDARD.encode(artwork.bytes),
-        })
+        Ok(artwork)
     }
 
     pub async fn get_library_local_artwork(
