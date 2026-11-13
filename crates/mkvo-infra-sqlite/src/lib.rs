@@ -43,6 +43,11 @@ pub enum StoreError {
         "the database was written by a newer version (schema {found}, this version reads up to {supported})"
     )]
     NewerSchema { found: u32, supported: u32 },
+    #[error(
+        "the database was not upgraded because it could not first be copied to {}: {reason}. Free some disk space or make that directory writable, then restart",
+        path.display()
+    )]
+    BackupFailed { path: PathBuf, reason: String },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -232,12 +237,16 @@ fn back_up_before_migrating(connection: &Connection, path: &Path) -> StoreResult
     let backup = backup_path(path, current);
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
-    let target = partial
-        .to_str()
-        .ok_or_else(|| rusqlite::Error::InvalidPath(partial.clone()))?;
-    connection.execute("VACUUM INTO ?1", [target])?;
-    std::fs::rename(&partial, &backup).map_err(|error| {
-        StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    let copied = match partial.to_str() {
+        Some(target) => connection
+            .execute("VACUUM INTO ?1", [target])
+            .map_err(|error| error.to_string())
+            .and_then(|_| std::fs::rename(&partial, &backup).map_err(|error| error.to_string())),
+        None => Err("the path is not valid UTF-8".to_owned()),
+    };
+    copied.map_err(|reason| StoreError::BackupFailed {
+        path: backup,
+        reason,
     })
 }
 
@@ -547,6 +556,31 @@ mod tests {
 
         SqliteStore::open(&database.0).expect("migrate");
         assert_eq!(version_and_setting(&backup_path(&database.0, 2)).0, 2);
+    }
+
+    /// Without its copy the database must stay as it was, and the error must say why.
+    #[test]
+    fn a_backup_that_cannot_be_written_stops_the_migration() {
+        let database = TestDatabase::new("backup-blocked");
+        database_at_version(&database.0, 2);
+        let partial = backup_path(&database.0, 2).with_extension("bak.partial");
+        std::fs::create_dir(&partial).expect("block the copy");
+
+        let opened = SqliteStore::open(&database.0);
+        let _ = std::fs::remove_dir(&partial);
+        let error = opened.expect_err("the migration must not run");
+        assert!(
+            matches!(&error, StoreError::BackupFailed { path, .. } if *path == backup_path(&database.0, 2)),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("Free some disk space"),
+            "{error}"
+        );
+        assert_eq!(
+            version_and_setting(&database.0),
+            (2, r#"{"theme":"dark"}"#.to_owned())
+        );
     }
 
     #[test]
