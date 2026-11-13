@@ -34,5 +34,15 @@ services:
       - ${MKVO_MEDIA_PATH:-./tmp/docker-media}:/media
       - ${MKVO_DOWNLOADS_PATH:-./tmp/docker-downloads}:/downloads
       - ${MKVO_CONFIG_PATH:-./tmp/docker-config}:/config
+    # The entrypoint only fixes /config ownership and switches to PUID/PGID.
+    # PUID=0 (run as root) also needs DAC_OVERRIDE and FOWNER to write other users' files.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
