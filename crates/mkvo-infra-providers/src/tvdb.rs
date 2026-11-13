@@ -1,12 +1,13 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -17,6 +18,12 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api4.thetvdb.com/v4/";
+const NAME_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Each name lookup is one request, so later results keep their search name.
+const MAX_NAME_LOOKUPS: usize = 10;
+
+/// Translated series names by id and language; `None` records a missing translation.
+type NameCache = HashMap<(u64, String), (Instant, Option<String>)>;
 
 #[derive(Debug)]
 struct CachedToken {
@@ -30,6 +37,7 @@ pub struct TvdbClient {
     client: Client,
     base_url: Url,
     token: Arc<RwLock<Option<CachedToken>>>,
+    names: Arc<Mutex<NameCache>>,
 }
 
 impl TvdbClient {
@@ -38,6 +46,7 @@ impl TvdbClient {
             client: provider_http_client(),
             base_url: Url::parse(DEFAULT_BASE_URL).expect("TVDB base URL is valid"),
             token: Arc::new(RwLock::new(None)),
+            names: Arc::default(),
         }
     }
 
@@ -46,6 +55,7 @@ impl TvdbClient {
             client,
             base_url,
             token: Arc::new(RwLock::new(None)),
+            names: Arc::default(),
         }
     }
 
@@ -109,21 +119,34 @@ impl TvdbClient {
         query: &[(&str, String)],
         cancellation: &CancellationToken,
     ) -> Result<Value, ProviderError> {
-        let bearer = self.bearer(credentials, cancellation).await?;
         let url = self
             .base_url
             .join(path)
             .map_err(|error| ProviderError::invalid(ProviderKind::Tvdb, error))?;
-        let query = query.to_vec();
-        let client = self.client.clone();
-        let response = send_with_retry(ProviderKind::Tvdb, cancellation, move || {
-            client
-                .get(url.clone())
-                .bearer_auth(bearer.expose())
-                .query(&query)
-        })
-        .await?;
-        response_json(ProviderKind::Tvdb, response).await
+        let mut logged_in_again = false;
+        loop {
+            let bearer = self.bearer(credentials, cancellation).await?;
+            let result = send_with_retry(ProviderKind::Tvdb, cancellation, || {
+                self.client
+                    .get(url.clone())
+                    .bearer_auth(bearer.expose())
+                    .query(query)
+            })
+            .await;
+            match result {
+                // TVDB can revoke a token before the cached copy expires.
+                Err(ProviderError::Status { status, .. })
+                    if status == StatusCode::UNAUTHORIZED && !logged_in_again =>
+                {
+                    let mut cached = self.token.write().await;
+                    if cached.as_ref().is_some_and(|cached| cached.token == bearer) {
+                        *cached = None;
+                    }
+                    logged_in_again = true;
+                }
+                result => return response_json(ProviderKind::Tvdb, result?).await,
+            }
+        }
     }
 
     async fn localized_series_name(
@@ -133,6 +156,12 @@ impl TvdbClient {
         language: &str,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, ProviderError> {
+        let key = (id, language.to_owned());
+        if let Some((cached_at, name)) = self.names.lock().await.get(&key)
+            && cached_at.elapsed() < NAME_CACHE_TTL
+        {
+            return Ok(name.clone());
+        }
         let document = self
             .get_json(
                 credentials,
@@ -144,7 +173,11 @@ impl TvdbClient {
                 cancellation,
             )
             .await?;
-        Ok(translation_name(&document, language))
+        let name = translation_name(&document, language);
+        let mut names = self.names.lock().await;
+        names.retain(|_, (cached_at, _)| cached_at.elapsed() < NAME_CACHE_TTL);
+        names.insert(key, (Instant::now(), name.clone()));
+        Ok(name)
     }
 }
 
@@ -172,6 +205,7 @@ impl MetadataProviderClient for TvdbClient {
         }
         let language = tvdb_language(language);
         let mut results = Vec::new();
+        let mut translated = HashMap::new();
         for (media_type, kind) in [("series", MediaKind::Series), ("movie", MediaKind::Movie)] {
             let document = self
                 .get_json(
@@ -185,17 +219,32 @@ impl MetadataProviderClient for TvdbClient {
                     &cancellation,
                 )
                 .await?;
+            if kind == MediaKind::Series {
+                translated = search_translations(&document, &language);
+            }
             results.extend(normalize_search_results(&document, kind));
         }
+        let mut lookups = 0;
         for result in &mut results {
             if result.kind != MediaKind::Series {
                 continue;
             }
-            if let Ok(Some(name)) = self
+            if let Some(name) = translated.remove(&result.id) {
+                result.name = name;
+                continue;
+            }
+            if lookups == MAX_NAME_LOOKUPS {
+                continue;
+            }
+            lookups += 1;
+            match self
                 .localized_series_name(credentials, result.id, &language, &cancellation)
                 .await
             {
-                result.name = name;
+                Ok(Some(name)) => result.name = name,
+                Ok(None) => {}
+                // Names are cosmetic, so a failing TVDB is not asked for the rest.
+                Err(_) => lookups = MAX_NAME_LOOKUPS,
             }
         }
         Ok(results)
@@ -286,6 +335,21 @@ fn normalize_search_results(document: &Value, kind: MediaKind) -> Vec<SearchResu
         .collect()
 }
 
+/// Search results can already carry each name in every language TVDB has.
+fn search_translations(document: &Value, language: &str) -> HashMap<u64, String> {
+    document
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = value_u64(item.get("tvdb_id").or_else(|| item.get("id"))?)?;
+            let name = item.get("translations")?.get(language)?.as_str()?;
+            (!name.trim().is_empty()).then(|| (id, name.to_owned()))
+        })
+        .collect()
+}
+
 fn normalize_episode_page(document: &Value) -> Vec<EpisodeMetadata> {
     document
         .pointer("/data/episodes")
@@ -365,16 +429,11 @@ fn tvdb_has_next_page(document: &Value, current_page: u32) -> bool {
     }
 }
 
+/// TVDB keys translations by the three-letter ISO 639-2/T code.
 fn tvdb_language(value: &str) -> String {
-    let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "en" | "en-us" | "eng" => "eng".to_owned(),
-        "ja" | "ja-jp" | "jpn" => "jpn".to_owned(),
-        "es" | "es-es" | "spa" => "spa".to_owned(),
-        "fr" | "fr-fr" | "fra" | "fre" => "fra".to_owned(),
-        "de" | "de-de" | "deu" | "ger" => "deu".to_owned(),
-        _ => "eng".to_owned(),
-    }
+    crate::iso639::lookup(value)
+        .map_or("eng", |(_, language)| language)
+        .to_owned()
 }
 
 fn translation_name(document: &Value, language: &str) -> Option<String> {
@@ -400,8 +459,181 @@ fn value_u64(value: &Value) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{
+        Json, Router,
+        extract::{Path, Query},
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
+    };
+
     use super::*;
+    use crate::common::serve_stub;
     use serde_json::json;
+
+    /// A stub whose `/login` hands out `token-1`, `token-2`, … and whose
+    /// `/search` accepts only `accepted`.
+    async fn stub_client(accepted: &'static str) -> (TvdbClient, Arc<AtomicUsize>) {
+        let logins = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&logins);
+        let router = Router::new()
+            .route(
+                "/login",
+                post(move || async move {
+                    let login = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Json(json!({"data": {"token": format!("token-{login}")}}))
+                }),
+            )
+            .route(
+                "/search",
+                get(move |headers: HeaderMap| async move {
+                    if headers["authorization"] == format!("Bearer {accepted}") {
+                        Ok(Json(json!({"data": []})))
+                    } else {
+                        Err(StatusCode::UNAUTHORIZED)
+                    }
+                }),
+            );
+        let base = Url::parse(&format!("{}/", serve_stub(router).await)).expect("stub URL");
+        (
+            TvdbClient::with_client(provider_http_client(), base),
+            logins,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_replaced_by_one_new_login() {
+        let (client, logins) = stub_client("token-2").await;
+        let results = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "show",
+                "eng",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search after a new login");
+        assert!(results.is_empty());
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_token_rejected_twice_is_an_error_not_a_login_loop() {
+        let (client, logins) = stub_client("never").await;
+        let error = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "show",
+                "eng",
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("still unauthorized");
+        assert!(error.to_string().contains("401"), "{error}");
+        assert_eq!(logins.load(Ordering::SeqCst), 2);
+    }
+
+    /// A stub whose series search returns `series` and which counts the name
+    /// lookups; ids from 100 up have no extended record.
+    async fn search_stub(series: Value) -> (TvdbClient, Arc<AtomicUsize>) {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&lookups);
+        let router = Router::new()
+            .route(
+                "/login",
+                post(|| async { Json(json!({"data": {"token": "token"}})) }),
+            )
+            .route(
+                "/search",
+                get(
+                    move |Query(query): Query<HashMap<String, String>>| async move {
+                        if query["type"] == "series" {
+                            Json(json!({"data": series}))
+                        } else {
+                            Json(json!({"data": []}))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/series/{id}/extended",
+                get(move |Path(id): Path<u64>| async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if id >= 100 {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                    Ok(Json(json!({"data": {"translations": {"nameTranslations": [
+                        {"language": "cat", "name": format!("Sèrie {id}")}
+                    ]}}})))
+                }),
+            );
+        let base = Url::parse(&format!("{}/", serve_stub(router).await)).expect("stub URL");
+        (
+            TvdbClient::with_client(provider_http_client(), base),
+            lookups,
+        )
+    }
+
+    #[tokio::test]
+    async fn name_lookups_are_capped_and_cached() {
+        let series: Vec<Value> = (1..=15)
+            .map(|id| json!({"tvdb_id": id.to_string(), "name": format!("Series {id}")}))
+            .collect();
+        let (client, lookups) = search_stub(json!(series)).await;
+        let credentials = ProviderCredentials::api_key("key");
+
+        for _ in 0..2 {
+            let results = client
+                .search(&credentials, "series", "cat", CancellationToken::new())
+                .await
+                .expect("search");
+            assert_eq!(results.len(), 15);
+            assert_eq!(results[0].name, "Sèrie 1");
+            assert_eq!(results[9].name, "Sèrie 10");
+            assert_eq!(results[10].name, "Series 11");
+        }
+        assert_eq!(lookups.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn name_lookups_stop_at_the_first_failure() {
+        let series: Vec<Value> = (100..115)
+            .map(|id| json!({"tvdb_id": id.to_string(), "name": format!("Series {id}")}))
+            .collect();
+        let (client, lookups) = search_stub(json!(series)).await;
+        let results = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "series",
+                "cat",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search");
+        assert_eq!(results[0].name, "Series 100");
+        assert_eq!(results.len(), 15);
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn translations_in_the_search_response_need_no_lookup() {
+        let (client, lookups) = search_stub(json!([
+            {"tvdb_id": "1", "name": "Series 1", "translations": {"cat": "Sèrie u", "eng": "One"}}
+        ]))
+        .await;
+        let results = client
+            .search(
+                &ProviderCredentials::api_key("key"),
+                "series",
+                "ca",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search");
+        assert_eq!(results[0].name, "Sèrie u");
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn normalizes_string_and_numeric_tvdb_ids() {
@@ -429,6 +661,18 @@ mod tests {
             translation_name(&document, "eng").as_deref(),
             Some("That Time I Got Reincarnated as a Slime")
         );
+    }
+
+    #[test]
+    fn languages_map_to_tvdbs_three_letter_codes() {
+        assert_eq!(tvdb_language("ca"), "cat");
+        assert_eq!(tvdb_language("cat"), "cat");
+        assert_eq!(tvdb_language("it"), "ita");
+        assert_eq!(tvdb_language("cze"), "ces");
+        assert_eq!(tvdb_language("ger"), "deu");
+        assert_eq!(tvdb_language("pt-BR"), "por");
+        assert_eq!(tvdb_language("en_US"), "eng");
+        assert_eq!(tvdb_language("und"), "eng");
     }
 
     #[test]

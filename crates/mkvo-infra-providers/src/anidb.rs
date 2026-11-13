@@ -11,26 +11,35 @@
 
 use std::{
     io::Read,
+    path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{
     EpisodeMetadata, MediaKind, MetadataProviderClient, ProviderCredentials, ProviderError,
-    ProviderKind, SearchResult, SelectedMedia, provider_http_client, send_with_retry,
+    ProviderKind, RateLimiter, SearchResult, SelectedMedia, provider_http_client,
+    send_rate_limited,
 };
 
 const TITLES_URL: &str = "https://anidb.net/api/anime-titles.xml.gz";
 const HTTP_API: &str = "http://api.anidb.net:9001/httpapi";
 const KIND: ProviderKind = ProviderKind::AniDb;
+const TITLES_FILE: &str = "anidb-titles.xml.gz";
 /// AniDB asks clients not to fetch the title dump more than once a day.
 const TITLE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// After a failed download AniDB is left alone this long before the next try.
+const DOWNLOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// AniDB bans clients that send more than one request every two seconds.
+const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESULTS: usize = 50;
+/// The decompressed dump was about 7 MiB in 2025; this leaves it room to triple.
+const MAX_TITLES_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct AnimeTitle {
@@ -40,17 +49,30 @@ struct AnimeTitle {
     kind: String,
 }
 
+/// Dated by wall clock so the copy on disk keeps its age across restarts.
 #[derive(Debug, Default)]
 struct TitleCache {
-    titles: Vec<AnimeTitle>,
-    fetched_at: Option<Instant>,
+    titles: Arc<[AnimeTitle]>,
+    fetched_at: Option<SystemTime>,
+    failure: Option<(Instant, ProviderError)>,
 }
 
 impl TitleCache {
-    fn is_fresh(&self) -> bool {
-        self.fetched_at
-            .is_some_and(|at| at.elapsed() < TITLE_CACHE_TTL)
+    /// An outdated dump still answers searches while AniDB cannot be reached.
+    fn outdated_or(&self, error: ProviderError) -> Result<Arc<[AnimeTitle]>, ProviderError> {
+        if self.fetched_at.is_some() {
+            Ok(Arc::clone(&self.titles))
+        } else {
+            Err(error)
+        }
     }
+}
+
+/// A date in the future means the clock stepped back, which counts as just fetched.
+fn is_fresh(fetched_at: SystemTime) -> bool {
+    fetched_at
+        .elapsed()
+        .map_or(true, |age| age < TITLE_CACHE_TTL)
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +80,9 @@ pub struct AniDbClient {
     http: reqwest::Client,
     titles_url: String,
     api_url: String,
-    cache: Arc<RwLock<TitleCache>>,
+    titles_path: Option<PathBuf>,
+    cache: Arc<Mutex<TitleCache>>,
+    limiter: Arc<RateLimiter>,
 }
 
 impl Default for AniDbClient {
@@ -79,48 +103,124 @@ impl AniDbClient {
             http: provider_http_client(),
             titles_url: titles_url.into(),
             api_url: api_url.into(),
-            cache: Arc::new(RwLock::new(TitleCache::default())),
+            titles_path: None,
+            cache: Arc::default(),
+            limiter: Arc::new(RateLimiter::new(REQUEST_INTERVAL)),
         }
+    }
+
+    /// Keep the title dump in `directory` so a restart does not download it again.
+    #[must_use]
+    pub fn with_cache_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.titles_path = Some(directory.into().join(TITLES_FILE));
+        self
     }
 
     async fn titles(
         &self,
         cancellation: CancellationToken,
-    ) -> Result<Vec<AnimeTitle>, ProviderError> {
-        if let Some(cached) = self.cached_titles().await {
-            return Ok(cached);
+    ) -> Result<Arc<[AnimeTitle]>, ProviderError> {
+        // Held across the download so concurrent searches share one fetch.
+        let mut cache = tokio::select! {
+            () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider: KIND }),
+            cache = self.cache.lock() => cache,
+        };
+        if cache.fetched_at.is_none()
+            && let Some(stored) = self.stored_titles().await
+        {
+            *cache = stored;
+        }
+        if cache.fetched_at.is_some_and(is_fresh) {
+            return Ok(Arc::clone(&cache.titles));
+        }
+        if let Some((failed_at, error)) = &cache.failure
+            && failed_at.elapsed() < DOWNLOAD_RETRY_INTERVAL
+        {
+            return cache.outdated_or(error.clone());
         }
 
-        let response =
-            send_with_retry(KIND, &cancellation, || self.http.get(&self.titles_url)).await?;
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ProviderError::network(KIND, error))?;
-        let xml = decompress(&bytes)?;
-        let titles = parse_titles(&xml)?;
-
-        let mut cache = self.cache.write().await;
-        cache.titles = titles.clone();
-        cache.fetched_at = Some(Instant::now());
-        Ok(titles)
+        match self.download(&cancellation).await {
+            Ok((bytes, titles)) => {
+                *cache = TitleCache {
+                    titles: titles.into(),
+                    fetched_at: Some(SystemTime::now()),
+                    failure: None,
+                };
+                self.store(&bytes).await;
+                Ok(Arc::clone(&cache.titles))
+            }
+            Err(error @ ProviderError::Cancelled { .. }) => Err(error),
+            Err(error) => {
+                cache.failure = Some((Instant::now(), error.clone()));
+                cache.outdated_or(error)
+            }
+        }
     }
 
-    async fn cached_titles(&self) -> Option<Vec<AnimeTitle>> {
-        let cache = self.cache.read().await;
-        cache.is_fresh().then(|| cache.titles.clone())
+    async fn download(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<u8>, Vec<AnimeTitle>), ProviderError> {
+        let mut response = send_rate_limited(KIND, cancellation, Some(&self.limiter), || {
+            self.http.get(&self.titles_url)
+        })
+        .await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| ProviderError::network(KIND, error))?
+        {
+            if bytes.len() + chunk.len() > MAX_TITLES_BYTES {
+                return Err(ProviderError::invalid(KIND, "title dump is too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let titles = parse_titles(&decompress(&bytes, MAX_TITLES_BYTES)?)?;
+        Ok((bytes, titles))
+    }
+
+    /// A copy that cannot be written only costs one download after a restart.
+    async fn store(&self, bytes: &[u8]) {
+        let Some(path) = &self.titles_path else {
+            return;
+        };
+        if let Some(directory) = path.parent() {
+            let _ = tokio::fs::create_dir_all(directory).await;
+        }
+        // Renamed into place so a crash mid-write cannot leave half a dump.
+        let temporary = path.with_extension("tmp");
+        if tokio::fs::write(&temporary, bytes).await.is_ok() {
+            let _ = tokio::fs::rename(&temporary, path).await;
+        }
+    }
+
+    /// The dump an earlier run saved, however old it is by now.
+    async fn stored_titles(&self) -> Option<TitleCache> {
+        let path = self.titles_path.as_ref()?;
+        let fetched_at = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+        let bytes = tokio::fs::read(path).await.ok()?;
+        let xml = decompress(&bytes, MAX_TITLES_BYTES).ok()?;
+        Some(TitleCache {
+            titles: parse_titles(&xml).ok()?.into(),
+            fetched_at: Some(fetched_at),
+            failure: None,
+        })
     }
 }
 
 /// The dump is served gzipped, but a proxy or CDN may have decompressed it
 /// already, so plain XML is accepted rather than treated as corrupt.
-fn decompress(bytes: &[u8]) -> Result<String, ProviderError> {
+fn decompress(bytes: &[u8], limit: usize) -> Result<String, ProviderError> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = GzDecoder::new(bytes);
         let mut xml = String::new();
-        decoder
+        GzDecoder::new(bytes)
+            .take(limit as u64 + 1)
             .read_to_string(&mut xml)
             .map_err(|error| ProviderError::invalid(KIND, error))?;
+        if xml.len() > limit {
+            return Err(ProviderError::invalid(KIND, "title dump is too large"));
+        }
         return Ok(xml);
     }
     String::from_utf8(bytes.to_vec()).map_err(|error| ProviderError::invalid(KIND, error))
@@ -161,21 +261,25 @@ fn parse_titles(xml: &str) -> Result<Vec<AnimeTitle>, ProviderError> {
             });
         }
     }
+    // An error page or a ban notice must not be cached as an empty dump.
+    if titles.is_empty() {
+        return Err(ProviderError::invalid(KIND, "title dump has no titles"));
+    }
     Ok(titles)
 }
 
 /// Fold the language spellings AniDB and MKVO each use onto one form.
 fn normalize_language(language: &str) -> String {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "eng" | "en" => "en",
-        "jpn" | "ja" => "ja",
+    let language = language.trim().to_ascii_lowercase();
+    match language.as_str() {
         "jpn-romaji" | "romaji" | "x_jat" | "x-jat" => "x-jat",
-        "spa" | "es" => "es",
-        "fre" | "fra" | "fr" => "fr",
-        "ger" | "deu" | "de" => "de",
-        "kor" | "ko" => "ko",
-        "chi" | "zh" => "zh",
-        other => other,
+        // AniDB files Catalan, Galician and Basque under Spain.
+        "cat" | "ca" => "es-ca",
+        "glg" | "gl" => "es-ga",
+        "baq" | "eus" | "eu" => "es-pv",
+        // Regional and AniDB-only tags (`pt-br`, `zh-hans`, `x-kot`) stay as they are.
+        other if other.contains('-') => other,
+        other => crate::iso639::lookup(other).map_or(other, |(language, _)| language),
     }
     .to_owned()
 }
@@ -363,7 +467,7 @@ impl MetadataProviderClient for AniDbClient {
         let titles = self.titles(cancellation).await?;
 
         let mut matches: Vec<u64> = Vec::new();
-        for title in &titles {
+        for title in titles.iter() {
             if search_key(&title.text).contains(&key) && !matches.contains(&title.aid) {
                 matches.push(title.aid);
                 if matches.len() >= MAX_RESULTS {
@@ -408,7 +512,7 @@ impl MetadataProviderClient for AniDbClient {
         }
 
         let url = self.api_url.clone();
-        let response = send_with_retry(KIND, &cancellation, || {
+        let response = send_rate_limited(KIND, &cancellation, Some(&self.limiter), || {
             self.http.get(&url).query(&[
                 ("request", "anime"),
                 ("client", client_name.as_str()),
@@ -443,7 +547,12 @@ fn split_client(value: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{Router, http::StatusCode, routing::get};
+
     use super::*;
+    use crate::common::serve_stub;
 
     const TITLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <animetitles>
@@ -455,6 +564,191 @@ mod tests {
     <title xml:lang="x-jat" type="main">Cowboy Bebop</title>
   </anime>
 </animetitles>"#;
+
+    /// A stub AniDB that answers the title dump with `status` and counts how
+    /// often it is asked. Each call to the returned closure is a client as a
+    /// restarted process has it.
+    async fn stub(status: StatusCode) -> (impl Fn() -> AniDbClient, Arc<AtomicUsize>) {
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&downloads);
+        let router = Router::new()
+            .route(
+                "/titles",
+                get(move || async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    (status, TITLES_XML)
+                }),
+            )
+            .route(
+                "/httpapi",
+                get(|| async { "<anime><episodecount>1</episodecount></anime>" }),
+            );
+        let base = serve_stub(router).await;
+        let client = move || {
+            AniDbClient::with_endpoints(format!("{base}/titles"), format!("{base}/httpapi"))
+        };
+        (client, downloads)
+    }
+
+    struct CacheDir(PathBuf);
+
+    impl CacheDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mkvo-anidb-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    /// Leave a dump in `directory` as a run at `modified` would have saved it.
+    fn save_dump(directory: &CacheDir, modified: SystemTime) -> PathBuf {
+        let path = directory.0.join(TITLES_FILE);
+        std::fs::create_dir_all(&directory.0).expect("cache directory");
+        std::fs::write(&path, TITLES_XML).expect("saved dump");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(modified))
+            .expect("date the saved dump");
+        path
+    }
+
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn search(client: &AniDbClient) -> Vec<SearchResult> {
+        client
+            .search(
+                &ProviderCredentials::api_key(""),
+                "bebop",
+                "eng",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search")
+    }
+
+    #[tokio::test]
+    async fn a_saved_dump_survives_a_restart() {
+        let (client, downloads) = stub(StatusCode::OK).await;
+        let directory = CacheDir::new("restart");
+
+        assert_eq!(
+            search(&client().with_cache_dir(&directory.0)).await[0].id,
+            2
+        );
+        assert_eq!(
+            search(&client().with_cache_dir(&directory.0)).await[0].id,
+            2
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_saved_dump_older_than_a_day_is_downloaded_again() {
+        let (client, downloads) = stub(StatusCode::OK).await;
+        let directory = CacheDir::new("stale");
+        let path = save_dump(&directory, SystemTime::now() - 2 * TITLE_CACHE_TTL);
+
+        search(&client().with_cache_dir(&directory.0)).await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        let saved = std::fs::metadata(&path).expect("saved dump");
+        assert!(is_fresh(saved.modified().expect("modified")));
+    }
+
+    /// A clock that stepped back must not turn every search into a download.
+    #[tokio::test]
+    async fn a_saved_dump_dated_in_the_future_is_not_downloaded_again() {
+        let (client, downloads) = stub(StatusCode::OK).await;
+        let directory = CacheDir::new("future");
+        save_dump(&directory, SystemTime::now() + Duration::from_secs(3600));
+
+        assert_eq!(
+            search(&client().with_cache_dir(&directory.0)).await[0].id,
+            2
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_falls_back_to_the_outdated_saved_dump() {
+        let (client, downloads) = stub(StatusCode::NOT_FOUND).await;
+        let directory = CacheDir::new("offline");
+        save_dump(&directory, SystemTime::now() - 2 * TITLE_CACHE_TTL);
+        let client = client().with_cache_dir(&directory.0);
+
+        assert_eq!(search(&client).await[0].id, 2);
+        assert_eq!(search(&client).await[0].id, 2);
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_is_not_repeated_by_the_next_search() {
+        let (client, downloads) = stub(StatusCode::NOT_FOUND).await;
+        let client = client();
+        for _ in 0..2 {
+            let error = client
+                .search(
+                    &ProviderCredentials::api_key(""),
+                    "bebop",
+                    "eng",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("no dump");
+            assert!(error.to_string().contains("404"), "{error}");
+        }
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn requests_wait_for_their_turn_in_the_rate_limiter() {
+        let (client, _) = stub(StatusCode::OK).await;
+        let mut client = client();
+        client.limiter = Arc::new(RateLimiter::new(Duration::from_millis(300)));
+        let selected = SelectedMedia {
+            id: 2,
+            kind: MediaKind::Series,
+            name: String::new(),
+        };
+
+        let started = std::time::Instant::now();
+        for _ in 0..2 {
+            client
+                .episodes(
+                    &ProviderCredentials::api_key("mkvo/1"),
+                    &selected,
+                    "eng",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("episodes");
+        }
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn a_dump_without_titles_is_an_error() {
+        let error = parse_titles("<animetitles/>").expect_err("empty dump");
+        assert!(error.to_string().contains("no titles"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_searches_share_one_download() {
+        let (client, downloads) = stub(StatusCode::OK).await;
+        let client = client();
+        let (first, second, third) =
+            tokio::join!(search(&client), search(&client), search(&client));
+        for results in [first, second, third] {
+            assert_eq!(results[0].id, 2);
+        }
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn titles_parse_with_language_and_type() {
@@ -486,6 +780,21 @@ mod tests {
     }
 
     #[test]
+    fn requested_languages_fold_onto_anidbs_codes() {
+        assert_eq!(normalize_language("eng"), "en");
+        assert_eq!(normalize_language("ita"), "it");
+        assert_eq!(normalize_language("por"), "pt");
+        assert_eq!(normalize_language("dut"), "nl");
+        assert_eq!(normalize_language("pt-BR"), "pt-br");
+        assert_eq!(normalize_language("zh-Hans"), "zh-hans");
+        assert_eq!(normalize_language("cat"), "es-ca");
+        assert_eq!(normalize_language("ca"), "es-ca");
+        assert_eq!(normalize_language("es-CA"), "es-ca");
+        assert_eq!(normalize_language("glg"), "es-ga");
+        assert_eq!(normalize_language("baq"), "es-pv");
+    }
+
+    #[test]
     fn gzip_and_plain_payloads_both_decompress() {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
@@ -494,10 +803,28 @@ mod tests {
         encoder.write_all(TITLES_XML.as_bytes()).expect("write");
         let gzipped = encoder.finish().expect("finish");
 
-        assert_eq!(decompress(&gzipped).expect("gzip"), TITLES_XML);
+        assert_eq!(decompress(&gzipped, 1024).expect("gzip"), TITLES_XML);
         assert_eq!(
-            decompress(TITLES_XML.as_bytes()).expect("plain"),
+            decompress(TITLES_XML.as_bytes(), 1024).expect("plain"),
             TITLES_XML
+        );
+    }
+
+    #[test]
+    fn a_gzip_bomb_is_rejected_instead_of_inflated() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![b' '; 1024 * 1024]).expect("write");
+        let bomb = encoder.finish().expect("finish");
+        assert!(bomb.len() < 4096);
+
+        let error = decompress(&bomb, 4096).expect_err("bomb");
+        assert!(error.to_string().contains("too large"), "{error}");
+        assert_eq!(
+            decompress(&bomb, 1024 * 1024).expect("fits").len(),
+            1024 * 1024
         );
     }
 

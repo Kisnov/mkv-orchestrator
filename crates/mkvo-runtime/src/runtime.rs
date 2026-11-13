@@ -88,12 +88,12 @@ struct ProviderClients {
 }
 
 impl ProviderClients {
-    fn new() -> Self {
+    fn new(config_root: &Path) -> Self {
         Self {
             tvdb: TvdbClient::new(),
             tmdb: TmdbClient::new(),
             anilist: AniListClient::new(),
-            anidb: AniDbClient::new(),
+            anidb: AniDbClient::new().with_cache_dir(config_root),
         }
     }
 }
@@ -233,6 +233,7 @@ impl MkvoRuntime {
                 });
         Self {
             inner: Arc::new(RuntimeInner {
+                providers: ProviderClients::new(&config.config_root),
                 config,
                 dependencies,
                 jobs,
@@ -240,7 +241,6 @@ impl MkvoRuntime {
                 settings_service,
                 current_scan: Arc::new(RwLock::new(CurrentScanState::default())),
                 legacy_rename_history,
-                providers: ProviderClients::new(),
                 media_server_http: MediaServerDiscoveryClient::new(),
             }),
         }

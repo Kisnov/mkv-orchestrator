@@ -5,6 +5,7 @@ mod adapter;
 mod anidb;
 mod anilist;
 mod common;
+mod iso639;
 mod tmdb;
 mod tvdb;
 

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) fn provider_http_client() -> reqwest::Client {
@@ -122,7 +123,7 @@ pub struct EpisodeMetadata {
     pub air_date: Option<String>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ProviderError {
     #[error("{provider} credentials are not configured")]
     MissingCredentials { provider: ProviderKind },
@@ -185,9 +186,48 @@ pub trait MetadataProviderClient: Send + Sync {
     ) -> Result<Vec<EpisodeMetadata>, ProviderError>;
 }
 
+/// Spaces requests at least `interval` apart across every clone of a client.
+#[derive(Debug)]
+pub(crate) struct RateLimiter {
+    interval: Duration,
+    next: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    async fn acquire(&self) {
+        let slot = {
+            let mut next = self.next.lock().await;
+            let slot = (*next).max(Instant::now());
+            *next = slot + self.interval;
+            slot
+        };
+        tokio::time::sleep_until(slot).await;
+    }
+}
+
 pub(crate) async fn send_with_retry<F>(
     provider: ProviderKind,
     cancellation: &CancellationToken,
+    build: F,
+) -> Result<Response, ProviderError>
+where
+    F: FnMut() -> RequestBuilder,
+{
+    send_rate_limited(provider, cancellation, None, build).await
+}
+
+/// `send_with_retry`, with every attempt waiting for its turn in `limiter`.
+pub(crate) async fn send_rate_limited<F>(
+    provider: ProviderKind,
+    cancellation: &CancellationToken,
+    limiter: Option<&RateLimiter>,
     mut build: F,
 ) -> Result<Response, ProviderError>
 where
@@ -195,34 +235,55 @@ where
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
+        let last_attempt = attempt + 1 == MAX_ATTEMPTS;
+        if let Some(limiter) = limiter {
+            wait_or_cancel(provider, cancellation, limiter.acquire()).await?;
+        }
         let send = build().send();
-        let response = tokio::select! {
+        let result = tokio::select! {
             () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider }),
-            response = send => response.map_err(|error| ProviderError::network(provider, error))?,
+            result = send => result,
         };
-        if response.status().is_success() {
-            return Ok(response);
-        }
-
-        let retryable = response.status() == StatusCode::TOO_MANY_REQUESTS
-            || response.status().is_server_error();
-        if !retryable || attempt + 1 == MAX_ATTEMPTS {
-            return Err(ProviderError::Status {
-                provider,
-                status: response.status(),
-            });
-        }
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_millis(250 * 2_u64.pow(attempt)))
-            .min(Duration::from_secs(10));
-        wait_or_cancel(provider, cancellation, tokio::time::sleep(retry_after)).await?;
+        let retry_after = match result {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let retryable = response.status() == StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error();
+                if !retryable || last_attempt {
+                    return Err(ProviderError::Status {
+                        provider,
+                        status: response.status(),
+                    });
+                }
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+            }
+            // A timeout already cost the caller its full wait, so only transport
+            // failures that return quickly (refused, reset) are sent again.
+            Err(error)
+                if !last_attempt
+                    && !error.is_timeout()
+                    && (error.is_connect() || error.is_request() || error.is_body()) =>
+            {
+                None
+            }
+            Err(error) => return Err(ProviderError::network(provider, error)),
+        };
+        let delay = retry_delay(retry_after, attempt);
+        wait_or_cancel(provider, cancellation, tokio::time::sleep(delay)).await?;
     }
     unreachable!("retry loop always returns")
+}
+
+/// The server's `Retry-After` when it sends one, else exponential backoff.
+fn retry_delay(retry_after_secs: Option<u64>, attempt: u32) -> Duration {
+    retry_after_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_millis(250 * 2_u64.pow(attempt)))
+        .min(Duration::from_secs(60))
 }
 
 async fn wait_or_cancel<F>(
@@ -240,23 +301,19 @@ where
     }
 }
 
+/// TMDB's `language` form: ISO 639-1, optionally followed by a country.
 pub fn normalize_language(value: &str) -> String {
     let value = value.trim().replace('_', "-").to_ascii_lowercase();
-    match value.as_str() {
-        "eng" => "en-US".to_owned(),
-        "jpn" => "ja-JP".to_owned(),
-        "spa" => "es-ES".to_owned(),
-        "fre" | "fra" => "fr-FR".to_owned(),
-        "ger" | "deu" => "de-DE".to_owned(),
-        "en" => "en-US".to_owned(),
-        "ja" => "ja-JP".to_owned(),
-        "es" => "es-ES".to_owned(),
-        "fr" => "fr-FR".to_owned(),
-        "de" => "de-DE".to_owned(),
-        value if value.len() == 5 && value.as_bytes()[2] == b'-' => {
-            format!("{}-{}", &value[..2], value[3..].to_ascii_uppercase())
-        }
-        _ => "en-US".to_owned(),
+    if value.len() == 5 && value.as_bytes()[2] == b'-' {
+        return format!("{}-{}", &value[..2], value[3..].to_ascii_uppercase());
+    }
+    match crate::iso639::lookup(&value) {
+        Some(("en", _)) | None => "en-US".to_owned(),
+        Some(("ja", _)) => "ja-JP".to_owned(),
+        Some(("es", _)) => "es-ES".to_owned(),
+        Some(("fr", _)) => "fr-FR".to_owned(),
+        Some(("de", _)) => "de-DE".to_owned(),
+        Some((language, _)) => language.to_owned(),
     }
 }
 
@@ -277,9 +334,66 @@ pub(crate) async fn response_json(
         .map_err(|error| ProviderError::invalid(provider, error.without_url()))
 }
 
+/// Serve `router` on a loopback port and return its base URL.
+#[cfg(test)]
+pub(crate) async fn serve_stub(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub server");
+    let address = listener.local_addr().expect("stub address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{address}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        tokio::spawn(async move {
+            drop(listener.accept().await);
+            let (mut stream, _) = listener.accept().await.expect("second connection");
+            let _ = stream.read(&mut [0_u8; 1024]).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .await;
+        });
+
+        let client = provider_http_client();
+        let response = send_with_retry(ProviderKind::Tmdb, &CancellationToken::new(), || {
+            client.get(&url)
+        })
+        .await
+        .expect("retried request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limiter_spaces_requests_by_its_interval() {
+        let limiter = RateLimiter::new(Duration::from_secs(2));
+        let started = Instant::now();
+        limiter.acquire().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        limiter.acquire().await;
+        limiter.acquire().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn retry_after_is_honoured_up_to_a_minute() {
+        assert_eq!(retry_delay(Some(30), 0), Duration::from_secs(30));
+        assert_eq!(retry_delay(Some(3600), 0), Duration::from_secs(60));
+        assert_eq!(retry_delay(None, 0), Duration::from_millis(250));
+        assert_eq!(retry_delay(None, 1), Duration::from_millis(500));
+    }
 
     #[test]
     fn credentials_are_redacted_from_debug() {
@@ -298,5 +412,16 @@ mod tests {
         assert_eq!(normalize_language("eng"), "en-US");
         assert_eq!(normalize_language("ja_jp"), "ja-JP");
         assert_eq!(normalize_language("unknown"), "en-US");
+    }
+
+    #[test]
+    fn languages_beyond_the_big_five_keep_their_own_code() {
+        assert_eq!(normalize_language("cat"), "ca");
+        assert_eq!(normalize_language("ita"), "it");
+        assert_eq!(normalize_language("ko"), "ko");
+        assert_eq!(normalize_language("dut"), "nl");
+        assert_eq!(normalize_language("pt-br"), "pt-BR");
+        assert_eq!(normalize_language("fre"), "fr-FR");
+        assert_eq!(normalize_language("und"), "en-US");
     }
 }
