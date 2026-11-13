@@ -220,22 +220,41 @@ fn settle_tick(debounce: Duration) -> Duration {
 
 /// Takes the paths quiet for `debounce` whose size and mtime also held still
 /// since the previous check, so a file still being copied is not probed.
-fn take_settled(
+async fn take_settled(
     pending: &mut BTreeMap<PathBuf, Pending>,
     debounce: Duration,
     now: Instant,
 ) -> Vec<WatchEvent> {
+    let due: Vec<PathBuf> = pending
+        .iter()
+        .filter(|(_, entry)| {
+            entry.kind != WatchEventKind::Removed && now.duration_since(entry.at) >= debounce
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    // Off the async workers: a hung network mount must not stall the runtime.
+    let Ok(states) = tokio::task::spawn_blocking(move || {
+        due.into_iter()
+            .map(|path| {
+                let state = std::fs::metadata(&path)
+                    .ok()
+                    .map(|metadata| (metadata.len(), metadata.modified().ok()));
+                (path, state)
+            })
+            .collect::<BTreeMap<_, _>>()
+    })
+    .await
+    else {
+        return Vec::new();
+    };
     let mut ready = Vec::new();
     pending.retain(|path, entry| {
         if now.duration_since(entry.at) < debounce {
             return true;
         }
-        if entry.kind != WatchEventKind::Removed {
-            let state = std::fs::metadata(path)
-                .ok()
-                .map(|metadata| (metadata.len(), metadata.modified().ok()));
-            if state.is_some() && state != entry.seen {
-                entry.seen = state;
+        if let Some(state) = states.get(path) {
+            if state.is_some() && *state != entry.seen {
+                entry.seen = *state;
                 entry.at = now;
                 return true;
             }
@@ -303,7 +322,7 @@ async fn debounce_native_events(
                 {
                     return;
                 }
-                for event in take_settled(&mut pending, debounce, Instant::now()) {
+                for event in take_settled(&mut pending, debounce, Instant::now()).await {
                     if sender.send(event).await.is_err() {
                         return;
                     }
@@ -389,7 +408,7 @@ async fn poll_loop(
                 }
             }
             _ = tick.tick() => {
-                for event in take_settled(&mut pending, options.debounce, Instant::now()) {
+                for event in take_settled(&mut pending, options.debounce, Instant::now()).await {
                     if sender.send(event).await.is_err() {
                         return;
                     }
@@ -481,8 +500,8 @@ mod tests {
 
     /// A file still being copied keeps growing between checks, and is only
     /// reported once its size and mtime hold still across one.
-    #[test]
-    fn a_growing_file_is_held_until_it_settles() {
+    #[tokio::test]
+    async fn a_growing_file_is_held_until_it_settles() {
         let directory = std::env::temp_dir().join(format!(
             "mkvo-watch-settle-{}-{}",
             std::process::id(),
@@ -508,14 +527,18 @@ mod tests {
             Instant::now(),
         );
 
-        let first = take_settled(&mut pending, Duration::ZERO, Instant::now());
+        let first = take_settled(&mut pending, Duration::ZERO, Instant::now()).await;
         assert_eq!(first.len(), 1, "a removal needs no settling");
         assert_eq!(first[0].kind, WatchEventKind::Removed);
 
         std::fs::write(&copying, b"part and more").expect("second chunk");
-        assert!(take_settled(&mut pending, Duration::ZERO, Instant::now()).is_empty());
+        assert!(
+            take_settled(&mut pending, Duration::ZERO, Instant::now())
+                .await
+                .is_empty()
+        );
 
-        let settled = take_settled(&mut pending, Duration::ZERO, Instant::now());
+        let settled = take_settled(&mut pending, Duration::ZERO, Instant::now()).await;
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(
             settled,
