@@ -301,8 +301,8 @@ mod tests {
     #[test]
     fn applied_rename_rows_present_the_target_as_the_current_file() {
         let created_at = Utc::now();
-        let source = PathBuf::from(r"C:\media\old-name.mkv");
-        let target = PathBuf::from(r"C:\media\new-name.mkv");
+        let source = PathBuf::from("media").join("old-name.mkv");
+        let target = PathBuf::from("media").join("new-name.mkv");
         let payload = RenamePlanPayload {
             template: "{title}".to_owned(),
             provider: None,
@@ -335,7 +335,7 @@ mod tests {
         let row = &response.items[0];
 
         assert_eq!(row.current_file_name, "new-name.mkv");
-        assert!(row.source_path.ends_with(r"media\new-name.mkv"));
+        assert_eq!(row.source_path, crate::runtime::display_path(&target));
         assert!(!row.selected);
         assert_eq!(row.status, "Renamed");
     }
