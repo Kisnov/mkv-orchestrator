@@ -177,6 +177,13 @@ pub trait JobRepository: Send + Sync {
     /// Jobs that have not reached a terminal status.
     async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError>;
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError>;
+    /// Delete the history that finished before `cutoff`: terminal jobs with
+    /// their events and journals, finished journals of operations that had no
+    /// job, and operation logs. Returns the rows deleted. A store that keeps
+    /// no history has nothing to delete.
+    async fn prune_history(&self, _cutoff: DateTime<Utc>) -> Result<u64, PortError> {
+        Ok(0)
+    }
 }
 
 #[async_trait]

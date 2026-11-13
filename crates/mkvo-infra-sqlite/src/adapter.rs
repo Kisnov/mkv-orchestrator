@@ -278,6 +278,11 @@ impl JobRepository for SqliteRepositories {
         })
         .await
     }
+
+    async fn prune_history(&self, cutoff: DateTime<Utc>) -> Result<u64, PortError> {
+        self.blocking(move |store| store.prune_history(cutoff.timestamp_millis()))
+            .await
+    }
 }
 
 async fn save_job(
@@ -744,6 +749,227 @@ mod tests {
         assert_eq!(recent[0].summary, "Skipped a.mkv: unreadable");
         assert_eq!(recent[0].error.as_deref(), Some("mkvmerge exited with 2"));
         assert!(serde_json::to_string(&recent).expect("json").len() < 1_000);
+    }
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    /// Stores `snapshot` as if it had last changed `age_days` ago.
+    fn store_job_aged(repositories: &SqliteRepositories, snapshot: &JobSnapshot, age_days: i64) {
+        repositories
+            .store()
+            .upsert_job(&StoredJob {
+                id: snapshot.id.to_string(),
+                kind: serde_json::to_string(&snapshot.kind).expect("kind"),
+                state: serde_json::to_string(&snapshot.status).expect("state"),
+                request: serde_json::Value::Null,
+                result: Some(serde_json::to_value(snapshot).expect("snapshot")),
+                idempotency_key: Some(snapshot.idempotency_key.to_string()),
+                error: None,
+                created_at_ms: 0,
+                updated_at_ms: Utc::now().timestamp_millis() - age_days * DAY_MS,
+            })
+            .expect("store job");
+    }
+
+    fn journal(
+        key: &IdempotencyKey,
+        status: mkvo_application::JournalStatus,
+        age_days: i64,
+    ) -> JournalRecord {
+        JournalRecord {
+            idempotency_key: key.clone(),
+            plan_id: PlanId::new(),
+            step: 0,
+            status,
+            resources: Vec::new(),
+            items: Vec::new(),
+            detail: None,
+            updated_utc: Utc::now() - chrono::TimeDelta::days(age_days),
+        }
+    }
+
+    fn log(message: &str, age_days: i64) -> OperationLogEntry {
+        OperationLogEntry {
+            timestamp_utc: Utc::now() - chrono::TimeDelta::days(age_days),
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            area: "Scan".to_owned(),
+            level: LogLevel::Information,
+            message: message.to_owned(),
+            detail: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_removes_only_history_that_finished_before_the_cutoff() {
+        use mkvo_application::JournalStatus;
+        use mkvo_contracts::{JobEvent, JobStatus};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+
+        let old_done = job(JobStatus::Completed);
+        let old_failed = job(JobStatus::Failed);
+        let old_running = job(JobStatus::Running);
+        let recent_done = job(JobStatus::Completed);
+        for (snapshot, age_days) in [
+            (&old_done, 100),
+            (&old_failed, 100),
+            (&old_running, 100),
+            (&recent_done, 1),
+        ] {
+            store_job_aged(&repositories, snapshot, age_days);
+            JobRepository::append_event(
+                &repositories,
+                &JobEventEnvelope {
+                    job_id: snapshot.id,
+                    correlation_id: snapshot.correlation_id,
+                    sequence: 0,
+                    emitted_utc: Utc::now(),
+                    event: JobEvent::Canceled {
+                        message: String::new(),
+                    },
+                },
+            )
+            .await
+            .expect("event");
+        }
+
+        let renamed = IdempotencyKey::parse("rename-finished").unwrap();
+        let rename_crashed = IdempotencyKey::parse("rename-crashed").unwrap();
+        let kept_journals = [
+            // Recovery pairs an unfinished job with its journal, however old.
+            journal(&old_running.idempotency_key, JournalStatus::Completed, 100),
+            journal(&recent_done.idempotency_key, JournalStatus::Completed, 100),
+            // A rename that stopped midway still needs a person to look at it.
+            journal(&rename_crashed, JournalStatus::Running, 100),
+        ];
+        let pruned_journals = [
+            journal(&old_done.idempotency_key, JournalStatus::Completed, 100),
+            // Its job is forgotten, so it must not resurface as an orphan.
+            journal(&old_failed.idempotency_key, JournalStatus::Running, 100),
+            journal(&renamed, JournalStatus::Completed, 100),
+        ];
+        for record in kept_journals.iter().chain(&pruned_journals) {
+            OperationJournal::begin(&repositories, record)
+                .await
+                .expect("journal");
+        }
+        for entry in [log("old", 100), log("recent", 1)] {
+            OperationLog::append(&repositories, &entry)
+                .await
+                .expect("log");
+        }
+
+        let cutoff = Utc::now() - chrono::TimeDelta::days(90);
+        let removed = JobRepository::prune_history(&repositories, cutoff)
+            .await
+            .expect("prune");
+        assert_eq!(removed, 6);
+
+        for (snapshot, kept) in [
+            (&old_done, false),
+            (&old_failed, false),
+            (&old_running, true),
+            (&recent_done, true),
+        ] {
+            let stored = JobRepository::get(&repositories, snapshot.id)
+                .await
+                .expect("get");
+            assert_eq!(stored.is_some(), kept, "{:?} job", snapshot.status);
+            let events = repositories
+                .store()
+                .count_job_events(&snapshot.id.to_string())
+                .expect("events");
+            assert_eq!(events, u64::from(kept), "{:?} job events", snapshot.status);
+        }
+        for (records, kept) in [(&kept_journals, true), (&pruned_journals, false)] {
+            for record in records {
+                let stored = OperationJournal::get(&repositories, &record.idempotency_key)
+                    .await
+                    .expect("journal");
+                assert_eq!(stored.is_some(), kept, "journal {}", record.idempotency_key);
+            }
+        }
+        let logs = OperationLog::query(
+            &repositories,
+            &LogQuery {
+                area: None,
+                minimum_level: None,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "recent");
+    }
+
+    /// Older builds kept every scanned file, twice, in the job. Those rows
+    /// are still read by the recent-jobs list until they age out.
+    #[tokio::test]
+    async fn pruning_strips_the_file_lists_older_builds_left_in_scan_results() {
+        use mkvo_contracts::JobStatus;
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let mut legacy = job(JobStatus::Completed);
+        legacy.result = Some(serde_json::json!({
+            "files": ["a".repeat(100_000)],
+            "rows": ["b".repeat(100_000)],
+            "skipped": ["broken.mkv: unreadable"],
+            "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
+        }));
+        JobRepository::insert(&repositories, &legacy)
+            .await
+            .expect("insert");
+
+        let cutoff = Utc::now() - chrono::TimeDelta::days(90);
+        JobRepository::prune_history(&repositories, cutoff)
+            .await
+            .expect("prune");
+
+        let stored = JobRepository::get(&repositories, legacy.id)
+            .await
+            .expect("get")
+            .expect("job is recent, so it stays");
+        assert_eq!(
+            stored.result,
+            Some(serde_json::json!({
+                "skipped": ["broken.mkv: unreadable"],
+                "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_plans_are_removed() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        for (id, expires_at_ms) in [("expired", Some(10)), ("current", Some(i64::MAX))] {
+            repositories
+                .store()
+                .put_plan(&StoredPlan {
+                    id: id.to_owned(),
+                    kind: "rename".to_owned(),
+                    version: 1,
+                    fingerprint: "abc".to_owned(),
+                    payload: serde_json::json!({}),
+                    created_at_ms: 1,
+                    expires_at_ms,
+                })
+                .expect("plan");
+        }
+        let removed = PlanRepository::remove_expired(&repositories, Utc::now())
+            .await
+            .expect("remove");
+        assert_eq!(removed, 1);
+        assert!(
+            repositories
+                .store()
+                .get_plan("current", 20)
+                .expect("plan")
+                .is_some()
+        );
     }
 
     #[tokio::test]

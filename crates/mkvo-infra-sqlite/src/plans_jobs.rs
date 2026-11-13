@@ -100,6 +100,44 @@ impl SqliteStore {
         u64::try_from(count).map_err(|_| StoreError::NumericOverflow)
     }
 
+    /// Delete the history that finished before `cutoff_ms` and return the
+    /// rows deleted.
+    ///
+    /// A job takes its events and journal with it. Jobs and journals that
+    /// never finished stay whatever their age: startup recovery reads them.
+    pub fn prune_history(&self, cutoff_ms: i64) -> StoreResult<u64> {
+        const FINISHED_JOBS: &str =
+            "state IN ('\"Completed\"', '\"Failed\"', '\"Skipped\"', '\"Canceled\"')
+             AND updated_at_ms < ?1";
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        // Scan results written before the file list moved out of the job.
+        transaction.execute(
+            "UPDATE jobs SET result_json = json_remove(result_json, '$.result.files', '$.result.rows')
+             WHERE kind = '\"scan\"' AND json_type(result_json, '$.result.files') IS NOT NULL",
+            [],
+        )?;
+        let mut removed = 0;
+        for sql in [
+            format!(
+                "DELETE FROM mutation_journal WHERE idempotency_key IN
+                 (SELECT idempotency_key FROM jobs WHERE {FINISHED_JOBS})"
+            ),
+            format!("DELETE FROM jobs WHERE {FINISHED_JOBS}"),
+            // A rename has no job, only a journal.
+            "DELETE FROM mutation_journal
+             WHERE updated_at_ms < ?1 AND status NOT IN ('\"prepared\"', '\"running\"')
+             AND idempotency_key NOT IN
+             (SELECT idempotency_key FROM jobs WHERE idempotency_key IS NOT NULL)"
+                .to_owned(),
+            "DELETE FROM operation_logs WHERE timestamp_ms < ?1".to_owned(),
+        ] {
+            removed += transaction.execute(&sql, [cutoff_ms])?;
+        }
+        transaction.commit()?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
     pub fn find_job_by_idempotency_key(&self, key: &str) -> StoreResult<Option<StoredJob>> {
         self.query_job("idempotency_key", key)
     }

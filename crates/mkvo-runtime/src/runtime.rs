@@ -48,6 +48,7 @@ mod media_servers;
 mod metadata_facade;
 mod migration_facade;
 mod recovery;
+mod retention;
 mod runtime_support;
 mod scan_facade;
 mod scan_state;
