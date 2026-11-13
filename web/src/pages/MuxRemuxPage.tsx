@@ -171,6 +171,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       onApply={() => { if (canRun) void confirmed.apply(buildRequest()); }}
       selectedText={`${selectedMkvPaths.length + (convertMp4 ? selectedMp4Paths.length : 0)} files selected`}
       hiddenSelected={[...selectedMkvPaths, ...(convertMp4 ? selectedMp4Paths : [])].filter(selection.isHidden).length}
+      risks={[!convertMp4 && !extractSubtitles && !preserveOriginal && "Replaces originals", convertMp4 && deleteMp4AfterConvert && "Deletes MP4", muxExternal && !preserveSidecars && "Deletes subtitle files", extractSubtitles && extractOverwrite && "Overwrites extracted subtitles"].filter((risk) => risk !== false)}
       options={<>
           {workflow !== "subtitles" ? <div className="flex items-center justify-between">
             {workflow === "remove" ? <h2 className="text-base font-semibold">Track Options</h2> : <span />}

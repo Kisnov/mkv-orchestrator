@@ -16,12 +16,12 @@ function job(patch: Partial<OperationJobResponse>): OperationJobResponse {
 
 const idle: OperationRun = { status: "Pick files.", job: undefined, isApplying: false, isBusy: false, isCanceling: false, cancel: () => undefined };
 
-function shell(run: OperationRun, props: Partial<{ canRun: boolean; onPreview: () => void; onApply: () => void; hiddenSelected: number }> = {}) {
+function shell(run: OperationRun, props: Partial<{ canRun: boolean; onPreview: () => void; onApply: () => void; hiddenSelected: number; risks: string[] }> = {}) {
   return render(
     <OperationShell
       title="Reorder Tracks" description="Reorder tracks." options={<h2>Reorder Options</h2>} run={run}
       canRun={props.canRun ?? true} onPreview={props.onPreview ?? (() => undefined)} onApply={props.onApply ?? (() => undefined)}
-      selectedText="2 files selected" hiddenSelected={props.hiddenSelected} notice={<span>The template is not in the batch.</span>}
+      selectedText="2 files selected" hiddenSelected={props.hiddenSelected} risks={props.risks} notice={<span>The template is not in the batch.</span>}
       files={<h2>File Info</h2>} details={<h2>Template Track Order</h2>}
       summary={{ title: "Reorder Tracks Preview Summary", emptyText: "Build a preview.", available: false, status: "", summary: "", metrics: [], sections: [] }}
     />
@@ -142,6 +142,7 @@ it("hides the options panel at any width and keeps the actions within reach", as
   const { unmount } = shell(idle, { onApply });
 
   await user.click(screen.getByRole("button", { name: "Hide options" }));
+  expect(screen.getByRole("button", { name: "Show options" })).toHaveFocus();
   expect(screen.queryByRole("heading", { name: "Reorder Options" })).not.toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "File Info" })).toBeInTheDocument();
   expect(screen.getByText("2 files selected")).toBeInTheDocument();
@@ -157,4 +158,17 @@ it("hides the options panel at any width and keeps the actions within reach", as
   await user.click(show);
   expect(screen.getByRole("heading", { name: "Reorder Options" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Hide options" })).toHaveFocus();
+});
+
+it("groups the actions and, with the options hidden, still says when originals are at risk", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  shell(idle, { risks: ["Replaces originals"] });
+  const actions = screen.getByRole("group", { name: "Operation actions" });
+  expect(within(actions).getByRole("button", { name: "Hide options" })).toBeInTheDocument();
+  expect(screen.queryByText("Replaces originals")).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Hide options" }));
+  expect(within(screen.getByRole("group", { name: "Operation actions" })).getByText("Replaces originals")).toBeInTheDocument();
+  localStorage.clear();
 });

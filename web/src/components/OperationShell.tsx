@@ -22,7 +22,7 @@ const panel = "flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-
  * the file list above the details on the right, and the preview summary and
  * job log dialogs.
  */
-export function OperationShell({ title, description, options, run, canRun, onPreview, onApply, selectedText, hiddenSelected = 0, notice, files, details, initialSplit = 56, summary, children }: {
+export function OperationShell({ title, description, options, run, canRun, onPreview, onApply, selectedText, hiddenSelected = 0, notice, risks = [], files, details, initialSplit = 56, summary, children }: {
   title: string;
   description: string;
   /** The sidebar's operation options. */
@@ -37,6 +37,8 @@ export function OperationShell({ title, description, options, run, canRun, onPre
   hiddenSelected?: number;
   /** Says why the operation cannot run, under the selected count. */
   notice?: ReactNode;
+  /** Options that replace or delete originals, named in the toolbar while the options are hidden. */
+  risks?: string[];
   files: ReactNode;
   details: ReactNode;
   /** Percent of the right column the file list starts with. */
@@ -66,20 +68,21 @@ export function OperationShell({ title, description, options, run, canRun, onPre
   }
 
   const toggle = (
-    <button ref={toggleRef} type="button" onClick={toggleOptions} aria-expanded={!optionsHidden} aria-controls={optionsHidden ? undefined : optionsId} aria-label={optionsHidden ? "Show options" : "Hide options"} title={optionsHidden ? "Show options" : "Hide options"} className={["options-panel-toggle inline-flex h-9 shrink-0 self-start items-center justify-center gap-2 rounded-md border border-border bg-button text-muted transition hover:bg-button-hover hover:text-text", optionsHidden ? "px-3 text-xs font-semibold" : "w-9"].join(" ")}>
+    <button ref={toggleRef} type="button" onClick={toggleOptions} aria-expanded={!optionsHidden} aria-controls={optionsHidden ? undefined : optionsId} aria-label={optionsHidden ? "Show options" : "Hide options"} title={optionsHidden ? "Show options" : "Hide options"} className={["options-panel-toggle inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-md border border-border bg-button text-muted transition hover:bg-button-hover hover:text-text", optionsHidden ? "px-3 text-xs font-semibold" : "w-9"].join(" ")}>
       {optionsHidden ? <><PanelLeftOpen size={16} /><span>Options</span></> : <PanelLeftClose size={16} />}
     </button>
   );
   const actions = (
-    <div className={optionsHidden ? "flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-card p-3 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]" : "mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3"} aria-label="Operation actions">
-      {optionsHidden ? toggle : null}
+    <div className={optionsHidden ? "flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-card p-3 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]" : "mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3"} role="group" aria-label="Operation actions">
+      {toggle}
       <button type="button" onClick={() => { setSummaryOpen(true); onPreview(); }} disabled={run.isBusy || !canRun} className={`h-9 min-w-0 whitespace-nowrap rounded-md border border-border bg-button text-xs font-semibold disabled:text-disabled ${optionsHidden ? "px-4" : "flex-1 px-1.5"}`}>Preview Summary</button>
       {run.isApplying
         ? <button type="button" data-dialog-return onClick={run.cancel} disabled={run.isCanceling} className={`h-9 min-w-0 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning ${optionsHidden ? "" : "flex-1"}`}>Cancel</button>
         : <button type="button" data-dialog-return onClick={onApply} disabled={run.isBusy || !canRun} className={`h-9 min-w-0 whitespace-nowrap rounded-md bg-accent text-xs font-semibold disabled:bg-button disabled:text-disabled ${optionsHidden ? "px-4" : "flex-1 px-1.5"}`}>Apply Changes</button>}
       <span className={`text-xs text-muted ${optionsHidden ? "" : "w-full"}`}>{selectedText}{hiddenSelected > 0 ? ` (${hiddenSelected} hidden)` : ""}</span>
+      {optionsHidden ? risks.map((risk) => <span key={risk} className="rounded-full border border-warning px-2 py-0.5 text-[0.6875rem] font-semibold text-warning">{risk}</span>) : null}
       {notice}
-      <span role="status" className={`min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere] ${optionsHidden ? "flex-1" : "w-full"}`}>{run.status}</span>
+      <span role="status" className={`min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere] ${optionsHidden ? "" : "w-full"}`}>{run.status}</span>
       {finishedJob ? (
         <button type="button" onClick={() => setLogOpen(true)} className={["text-xs font-semibold hover:underline", finishedJob.failed > 0 || finishedJob.status === "Failed" ? "text-warning" : "text-muted"].join(" ")}>
           {finishedJob.failed > 0 ? `Show the ${finishedJob.failed} failed file(s) and job log` : "Show job log"}
@@ -106,10 +109,7 @@ export function OperationShell({ title, description, options, run, canRun, onPre
       ) : (
         <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(14rem,18.75rem)_minmax(0,1fr)] gap-3">
           <section id={optionsId} className="operation-sidebar flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
-            <div className="flex min-h-0 flex-1 gap-2">
-              <MobileOptions>{options}</MobileOptions>
-              {toggle}
-            </div>
+            <MobileOptions>{options}</MobileOptions>
             {actions}
           </section>
           {panels}

@@ -96,6 +96,7 @@ export function ReorderTracksPage() {
       onApply={() => { if (canRun) void confirmed.apply(request()); }}
       selectedText={`${selectedMkvPaths.length} files selected`}
       hiddenSelected={selectedMkvPaths.filter(selection.isHidden).length}
+      risks={["Replaces originals"]}
       notice={template && !canRun ? <span className="w-full text-xs text-warning">The template file is not in the batch. Check it in the list to continue.</span> : null}
       options={<div className="space-y-3">
         <h2 className="text-base font-semibold">Reorder Options</h2>
