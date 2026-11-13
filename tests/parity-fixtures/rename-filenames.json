@@ -100,12 +100,6 @@
         "isMovie": false
       },
       "expected": "Show - Bad-Name- -Pilot--.mkv"
-    },
-    {
-      "id": "planner-invalid-characters-become-spaces",
-      "operation": "RenamePlanner.SanitizeFileName",
-      "input": "Show: Bad*Name? <Pilot>|",
-      "expected": "Show Bad Name Pilot"
     }
   ],
   "matchingCases": [

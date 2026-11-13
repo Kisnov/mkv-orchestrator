@@ -484,31 +484,6 @@ pub fn sanitize_file_name(value: &str) -> String {
     clean
 }
 
-/// Apply the legacy planner sanitizer used for metadata-provided file names.
-///
-/// The filename builder intentionally substitutes portable-invalid characters
-/// with hyphens, while the planner historically used spaces before collapsing
-/// whitespace. Both behaviors are user-visible and are therefore kept as
-/// separate operations.
-#[must_use]
-pub fn sanitize_planner_file_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() || "\\/:*?\"<>|".contains(character) {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_end_matches(['.', ' '])
-        .to_owned()
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AbsoluteEpisodeMatch {
@@ -957,27 +932,19 @@ mod tests {
         let planning_cases = fixture["planningCases"].as_array().expect("planning cases");
         assert_eq!(
             builder_cases.len() + matching_cases.len() + planning_cases.len(),
-            10,
+            9,
             "fixture case count changed"
         );
 
         for case in builder_cases {
             let id = case["id"].as_str().expect("case id");
             let expected = case["expected"].as_str().expect("string result");
-            if case["operation"] == "RenamePlanner.SanitizeFileName" {
-                assert_eq!(
-                    sanitize_planner_file_name(case["input"].as_str().expect("input")),
-                    expected,
-                    "fixture case `{id}`"
-                );
-            } else {
-                let file = fixture_media(&case["input"]);
-                assert_eq!(
-                    build_file_name(&file, case["input"]["template"].as_str().expect("template")),
-                    expected,
-                    "fixture case `{id}`"
-                );
-            }
+            let file = fixture_media(&case["input"]);
+            assert_eq!(
+                build_file_name(&file, case["input"]["template"].as_str().expect("template")),
+                expected,
+                "fixture case `{id}`"
+            );
         }
 
         for case in matching_cases {
