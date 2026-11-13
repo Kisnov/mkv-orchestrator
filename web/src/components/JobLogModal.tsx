@@ -1,7 +1,11 @@
+import { useState } from "react";
 import { Copy } from "lucide-react";
 
 import type { OperationJobResponse } from "../api";
+import { copyText } from "../lib/copyText";
 import { Dialog } from "./Dialog";
+
+const shownLines = 500;
 
 /**
  * The failed files a batch error names (the backend's batch_failure: "internal error: N of M files
@@ -17,6 +21,13 @@ function failedFiles(job: OperationJobResponse): { files: string[]; more: string
 export function JobLogModal({ title, job, onClose }: { title: string; job: OperationJobResponse; onClose: () => void }) {
   const { files: failed, more } = failedFiles(job);
   const counts = `${job.completed} done, ${job.failed} failed, ${job.skipped} skipped of ${job.total}`;
+  const [copied, setCopied] = useState<boolean | null>(null);
+
+  async function copy() {
+    setCopied(await copyText([`${job.status}: ${counts}`, ...failed, ...(more ? [more] : []), ...job.lines].join("\n")));
+    setTimeout(() => setCopied(null), 2000);
+  }
+
   return (
     <Dialog title={title} onClose={onClose} className="w-[min(60rem,calc(100vw-3rem))]">
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
@@ -25,8 +36,8 @@ export function JobLogModal({ title, job, onClose }: { title: string; job: Opera
             <div className={["text-sm font-semibold", job.status === "Completed" ? "text-success" : "text-warning"].join(" ")}>{job.status}</div>
             <div className="mt-1 text-xs text-muted">{counts}</div>
           </div>
-          <button type="button" onClick={() => void navigator.clipboard.writeText([`${job.status}: ${counts}`, ...failed, ...job.lines].join("\n"))} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-md border border-border bg-button px-3 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">
-            <Copy size={15} /> Copy log
+          <button type="button" onClick={() => void copy()} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-md border border-border bg-button px-3 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">
+            <Copy size={15} /> {copied === null ? "Copy log" : copied ? "Copied" : "Copy failed"}
           </button>
         </div>
         {failed.length ? (
@@ -40,8 +51,9 @@ export function JobLogModal({ title, job, onClose }: { title: string; job: Opera
         ) : null}
         <section className="mt-5">
           <h3 className="mb-2 text-sm font-semibold text-text">Job log <span className="text-muted">({job.lines.length})</span></h3>
+          {job.lines.length > shownLines ? <p className="mb-2 text-xs text-muted">Showing the last {shownLines} of {job.lines.length} lines. Copy log copies all of them.</p> : null}
           {job.lines.length
-            ? <pre className="whitespace-pre-wrap rounded-md [overflow-wrap:anywhere] border border-border bg-input px-4 py-3 text-xs leading-5 text-muted">{job.lines.join("\n")}</pre>
+            ? <pre className="whitespace-pre-wrap rounded-md [overflow-wrap:anywhere] border border-border bg-input px-4 py-3 text-xs leading-5 text-muted">{job.lines.slice(-shownLines).join("\n")}</pre>
             : <div className="rounded-md border border-border bg-input px-4 py-3 text-sm text-subtle">The job wrote no log lines.</div>}
         </section>
       </div>

@@ -1,5 +1,6 @@
 import { Copy } from "lucide-react";
 
+import { copyText } from "../lib/copyText";
 import { Dialog } from "./Dialog";
 
 export type PreviewSummaryMetric = {
@@ -38,7 +39,7 @@ export function PreviewSummaryModal({ title, emptyText, available, status, summa
         `[${section.title.toUpperCase()}] ${row.title}\n${row.detail}${row.meta ? `\n${row.meta}` : ""}`
       ))
     ];
-    await navigator.clipboard.writeText(details.join("\n\n"));
+    await copyText(details.join("\n\n"));
   };
 
   return (

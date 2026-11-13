@@ -118,3 +118,19 @@ it("says how many of the selected files the table's filter hides", () => {
   shell(idle, { hiddenSelected: 1 });
   expect(screen.getByText("2 files selected (1 hidden)")).toBeInTheDocument();
 });
+
+it("shows the end of a long log and copies all of it, saying it did", async () => {
+  const user = userEvent.setup();
+  const lines = Array.from({ length: 600 }, (_, index) => `line ${index + 1}`);
+  const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  shell({ ...idle, job: job({ lines }) });
+
+  await user.click(screen.getByRole("button", { name: "Show job log" }));
+  const dialog = screen.getByRole("dialog");
+  expect(within(dialog).getByText("Showing the last 500 of 600 lines. Copy log copies all of them.")).toBeInTheDocument();
+  expect(dialog.querySelector("pre")!.textContent!.split("\n")).toEqual(lines.slice(100));
+  await user.click(within(dialog).getByRole("button", { name: "Copy log" }));
+  expect(writeText.mock.calls[0][0]).toContain("line 1\nline 2");
+  expect(await within(dialog).findByRole("button", { name: "Copied" })).toBeInTheDocument();
+});
