@@ -111,9 +111,18 @@ impl ServerConfig {
             && !bind.ip().is_loopback()
             && !parse_bool("MKVO_ALLOW_NO_LOGIN", get("MKVO_ALLOW_NO_LOGIN"))?.unwrap_or(false)
         {
+            let text = config_dir.join("admin-password.txt");
+            let hash = config_dir.join("admin-password.hash");
+            let password = if !text.exists() && hash.exists() {
+                format!(
+                    "the password you signed in with before (only its hash is left, in {}; delete it to generate a new one)",
+                    hash.display()
+                )
+            } else {
+                format!("the password stored in {}", text.display())
+            };
             bail!(
-                "Login is turned off (MKVO_AUTH_ENABLED=false or MKVO_AUTH_MODE=disabled) but MKVO_BIND={bind} accepts network connections, so anyone on the network could rename, remux and delete your media. Remove that setting to sign in as '{auth_username}' with the password stored in {}/admin-password.txt (or set MKVO_PASSWORD), or set MKVO_ALLOW_NO_LOGIN=true to keep running without login on a trusted network",
-                config_dir.display()
+                "Login is turned off (MKVO_AUTH_ENABLED=false or MKVO_AUTH_MODE=disabled) but MKVO_BIND={bind} accepts network connections, so anyone on the network could rename, remux and delete your media. Remove that setting to sign in as '{auth_username}' with {password} or with MKVO_PASSWORD, or set MKVO_ALLOW_NO_LOGIN=true to keep running without login on a trusted network"
             );
         }
         let allowed_hosts = list(get("MKVO_ALLOWED_HOSTS"))
@@ -350,6 +359,29 @@ mod tests {
             ("MKVO_AUTH_ENABLED", "false"),
         ]);
         assert!(ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).is_ok());
+    }
+
+    #[test]
+    fn refusal_names_the_file_that_holds_the_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_dir = directory.path().to_string_lossy().into_owned();
+        let values = BTreeMap::from([
+            ("MKVO_BIND", "0.0.0.0:8080"),
+            ("MKVO_AUTH_ENABLED", "false"),
+            ("MKVO_CONFIG_DIR", config_dir.as_str()),
+        ]);
+        let refusal = || {
+            ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+                .err()
+                .unwrap()
+                .to_string()
+        };
+        assert!(refusal().contains("admin-password.txt"));
+        // After the first sign-in only the hash is left.
+        std::fs::write(directory.path().join("admin-password.hash"), "$argon2id$").unwrap();
+        let message = refusal();
+        assert!(message.contains("admin-password.hash"), "{message}");
+        assert!(!message.contains("admin-password.txt"), "{message}");
     }
 
     #[test]
