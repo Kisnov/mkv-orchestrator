@@ -82,14 +82,9 @@ impl MkvoRuntime {
 
     async fn scan_locations(&self) -> (Option<PathBuf>, Vec<LibraryRoot>) {
         self.settings_service()
-            .load()
+            .load_settings()
             .await
-            .map(|loaded| {
-                (
-                    loaded.settings.scan.default_root,
-                    loaded.settings.scan.library_roots,
-                )
-            })
+            .map(|settings| (settings.scan.default_root, settings.scan.library_roots))
             .unwrap_or_default()
     }
 
@@ -214,9 +209,8 @@ impl MkvoRuntime {
         if request.max_workers.is_none() {
             request.max_workers = Some(
                 self.settings_service()
-                    .load()
+                    .load_settings()
                     .await?
-                    .settings
                     .workers
                     .max_scan_workers,
             );

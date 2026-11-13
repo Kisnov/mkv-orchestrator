@@ -63,9 +63,8 @@ impl MkvoRuntime {
         &self,
         request: LibraryCatalogRequest,
     ) -> RuntimeResult<LibraryCatalogResponse> {
-        let loaded = self.settings_service().load().await?;
-        let server = loaded
-            .settings
+        let settings = self.settings_service().load_settings().await?;
+        let server = settings
             .media_servers
             .iter()
             .find(|server| {
@@ -93,7 +92,7 @@ impl MkvoRuntime {
         }
         let connection = self.media_server_connection(server).await?;
         let asked = self.known_credential_rejection(server, &connection).await?;
-        let client = self.media_server_client(server.kind, &loaded.settings);
+        let client = self.media_server_client(server.kind, &settings);
         let items = client
             .discover_items(
                 &connection,
@@ -130,9 +129,8 @@ impl MkvoRuntime {
         {
             return Err(RuntimeError::invalid("invalid media-server item id"));
         }
-        let loaded = self.settings_service().load().await?;
-        let server = loaded
-            .settings
+        let settings = self.settings_service().load_settings().await?;
+        let server = settings
             .media_servers
             .iter()
             .find(|server| {
@@ -147,7 +145,7 @@ impl MkvoRuntime {
         let connection = self.media_server_connection(server).await?;
         let asked = self.known_credential_rejection(server, &connection).await?;
         let artwork = self
-            .media_server_client(server.kind, &loaded.settings)
+            .media_server_client(server.kind, &settings)
             .fetch_artwork(&connection, &request.item_id, CancellationToken::new())
             .await;
         let artwork = self
@@ -345,10 +343,9 @@ impl MkvoRuntime {
         &self,
         request: MediaServerConnectionRequest,
     ) -> RuntimeResult<MediaServerTestResponse> {
-        let loaded = self.settings_service().load().await?;
+        let settings = self.settings_service().load_settings().await?;
         let stored = request.id.as_deref().and_then(|id| {
-            loaded
-                .settings
+            settings
                 .media_servers
                 .iter()
                 .find(|server| server.id.to_string().eq_ignore_ascii_case(id))
@@ -385,7 +382,7 @@ impl MkvoRuntime {
             (None, Some(stored)) => self.media_server_connection(stored).await?.credential,
             (None, None) => String::new(),
         };
-        let client = self.media_server_client(kind, &loaded.settings);
+        let client = self.media_server_client(kind, &settings);
         let connection = MediaServerConnection {
             kind,
             base_url: url,

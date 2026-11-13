@@ -10,14 +10,14 @@ impl MkvoRuntime {
         requested: Option<&str>,
         requested_language: Option<&str>,
     ) -> RuntimeResult<Arc<dyn MetadataProviderClient>> {
-        let loaded = self.settings_service().load().await?;
+        let settings = self.settings_service().load_settings().await?;
         let provider = requested
             .map(parse_provider)
             .transpose()?
-            .unwrap_or(loaded.settings.rename.provider);
+            .unwrap_or(settings.rename.provider);
         let language = requested_language
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&loaded.settings.rename.language)
+            .unwrap_or(&settings.rename.language)
             .to_owned();
         match provider {
             MetadataProvider::Tvdb => {

@@ -39,9 +39,8 @@ impl MkvoRuntime {
             .transpose()?
             .unwrap_or(
                 self.settings_service()
-                    .load()
+                    .load_settings()
                     .await?
-                    .settings
                     .rename
                     .provider,
             );
