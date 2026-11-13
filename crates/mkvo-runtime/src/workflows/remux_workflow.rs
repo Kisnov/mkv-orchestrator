@@ -617,12 +617,24 @@ impl MkvoRuntime {
                 0,
             )
             .await?;
+        let outputs = self.remux_outputs(item).await;
         let produced = self.produce_remux_output(item, attributes, context).await;
         // Temporaries never outlive the item; one that cannot be removed is only a warning.
-        for warning in self.remove_remux_temporaries(item, attributes).await {
+        let (kept, warnings) = self
+            .remove_remux_temporaries(item, attributes, outputs)
+            .await;
+        for warning in warnings {
             let _ = context.log(JobLogLevel::Warning, warning).await;
         }
-        produced?;
+        match produced {
+            Err(error) if !kept.is_empty() => {
+                return Err(ApplicationError::Internal(format!(
+                    "{error}; the file being replaced is gone, so the new file was kept at {}",
+                    kept.join(", ")
+                )));
+            }
+            produced => produced?,
+        }
         if item.delete_external_subtitles_after_success {
             for subtitle in &item.external_subtitles {
                 self.dependencies()
@@ -700,38 +712,61 @@ impl MkvoRuntime {
         }
     }
 
-    /// Removes whatever the item left behind and returns what could not be removed.
+    /// Each temporary the tool writes, with the existing file it is about to replace.
+    async fn remux_outputs(
+        &self,
+        item: &mkvo_domain::RemuxPlanItem,
+    ) -> Vec<(PathBuf, Option<PathBuf>)> {
+        if item.mode != RemuxMode::ExtractSubtitles {
+            let replaced =
+                same_path(&item.source, &item.final_output).then(|| item.final_output.clone());
+            return vec![(item.temporary_output.clone(), replaced)];
+        }
+        let file_system = &self.dependencies().file_system;
+        let mut outputs = Vec::new();
+        for track in &item.extract_tracks {
+            let exists = file_system.exists(&track.output).await.unwrap_or(false);
+            outputs.push((
+                extraction_temp_path(&track.output, track.track_id),
+                exists.then(|| track.output.clone()),
+            ));
+        }
+        outputs
+    }
+
+    /// Removes what the item left behind; returns the outputs kept and what could not be removed.
     async fn remove_remux_temporaries(
         &self,
         item: &mkvo_domain::RemuxPlanItem,
         attributes: &BTreeMap<String, String>,
-    ) -> Vec<String> {
-        let mut temporaries: Vec<PathBuf> = item
+        outputs: Vec<(PathBuf, Option<PathBuf>)>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut temporaries: Vec<(PathBuf, Option<PathBuf>)> = item
             .subtitle_transforms
             .iter()
-            .map(|transform| transform.temporary_path.clone())
+            .map(|transform| (transform.temporary_path.clone(), None))
             .collect();
-        temporaries.extend(imported_font_path(item, attributes));
-        if item.mode == RemuxMode::ExtractSubtitles {
-            temporaries.extend(
-                item.extract_tracks
-                    .iter()
-                    .map(|track| extraction_temp_path(&track.output, track.track_id)),
-            );
-        } else {
-            temporaries.push(item.temporary_output.clone());
-        }
+        temporaries.extend(imported_font_path(item, attributes).map(|font| (font, None)));
+        temporaries.extend(outputs);
         let file_system = &self.dependencies().file_system;
+        let mut kept = Vec::new();
         let mut failures = Vec::new();
-        for temporary in temporaries {
+        for (temporary, replaced) in temporaries {
             if !file_system.exists(&temporary).await.unwrap_or(false) {
                 continue;
+            }
+            // A failed replace may already have taken the old file: then this is the only copy.
+            if let Some(replaced) = replaced {
+                if !file_system.exists(&replaced).await.unwrap_or(false) {
+                    kept.push(temporary.display().to_string());
+                    continue;
+                }
             }
             if let Err(error) = file_system.remove_file(&temporary).await {
                 failures.push(format!("temporary file was left behind: {error}"));
             }
         }
-        failures
+        (kept, failures)
     }
 
     async fn prepare_subtitle_transforms(
@@ -2048,8 +2083,8 @@ pub(super) mod execution_tests {
 
     use async_trait::async_trait;
     use mkvo_application::{
-        MediaCatalog, MediaEnumerationRequest, MediaProbe, PortError, ToolExecutionResult,
-        ToolExecutor, ToolRegistry,
+        FileSystem, MediaCatalog, MediaEnumerationRequest, MediaProbe, PortError,
+        ToolExecutionResult, ToolExecutor, ToolRegistry,
     };
     use mkvo_contracts::{JobSnapshot, JobStatus, ToolStatus};
     use mkvo_infra_sqlite::{SqliteRepositories, SqliteStore};
@@ -2146,6 +2181,14 @@ pub(super) mod execution_tests {
     }
 
     pub fn library(tools: impl ToolExecutor + 'static) -> Library {
+        library_with(tools, |_| {})
+    }
+
+    /// Like `library`, after `adjust` swapped in whatever the test needs to misbehave.
+    pub fn library_with(
+        tools: impl ToolExecutor + 'static,
+        adjust: impl FnOnce(&mut RuntimeDependencies),
+    ) -> Library {
         let directory = tempfile::tempdir().expect("tempdir");
         let roots =
             AuthorizedRoots::new([AuthorizedRoot::new(directory.path(), true).expect("root")])
@@ -2153,7 +2196,7 @@ pub(super) mod execution_tests {
         let repositories = Arc::new(SqliteRepositories::from_store(
             SqliteStore::open_in_memory().expect("SQLite"),
         ));
-        let dependencies = RuntimeDependencies {
+        let mut dependencies = RuntimeDependencies {
             catalog: Arc::new(NoScan),
             probe: Arc::new(NoScan),
             cache: repositories.clone(),
@@ -2172,6 +2215,7 @@ pub(super) mod execution_tests {
             process_tools: None,
             authorized_roots: Some(roots),
         };
+        adjust(&mut dependencies);
         let config = RuntimeConfig::new(directory.path(), directory.path());
         Library {
             runtime: MkvoRuntime::from_parts(config, dependencies),
@@ -2473,12 +2517,9 @@ pub(super) mod execution_tests {
         assert_eq!(library.file_names(), ["Episode 01.mkv"]);
     }
 
-    #[tokio::test]
-    async fn extraction_replaces_an_existing_subtitle_without_a_backup() {
-        let library = library(ScriptedTools(writes_output));
-        let episode = library.media("Episode 01.mkv").await;
-        let subtitle = episode.path.with_file_name("Episode 01.eng.srt");
-        std::fs::write(&subtitle, "older").expect("subtitle");
+    /// Extraction of one track over the subtitle that is already there.
+    fn overwriting_extraction_plan(episode: MediaFile, subtitle: &Path) -> RemuxPlan {
+        std::fs::write(subtitle, "older").expect("subtitle");
         let mut plan = RemuxPlanner
             .build_plan(RemuxPlanRequest {
                 mode: RemuxMode::ExtractSubtitles,
@@ -2487,7 +2528,7 @@ pub(super) mod execution_tests {
                     vec![TrackExtraction {
                         track_id: 2,
                         kind: TrackKind::Subtitle,
-                        output: subtitle.clone(),
+                        output: subtitle.to_path_buf(),
                     }],
                 )]),
                 ..remux_request(vec![episode])
@@ -2497,8 +2538,98 @@ pub(super) mod execution_tests {
             "extractOverwriteExistingFiles".to_owned(),
             "true".to_owned(),
         );
+        plan
+    }
 
-        let job = library.run_remux(plan).await;
+    /// A share where replacing a file removes the old one and then fails.
+    struct LosesReplacedFile(Arc<dyn FileSystem>);
+
+    #[async_trait]
+    impl FileSystem for LosesReplacedFile {
+        async fn exists(&self, path: &Path) -> Result<bool, PortError> {
+            self.0.exists(path).await
+        }
+
+        async fn is_directory(&self, path: &Path) -> Result<bool, PortError> {
+            self.0.is_directory(path).await
+        }
+
+        async fn fingerprint(&self, path: &Path) -> Result<FileFingerprint, PortError> {
+            self.0.fingerprint(path).await
+        }
+
+        async fn move_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            self.0.move_file(source, target).await
+        }
+
+        async fn remove_file(&self, path: &Path) -> Result<(), PortError> {
+            self.0.remove_file(path).await
+        }
+
+        async fn probe_access(
+            &self,
+            path: &Path,
+            access: RequiredAccess,
+        ) -> Result<FileAccessState, PortError> {
+            self.0.probe_access(path, access).await
+        }
+
+        async fn replace_file(&self, _source: &Path, target: &Path) -> Result<(), PortError> {
+            self.0.remove_file(target).await?;
+            Err(PortError::Other("the share went away".to_owned()))
+        }
+    }
+
+    fn losing_replaced_files(dependencies: &mut RuntimeDependencies) {
+        dependencies.file_system = Arc::new(LosesReplacedFile(dependencies.file_system.clone()));
+    }
+
+    #[tokio::test]
+    async fn a_replace_that_loses_the_original_keeps_the_new_file() {
+        let library = library_with(ScriptedTools(writes_output), losing_replaced_files);
+        let episode = library.media("Episode 01.mkv").await;
+        let kept = episode
+            .path
+            .with_file_name(".Episode 01.mkv.mkvo-remux.tmp");
+
+        let job = library.run_remux(remux_plan(vec![episode])).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(std::fs::read_to_string(&kept).expect("kept"), "new");
+        let error = job.error.expect("error");
+        assert!(error.contains("the share went away"), "{error}");
+        assert!(
+            error.contains("was kept at") && error.contains(".Episode 01.mkv.mkvo-remux.tmp"),
+            "{error}"
+        );
+        assert!(job.lines.iter().any(|line| line.contains("was kept at")));
+    }
+
+    #[tokio::test]
+    async fn an_extraction_that_loses_the_old_subtitle_keeps_the_new_one() {
+        let library = library_with(ScriptedTools(writes_output), losing_replaced_files);
+        let episode = library.media("Episode 01.mkv").await;
+        let subtitle = episode.path.with_file_name("Episode 01.eng.srt");
+        let kept = subtitle.with_file_name(".Episode 01.eng.srt.mkvo-extract-2.tmp");
+
+        let job = library
+            .run_remux(overwriting_extraction_plan(episode, &subtitle))
+            .await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(std::fs::read_to_string(&kept).expect("kept"), "new");
+        assert!(job.error.expect("error").contains("was kept at"));
+    }
+
+    #[tokio::test]
+    async fn extraction_replaces_an_existing_subtitle_without_a_backup() {
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        let subtitle = episode.path.with_file_name("Episode 01.eng.srt");
+
+        let job = library
+            .run_remux(overwriting_extraction_plan(episode, &subtitle))
+            .await;
 
         assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
         assert_eq!(std::fs::read_to_string(&subtitle).expect("subtitle"), "new");
