@@ -99,6 +99,14 @@ type EditableMediaServer = WebMediaServer & {
   apiKey?: string;
 };
 
+// A stable React key per row, so removing or moving one never hands its inputs to another.
+type EditableRoot = SourceRoot & { key: string };
+
+let nextRootKey = 0;
+function editableRoot(root: SourceRoot): EditableRoot {
+  return { ...root, key: `root-${nextRootKey++}` };
+}
+
 const themeColorOptions = [
   { name: "Accent", label: "Accent", cssVariable: "--color-accent" },
   { name: "AccentHover", label: "Accent hover", cssVariable: "--color-accent-hover" },
@@ -167,7 +175,7 @@ export function SettingsPage() {
   const [muxSubtitleDefaults, setMuxSubtitleDefaults] = useState("eng");
   const [mkvToolNixDirectory, setMkvToolNixDirectory] = useState("");
   const [ffmpegDirectory, setFfmpegDirectory] = useState("");
-  const [libraryRoots, setLibraryRoots] = useState<SourceRoot[]>([]);
+  const [libraryRoots, setLibraryRoots] = useState<EditableRoot[]>([]);
   const [defaultDirectory, setDefaultDirectory] = useState("");
   const [defaultDirectoryName, setDefaultDirectoryName] = useState("Home");
   // Which row the browser is filling in, so one dialog serves every row.
@@ -233,7 +241,7 @@ export function SettingsPage() {
       : loadedRoots[0]?.name || webSettings.data.defaultRootName;
     setDefaultDirectory(loadedHome);
     setDefaultDirectoryName(loadedHomeName || "Home");
-    setLibraryRoots(loadedRoots.filter((root) => !sameFolderPath(root.path, loadedHome)));
+    setLibraryRoots(loadedRoots.filter((root) => !sameFolderPath(root.path, loadedHome)).map(editableRoot));
     setWatchFoldersText((webSettings.data.watchFolders ?? []).join("\n"));
     setLiveWatcherEnabled(Boolean(webSettings.data.enableLiveWatchFolderMonitoring));
     setMediaServers((webSettings.data.mediaServers ?? []).map((server) => ({ ...server, apiKey: "" })));
@@ -555,7 +563,7 @@ export function SettingsPage() {
                     ) : null}
 
                     {libraryRoots.map((root, index) => (
-                      <div key={index} className="grid items-center gap-2 sm:grid-cols-[7rem_minmax(10rem,1fr)_auto_auto_auto_auto]">
+                      <div key={root.key} className="grid items-center gap-2 sm:grid-cols-[7rem_minmax(10rem,1fr)_auto_auto_auto_auto]">
                         <input
                           value={root.name}
                           onChange={(event) =>
@@ -633,7 +641,7 @@ export function SettingsPage() {
 
                     <button
                       type="button"
-                      onClick={() => setLibraryRoots((current) => [...current, { name: "", path: "" }])}
+                      onClick={() => setLibraryRoots((current) => [...current, editableRoot({ name: "", path: "" })])}
                       className="mt-2 h-9 self-start rounded-md border border-border bg-button px-3 text-xs font-semibold text-muted transition hover:bg-button-hover hover:text-text"
                     >
                       Add folder
@@ -1314,7 +1322,7 @@ export function SettingsPage() {
             setLibraryRoots((current) =>
               current.some((root) => sameFolderPath(root.path, path))
                 ? current
-                : [...current, { name: name || folderName(path), path }]
+                : [...current, editableRoot({ name: name || folderName(path), path })]
             );
           }}
           onSelect={(path, kind) => {

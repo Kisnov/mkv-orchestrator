@@ -370,6 +370,30 @@ describe("Settings library folders", () => {
     ]);
   });
 
+  /// With index keys, removing the first row handed its inputs to the second
+  /// row, so focus and a half-typed value jumped to the wrong folder.
+  it("keeps each Quick Access row's own inputs when another is removed", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({
+        defaultRoot: "/media",
+        libraryRoots: [
+          { name: "Anime", path: "/media/anime" },
+          { name: "TV", path: "/media/tv" }
+        ]
+      })),
+      saveWebSettings: vi.fn().mockResolvedValue(settings())
+    });
+
+    await user.click(await screen.findByRole("button", { name: /^general$/i }));
+    const tvName = await screen.findByDisplayValue("TV");
+    await user.click(screen.getByRole("button", { name: /remove quick access folder 1/i }));
+
+    expect(tvName).toBeInTheDocument();
+    expect(tvName).toHaveValue("TV");
+  });
+
   it("reorders Quick Access folders and automatically saves their order", async () => {
     const user = userEvent.setup();
     const saveWebSettings = vi.fn().mockResolvedValue(settings());
