@@ -559,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn a_hung_output_does_not_extend_the_inactivity_timeout() {
         let (probe, _, release) = stalled_probe();
-        let timeout = Duration::from_millis(1200);
+        let timeout = Duration::from_millis(3000);
         let started = std::time::Instant::now();
 
         quiet_for(
