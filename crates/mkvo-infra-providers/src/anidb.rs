@@ -38,8 +38,8 @@ const DOWNLOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// AniDB bans clients that send more than one request every two seconds.
 const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESULTS: usize = 50;
-/// The dump is a few megabytes; far more than that is not the dump.
-const MAX_TITLES_BYTES: usize = 64 * 1024 * 1024;
+/// The decompressed dump was about 7 MiB in 2025; this leaves it room to triple.
+const MAX_TITLES_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct AnimeTitle {
