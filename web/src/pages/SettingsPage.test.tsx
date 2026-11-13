@@ -870,6 +870,24 @@ describe("Settings media server saves", () => {
     expect(screen.getByLabelText("API key / token")).toHaveAttribute("placeholder", "API key or token");
   });
 
+  /// The warning must agree with the backend, which drops the key: paths are
+  /// case-sensitive, a default port is no change.
+  it("compares URLs the way the backend does", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ serverUrl: "http://jellyfin.local/Jellyfin" })] }))
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const url = screen.getByLabelText("Server URL");
+
+    fireEvent.change(url, { target: { value: "HTTP://Jellyfin.local:80/Jellyfin/" } });
+    expect(screen.queryByText(/a new url needs the api key again/i)).not.toBeInTheDocument();
+    fireEvent.change(url, { target: { value: "http://jellyfin.local/jellyfin" } });
+    expect(screen.getByText(/a new url needs the api key again/i)).toBeInTheDocument();
+  });
+
   /// Without `crypto.randomUUID` (plain HTTP on a LAN address) the new server
   /// got an id the backend replaced, so Sync could not find it after saving.
   it("syncs a server added where crypto.randomUUID is missing", async () => {

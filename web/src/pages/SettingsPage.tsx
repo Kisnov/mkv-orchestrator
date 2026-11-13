@@ -1604,8 +1604,18 @@ function normalizeRenameTemplates(value: string, selectedTemplate: string) {
 /** Whether the server's URL differs from the saved one; the backend then drops its key. */
 function urlChanged(server: EditableMediaServer, saved: WebMediaServer[] | undefined) {
   const savedUrl = saved?.find((item) => item.id === server.id)?.serverUrl;
-  const normalize = (url: string) => url.trim().replace(/\/+$/, "").toLowerCase();
-  return savedUrl !== undefined && normalize(savedUrl) !== normalize(server.serverUrl);
+  return savedUrl !== undefined && !sameServerUrl(savedUrl, server.serverUrl);
+}
+
+/** The backend's `media_server_urls_equivalent`: scheme, host, effective port, path without trailing slashes. */
+function sameServerUrl(left: string, right: string) {
+  try {
+    const [a, b] = [new URL(left.trim()), new URL(right.trim())];
+    return a.protocol === b.protocol && a.hostname === b.hostname && a.port === b.port
+      && a.pathname.replace(/\/+$/, "") === b.pathname.replace(/\/+$/, "");
+  } catch {
+    return false;
+  }
 }
 
 // Always a UUID: the backend replaces any other id, and Sync could then not find the server.
