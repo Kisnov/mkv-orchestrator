@@ -470,7 +470,8 @@ fn is_year_or_resolution(number: u32) -> bool {
 /// `S01E02`, and with it `S01E01E02`, `S01E01-E03` and `S01E01-02`.
 fn season_episode_marker(bytes: &[u8]) -> Option<ParsedEpisode> {
     (0..bytes.len()).find_map(|index| {
-        if bytes[index] != b's' || !starts_word(bytes, index) {
+        // Also inside a word: `ShowS01E01` is a name people do write.
+        if bytes[index] != b's' {
             return None;
         }
         let (season, cursor) = number_at(bytes, index + 1, 4)?;
@@ -714,6 +715,10 @@ mod tests {
             ("Show - S01E05 - Name.mkv", parsed(Some(1), 5, 5)),
             ("Show S01E01v2.mkv", parsed(Some(1), 1, 1)),
             ("Show S00E03.mkv", parsed(Some(0), 3, 3)),
+            ("ShowS01E01.mkv", parsed(Some(1), 1, 1)),
+            // A marked number may be any episode; only a bare one is read as a year.
+            ("Show S01E1999.mkv", parsed(Some(1), 1999, 1999)),
+            ("Show E2000.mkv", parsed(None, 2000, 2000)),
             // A double episode used to lose its second half.
             ("Show S01E01E02.mkv", parsed(Some(1), 1, 2)),
             ("Show S01E01-E03.mkv", parsed(Some(1), 1, 3)),
