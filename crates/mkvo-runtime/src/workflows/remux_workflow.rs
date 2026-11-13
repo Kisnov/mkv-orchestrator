@@ -2445,6 +2445,7 @@ pub(super) mod execution_tests {
         let preview = |subtitle: &str| {
             serde_json::from_value::<MuxPreviewRequest>(serde_json::json!({
                 "files": [mkvo_contracts::MediaFileRow::from(&episode)],
+                "selectedPaths": [episode.path.to_string_lossy()],
                 "removeUnwantedAudioLanguages": false,
                 "keepAudioLanguages": "",
                 "removeUnwantedSubtitleLanguages": false,
