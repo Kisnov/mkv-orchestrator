@@ -1034,4 +1034,52 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
     }
+
+    #[tokio::test]
+    async fn job_events_start_with_the_job_state_and_end_with_the_job() {
+        let host = TestHost::new(None);
+        let job = host
+            .runtime
+            .start_scan(mkvo_contracts::ScanRequest {
+                source_path: Some(host.config.media_root.display().to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = job.id.to_string();
+        // Followed both while it runs and once it has ended.
+        for _ in 0..2 {
+            let response = host
+                .router()
+                .oneshot(request("GET", &format!("/api/scans/{id}/events"), &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                response.into_body().collect(),
+            )
+            .await
+            .expect("the stream ends with the job")
+            .unwrap()
+            .to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let first = body.split("\n\n").next().unwrap();
+            assert!(
+                first.lines().any(|line| line == "event: snapshot"),
+                "{body}"
+            );
+            assert!(first.contains(&format!(r#""id":"{id}""#)), "{body}");
+            while !host
+                .runtime
+                .get_scan_job(&id)
+                .await
+                .unwrap()
+                .status
+                .is_terminal()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
 }

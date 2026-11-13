@@ -7,10 +7,10 @@ use axum::{
     response::{IntoResponse, Sse, sse::Event},
     routing::{any, get, post, put},
 };
-use futures::stream;
+use futures::{StreamExt, stream};
 use mkvo_contracts::{
-    FileSelectionRequest, LibraryArtworkRequest, LibraryCatalogRequest, LibraryLocalArtworkRequest,
-    ScanRequest, WebSettingsRequest,
+    FileSelectionRequest, JobEvent, LibraryArtworkRequest, LibraryCatalogRequest,
+    LibraryLocalArtworkRequest, ScanRequest, WebSettingsRequest,
 };
 use mkvo_runtime::{
     RuntimeError,
@@ -317,10 +317,28 @@ async fn job_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpError> {
+    // Subscribed before the state is read, so no change falls between the two.
     let receiver = state.runtime.subscribe_job_events(&id).await?;
-    let events = stream::unfold(receiver, |mut receiver| async move {
+    let (snapshot, ended) = match state.runtime.get_scan_job(&id).await {
+        Ok(job) => (Event::default().json_data(&job), job.status.is_terminal()),
+        Err(_) => {
+            let job = state.runtime.get_operation_job(&id).await?;
+            (Event::default().json_data(&job), job.status.is_terminal())
+        }
+    };
+    let snapshot = snapshot
+        .map_err(|error| RuntimeError::internal(error.to_string()))?
+        .event("snapshot");
+    let live = stream::unfold((!ended).then_some(receiver), |receiver| async move {
+        let mut receiver = receiver?;
         match receiver.recv().await {
             Ok(envelope) => {
+                let ended = matches!(
+                    envelope.event,
+                    JobEvent::Completed { .. }
+                        | JobEvent::Failed { .. }
+                        | JobEvent::Canceled { .. }
+                );
                 let sequence = envelope.sequence.to_string();
                 let event = Event::default()
                     .event("job")
@@ -331,15 +349,16 @@ async fn job_events(
                             .event("serialization-error")
                             .data(error.to_string())
                     });
-                Some((Ok::<Event, Infallible>(event), receiver))
+                Some((Ok::<Event, Infallible>(event), (!ended).then_some(receiver)))
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => Some((
                 Ok(Event::default().event("lagged").data(skipped.to_string())),
-                receiver,
+                Some(receiver),
             )),
             Err(broadcast::error::RecvError::Closed) => None,
         }
     });
+    let events = stream::once(async { Ok(snapshot) }).chain(live);
     Ok(Sse::new(events).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(Duration::from_secs(15))
