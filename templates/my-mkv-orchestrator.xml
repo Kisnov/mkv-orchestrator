@@ -15,7 +15,7 @@
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/templates/my-mkv-orchestrator.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/web/src/assets/mkvo-icon-purple.png</Icon>
-  <ExtraParams>--cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --security-opt=no-new-privileges:true</ExtraParams>
+  <ExtraParams>--cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --cap-add=DAC_READ_SEARCH --security-opt=no-new-privileges:true</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DonateText/>
@@ -36,6 +36,7 @@
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID that owns files created by MKVO. Unraid default: 100 (users)." Type="Variable" Display="always" Required="false" Mask="false">100</Config>
   <Config Name="UMASK" Target="UMASK" Default="022" Mode="" Description="File creation mask for new files." Type="Variable" Display="advanced" Required="false" Mask="false">022</Config>
   <Config Name="Secure Cookies" Target="MKVO_SECURE_COOKIES" Default="false|true" Mode="" Description="Enable only when accessing MKVO over HTTPS. Leave false for plain HTTP LAN access." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Log Level" Target="RUST_LOG" Default="info" Mode="" Description="Log detail. info shows startup messages, including where to find the administrator password; error shows only failures." Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
   <Config Name="Scan Workers" Target="MKVO_SCAN_WORKERS" Default="6" Mode="" Description="Maximum concurrent file metadata scans." Type="Variable" Display="advanced" Required="false" Mask="false">6</Config>
   <Config Name="Edit Workers" Target="MKVO_EDIT_WORKERS" Default="2" Mode="" Description="Maximum concurrent mkvpropedit track property edits." Type="Variable" Display="advanced" Required="false" Mask="false">2</Config>
   <Config Name="TVDB API Key" Target="MKVO_TVDB_API_KEY" Default="" Mode="" Description="Optional container-managed TVDB API key. It appears as configured in MKVO Settings after the container restarts, but its value remains masked." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>

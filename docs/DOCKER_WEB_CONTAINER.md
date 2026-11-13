@@ -65,6 +65,7 @@ MKVO_SOURCE_ROOTS=downloads=/downloads
 | `MKVO_USERNAME` / `MKVO_PASSWORD` | admin / generated | Use a password of at least 12 characters. Blank generates one in `/config/admin-password.txt`, replaced by `admin-password.hash` after the first sign-in. Never publish either file. |
 | `MKVO_ALLOWED_HOSTS` | unset | Extra host names (comma separated) accepted without login and as request origins; IP addresses and `localhost` always work. Needed for a host name with login off, or behind a proxy that rewrites `Host`. |
 | `MKVO_TOOL_DIRECTORIES` | unset | Directories the Settings page may choose for MKVToolNix/FFmpeg. The image finds its bundled tools on its own, so leave the Settings fields blank; any other directory is refused. |
+| `RUST_LOG` | `info` in compose and Unraid, errors only otherwise | Log level. At `info` the startup log names the file that holds the generated password. |
 | `MKVO_SECURE_COOKIES` | false | Enable for HTTPS; leave false for plain HTTP. A proxy sending `X-Forwarded-Proto: https` gets a Secure cookie anyway. |
 | `MKVO_AUTH_MODE`, `MKVO_AUTH_USERNAME`, `MKVO_AUTH_PASSWORD` | legacy | Existing settings are honored unless their new equivalents are explicitly set; blank values count as unset. |
 | `MKVO_TVDB_API_KEY`, `MKVO_TVDB_PIN`, `MKVO_TMDB_API_KEY` | unset | Optional provider credentials; Settings-page values take effect otherwise. |
@@ -85,8 +86,10 @@ a value entered through the web UI.
   HTTPS plus network restrictions before exposing MKVO beyond a trusted network.
   See [authentication notes](AUTHENTICATION.md).
 - The compose file and Unraid template drop every Linux capability except
-  `CHOWN`, `SETUID` and `SETGID` (the entrypoint fixes `/config` ownership and
-  switches to `PUID`/`PGID`) and set `no-new-privileges`. With `PUID=0` the app
+  `CHOWN`, `SETUID`, `SETGID` and `DAC_READ_SEARCH` (the entrypoint fixes `/config`
+  ownership and switches to `PUID`/`PGID`; the last one lets it, and `docker exec`,
+  read inside folders the app user keeps private) and set `no-new-privileges`.
+  The app itself runs as `PUID` with no capabilities at all. With `PUID=0` the app
   runs as root without `DAC_OVERRIDE`/`FOWNER`, so it cannot write files owned
   by other users; add those two capabilities or use a real PUID/PGID.
 - Media-server URLs must be HTTP(S) and cannot use link-local addresses
