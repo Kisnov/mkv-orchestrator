@@ -8,7 +8,7 @@ export function OriginalsConfirm({ risk, onConfirm, onClose }: { risk: Originals
   const groups = [
     { title: "Replaced", files: risk.replaced, text: "Each file is rebuilt in a temporary copy, which replaces the original once it checks out. The previous version is not kept." },
     { title: "MP4 deleted after conversion", files: risk.deletedMp4, text: "Each MP4 is deleted once its MKV is created." },
-    { title: "External subtitles deleted after muxing into", files: risk.deletedSubtitlesOf, text: "The matching subtitle files next to these MKVs are deleted once they are muxed in." },
+    { title: "Subtitle files deleted after muxing", files: risk.deletedSubtitles, text: "The subtitle files muxed into these MKVs are deleted once the mux succeeds." },
     { title: "Extracted with overwrite", files: risk.overwrittenExtracts, text: "Subtitle files already extracted under these names are overwritten." }
   ].filter((group) => group.files.length);
   const only = groups.length === 1 ? groups[0].files : null;
