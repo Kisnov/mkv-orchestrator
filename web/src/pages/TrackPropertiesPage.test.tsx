@@ -1,8 +1,9 @@
 import { useMediaLibrary, MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, PropEditPreviewRequest, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
-import { screen, waitFor, within } from "@testing-library/react";
+import type { MediaFileRow, OperationJobResponse, PropEditPreviewRequest, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TrackPropertiesPage } from "./TrackPropertiesPage";
 
@@ -36,6 +37,13 @@ function template(path: string): PropEditTemplateResponse {
     forcedAudio: "Keep existing",
     defaultSubtitle: "Keep existing",
     forcedSubtitle: "Keep existing"
+  };
+}
+
+function editJob(status: OperationJobResponse["status"]): OperationJobResponse {
+  return {
+    id: "job-1", kind: "PropertyEdit", status, createdUtc: "2026-08-25T20:00:00Z", startedUtc: "2026-08-25T20:00:01Z", completedUtc: null,
+    completed: 1, failed: 0, skipped: 0, total: 1, currentFile: "", currentFilePercent: 100, lines: [], muxResult: null, propEditResult: null, error: ""
   };
 }
 
@@ -220,6 +228,60 @@ describe("Track Properties template synchronization", () => {
     await waitFor(() => expect(startPropEditApply).toHaveBeenCalledTimes(3));
     expect(buildPropEditPreview).toHaveBeenCalledTimes(4);
     expect(startPropEditApply.mock.calls[2][0]).toMatchObject({ planId: "plan-4", selectedDefaultVideo: "Default" });
+  });
+
+  it("reads the template again once a running job finishes", async () => {
+    const scannedFile = file("Episode 01.mkv");
+    window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "job-1", label: "Edit Tracks" }));
+    const loadPropEditTemplate = vi.fn(() => Promise.resolve(template(scannedFile.path)));
+    let status: OperationJobResponse["status"] = "Running";
+
+    renderWithBackend(
+      <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
+      {
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-25T20:00:00Z", files: [scannedFile], selectedPaths: [scannedFile.path], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
+        getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
+        loadPropEditTemplate,
+        getOperationJob: () => Promise.resolve(editJob(status))
+      }
+    );
+
+    await screen.findByText("Applying 1/1");
+    await waitFor(() => expect(loadPropEditTemplate).toHaveBeenCalledTimes(1));
+    status = "Completed";
+    await waitFor(() => expect(loadPropEditTemplate).toHaveBeenCalledTimes(2), { timeout: 3000 });
+  });
+
+  it("does not read the template again when returning after a finished job", async () => {
+    const user = userEvent.setup();
+    const scannedFile = file("Episode 01.mkv");
+    window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "job-1", label: "Edit Tracks" }));
+    const loadPropEditTemplate = vi.fn(() => Promise.resolve(template(scannedFile.path)));
+    function Visit() {
+      const [shown, setShown] = useState(true);
+      return <><button type="button" onClick={() => setShown((value) => !value)}>Toggle page</button>{shown ? <TrackPropertiesPage /> : null}</>;
+    }
+
+    renderWithBackend(
+      <MediaLibraryProvider><Visit /></MediaLibraryProvider>,
+      {
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-25T20:00:00Z", files: [scannedFile], selectedPaths: [scannedFile.path], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
+        getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
+        loadPropEditTemplate,
+        getOperationJob: () => Promise.resolve(editJob("Completed"))
+      }
+    );
+
+    const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 100)));
+    await screen.findByText(`Template loaded: ${scannedFile.fileName}`);
+    await settle();
+    const reads = loadPropEditTemplate.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "Toggle page" }));
+    await user.click(screen.getByRole("button", { name: "Toggle page" }));
+    await screen.findByText(`Template loaded: ${scannedFile.fileName}`);
+    await settle();
+    expect(loadPropEditTemplate).toHaveBeenCalledTimes(reads);
   });
 
   it("reloads its track template when Dashboard changes the shared template file", async () => {

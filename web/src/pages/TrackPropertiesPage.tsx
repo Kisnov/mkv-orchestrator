@@ -20,7 +20,7 @@ import { PreviewSummaryModal } from "../components/PreviewSummaryModal";
 import { describeTrackTargets } from "../lib/templateMatch";
 import { useFileSelection } from "../state/useFileSelection";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
-import { useInvalidatePropEditTemplate, usePropEditTemplate } from "../state/propEditTemplate";
+import { usePropEditTemplate } from "../state/propEditTemplate";
 import { useOperationJob } from "../state/OperationJobContext";
 
 type TitleMode = "keep" | "remove" | "file" | "episode_title" | "custom";
@@ -118,7 +118,6 @@ export function TrackPropertiesPage() {
   // Cached and warmed while the library loads, so arriving here usually finds
   // the tracks already read rather than starting the read.
   const templateLoad = usePropEditTemplate(templatePath, files);
-  const invalidateTemplate = useInvalidatePropEditTemplate();
 
   // Seeds the editable copies from whatever the cache holds. The query returns
   // the same object until the template genuinely changes, so this does not
@@ -238,10 +237,6 @@ export function TrackPropertiesPage() {
       setStatusText(`Applying ${runningJob.completed + runningJob.failed + runningJob.skipped}/${runningJob.total}${progress}`);
       return;
     }
-
-    // The edits have landed on disk, so the cached track layout now describes
-    // how the files used to look. Dropping it re-reads them.
-    void invalidateTemplate();
 
     if (runningJob.propEditResult) {
       setPreviewResult(runningJob.propEditResult);
