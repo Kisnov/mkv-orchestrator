@@ -335,9 +335,12 @@ fn sidecars_by_video(
             let owner = videos
                 .iter()
                 .filter_map(|(stem, video)| {
-                    Some((stem.len(), video, sidecar_suffix(stem, sidecar)?))
+                    let suffix = sidecar_suffix(stem, sidecar)?;
+                    // Between `Ep.mkv` and `ep.mkv` it is the one spelled like the sidecar.
+                    let same_case = sidecar.file_name()?.to_string_lossy().starts_with(stem);
+                    Some(((stem.len(), same_case), video, suffix))
                 })
-                .max_by_key(|(length, ..)| *length);
+                .max_by_key(|(rank, ..)| *rank);
             if let Some((_, video, suffix)) = owner {
                 owned
                     .entry(portable_path_key(video))
@@ -1445,6 +1448,36 @@ mod preflight_tests {
                 source: PathBuf::from("/media/ep.nfo"),
                 target: PathBuf::from("/media").join("Ep.nfo"),
             }]
+        );
+    }
+
+    /// Only where case tells files apart can `Ep.mkv` and `ep.mkv` both exist.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn a_sidecar_goes_with_the_video_whose_case_it_shares() {
+        let plan = plan(
+            vec![
+                media("/media/Ep.mkv", "First"),
+                media("/media/ep.mkv", "Second"),
+            ],
+            &["/media/Ep.srt", "/media/ep.srt"],
+        );
+        let moved: Vec<_> = plan
+            .payload
+            .items
+            .iter()
+            .map(|item| item.sidecars.clone())
+            .collect();
+        let sidecar = |source: &str, target: &str| RenameSidecar {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+        };
+        assert_eq!(
+            moved,
+            [
+                [sidecar("/media/Ep.srt", "/media/First.srt")],
+                [sidecar("/media/ep.srt", "/media/Second.srt")],
+            ]
         );
     }
 
