@@ -3,7 +3,7 @@ import { StrictMode, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 
-import { MediaLibraryProvider, MediaLibrarySynchronizer, useMediaLibrary } from "./MediaLibraryContext";
+import { MediaLibraryProvider, MediaLibrarySynchronizer, useMediaLibrary, useMediaLibraryActions } from "./MediaLibraryContext";
 import { createMockBackendClient } from "../backend/mockClient";
 import { setBackendClient } from "../backend/runtime";
 import type { MediaFileRow } from "../api";
@@ -420,4 +420,36 @@ it("keeps manually removed files excluded when newer operation results arrive", 
   act(() => result.current.syncFromBackend({ files: [{ ...first, codec: "HEVC" }, removed], selectedPaths: [first.path, removed.path], summary: emptySummary, updatedUtc: "2026-09-17T02:00:00Z" }));
   expect(result.current.files).toEqual([{ ...first, codec: "HEVC" }]);
   expect(result.current.selectedPaths).toEqual([first.path]);
+});
+
+describe("consumers that only act", () => {
+  it("do not re-render when the files or the selection change", () => {
+    setBackendClient(createMockBackendClient({ setFileSelection: () => new Promise(() => undefined) }));
+    let actorRenders = 0;
+    const both = renderHook(() => {
+      const actions = useMediaLibraryActions();
+      return { actions, library: useMediaLibrary() };
+    }, {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <MediaLibraryProvider>
+          <Actor />
+          {children}
+        </MediaLibraryProvider>
+      )
+    });
+    function Actor() {
+      useMediaLibraryActions();
+      actorRenders += 1;
+      return null;
+    }
+    const firstActions = both.result.current.actions;
+
+    act(() => both.result.current.library.setFiles([file("/media/a.mkv"), file("/media/b.mkv")]));
+    act(() => both.result.current.library.toggleSelectedPath("/media/a.mkv"));
+    act(() => both.result.current.library.toggleSelectedPath("/media/b.mkv"));
+
+    expect(both.result.current.library.selectedPaths).toEqual(["/media/a.mkv", "/media/b.mkv"]);
+    expect(both.result.current.actions).toBe(firstActions);
+    expect(actorRenders).toBe(1);
+  });
 });

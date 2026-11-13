@@ -22,7 +22,7 @@ import {
   WebSettings
 } from "../api";
 import { SectionHeader } from "../components/SectionHeader";
-import { useMediaLibrary } from "../state/MediaLibraryContext";
+import { useMediaLibraryActions } from "../state/MediaLibraryContext";
 
 type LibraryFilter = "all" | "matching" | "mismatch";
 
@@ -57,7 +57,7 @@ export function resetLibraryViewCacheForTests() {
 export function LibraryPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { setWorkingView } = useMediaLibrary();
+  const { setWorkingView } = useMediaLibraryActions();
   const webSettings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
   const [auditResult, setAuditResult] = useState<LibraryAuditResponse | null>(null);
   const [selectedTitleId, setSelectedTitleId] = useState("");

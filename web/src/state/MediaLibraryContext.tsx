@@ -39,7 +39,12 @@ type MediaLibraryContextValue = {
   updateFilesAfterRename: (renames: Array<{ oldPath: string; newPath: string; newFileName: string; status?: string }>) => void;
 };
 
-const MediaLibraryContext = createContext<MediaLibraryContextValue | null>(null);
+type MediaLibraryData = Pick<MediaLibraryContextValue, "files" | "isWorkingView" | "selectedPaths" | "selectionError" | "templateFilePath">;
+type MediaLibraryActions = Omit<MediaLibraryContextValue, keyof MediaLibraryData>;
+
+// Two contexts, so a page that only acts is not re-rendered by every file or selection change.
+const MediaLibraryDataContext = createContext<MediaLibraryData | null>(null);
+const MediaLibraryActionsContext = createContext<MediaLibraryActions | null>(null);
 const templateStorageKey = "mkvo.web.templateFilePath";
 // Selection outlives the tab: it is a deliberate user action, and losing it
 // after a restart means re-picking files across a large library.
@@ -107,6 +112,11 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
   });
 
   useEffect(() => write(localStorage, selectionStorageKey, selectedPaths), [selectedPaths]);
+  // Lets toggleSelectedPath stay stable while reading the latest selection.
+  const selectedPathsRef = useRef(selectedPaths);
+  useEffect(() => {
+    selectedPathsRef.current = selectedPaths;
+  }, [selectedPaths]);
 
   useEffect(() => {
     try {
@@ -185,8 +195,7 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const value = useMemo<MediaLibraryContextValue>(() => ({
-    files,
+  const actions = useMemo<MediaLibraryActions>(() => ({
     removeFilesFromView: (paths) => {
       for (const path of paths) removedPaths.current.add(pathKey(path));
       write(sessionStorage, "mkvo.web.removedPaths", [...removedPaths.current]);
@@ -237,23 +246,21 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
         return wanted.length < adopted.length ? (await setFileSelection(wanted)).selectedPaths : adopted;
       });
     },
-    isWorkingView,
-    selectedPaths,
-    selectionError,
     setSelectedPaths: (paths) => {
       setSelectedPathsState(paths);
       pushSelection(paths);
     },
     toggleSelectedPath: (path) => {
+      const selectedPaths = selectedPathsRef.current;
       const next = selectedPaths.some((selected) => pathKey(selected) === pathKey(path))
         ? selectedPaths.filter((selected) => pathKey(selected) !== pathKey(path))
         : [...selectedPaths, path];
+      selectedPathsRef.current = next;
       setSelectedPathsState(next);
       pushSelection(next);
     },
     hydrateSelection: (paths) => setSelectedPathsState(paths),
     syncFromBackend,
-    templateFilePath,
     setTemplateFilePath,
     clearLibraryCache,
     updateFilesAfterRename: (renames) => {
@@ -285,26 +292,43 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
         return rename ? rename.newPath : current;
       });
     }
-  }), [files, selectedPaths, selectionError, templateFilePath, isWorkingView, pushSelection, queueSelection, syncFromBackend, clearLibraryCache]);
+  }), [pushSelection, queueSelection, syncFromBackend, clearLibraryCache]);
+  const data = useMemo<MediaLibraryData>(
+    () => ({ files, isWorkingView, selectedPaths, selectionError, templateFilePath }),
+    [files, isWorkingView, selectedPaths, selectionError, templateFilePath]
+  );
 
   return (
-    <MediaLibraryContext.Provider value={value}>
-      {children}
-    </MediaLibraryContext.Provider>
+    <MediaLibraryActionsContext.Provider value={actions}>
+      <MediaLibraryDataContext.Provider value={data}>
+        {children}
+      </MediaLibraryDataContext.Provider>
+    </MediaLibraryActionsContext.Provider>
   );
 }
 
-export function useMediaLibrary() {
-  const context = useContext(MediaLibraryContext);
-  if (!context) {
+export function useMediaLibrary(): MediaLibraryContextValue {
+  const data = useContext(MediaLibraryDataContext);
+  const actions = useMediaLibraryActions();
+  if (!data) {
     throw new Error("useMediaLibrary must be used inside MediaLibraryProvider");
   }
 
-  return context;
+  return useMemo(() => ({ ...data, ...actions }), [data, actions]);
+}
+
+/** The actions alone: they never change, so using them causes no re-render. */
+export function useMediaLibraryActions(): MediaLibraryActions {
+  const actions = useContext(MediaLibraryActionsContext);
+  if (!actions) {
+    throw new Error("useMediaLibrary must be used inside MediaLibraryProvider");
+  }
+
+  return actions;
 }
 
 export function MediaLibrarySynchronizer() {
-  const { syncFromBackend } = useMediaLibrary();
+  const { syncFromBackend } = useMediaLibraryActions();
   const currentScan = useQuery({ queryKey: ["current-scan-files"], queryFn: getCurrentScanFiles });
   useEffect(() => { if (currentScan.data) syncFromBackend(currentScan.data); }, [currentScan.data, syncFromBackend]);
   return null;
