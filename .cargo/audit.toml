@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    # Bundled SQLite < 3.54 WAL bug: fix needs rusqlite 0.41 (rustc 1.89, CI pins 1.88); only our own state DB is opened.
+    "RUSTSEC-2026-0459",
+]
