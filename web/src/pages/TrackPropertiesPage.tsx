@@ -282,8 +282,9 @@ export function TrackPropertiesPage() {
     if (!templateFile) return [];
     const audioLabels = audioTracks.map((track) => track.trackLabel);
     const subtitleLabels = subtitleTracks.map((track) => track.trackLabel);
+    const selected = new Set(selectedMkvPaths);
     return mkvFiles
-      .filter((file) => selection.differingPaths.has(file.path) && selectedMkvPaths.includes(file.path))
+      .filter((file) => selection.differingPaths.has(file.path) && selected.has(file.path))
       .map((file) => ({
         key: file.path,
         title: file.fileName,
