@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_carry_security_headers_and_a_csp_the_spa_can_run_under() {
+    async fn responses_carry_security_headers_and_a_same_origin_csp() {
         let host = TestHost::new(None);
         for path in ["/", "/api/status", "/api/does-not-exist"] {
             let response = host
