@@ -322,6 +322,55 @@ describe("Track Properties template synchronization", () => {
     expect(buildPropEditPreview.mock.calls[0][0]).toMatchObject({ templatePath: first.path, selectedPaths: [first.path, second.path] });
   });
 
+  it("re-reads the template when a finished job changed only track flags", async () => {
+    const user = userEvent.setup();
+    type Track = MediaFileRow["tracks"][number];
+    const audio = (id: number, isDefault: boolean): Track => ({ id, trackNumber: id + 1, type: "audio", codec: "AAC", language: "cat", name: `Audio ${id}`, channels: 2, default: isDefault, forced: false });
+    const scanned = (defaultId: number): MediaFileRow => ({ ...file("Episode 01.mkv"), tracks: [audio(1, defaultId === 1), audio(2, defaultId === 2)] });
+    window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "job-1", label: "Edit Tracks" }));
+    let status: OperationJobResponse["status"] = "Running";
+    let scan = { updatedUtc: "2026-08-25T20:00:00Z", files: [scanned(1)] };
+    // Like the backend, the template is built from the rows the request carries.
+    const loadPropEditTemplate = vi.fn((request: PropEditTemplateRequest) => {
+      const tracks = request.files[0].tracks;
+      return Promise.resolve({
+        ...template(request.files[0].path),
+        audioTracks: tracks.map((track, index) => ({ trackNumber: index + 1, trackLabel: `Audio ${index + 1}`, type: "audio", currentName: track.name, currentLanguage: track.language, currentCodec: track.codec, currentChannels: track.channels, currentDefault: track.default, editedName: track.name, nameFromMetadata: false, editedLanguage: track.language })),
+        defaultAudio: `Audio ${tracks.findIndex((track) => track.default) + 1}`
+      });
+    });
+    const buildPropEditPreview = vi.fn<(request: PropEditPreviewRequest) => Promise<PropEditPreviewResponse>>(() => Promise.resolve({
+      actions: [], skipped: [], noChange: [], summary: "No changes", status: "No changes", planId: null, planFingerprint: null, idempotencyKey: null
+    }));
+
+    renderWithBackend(
+      <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
+      {
+        getCurrentScanFiles: () => Promise.resolve({ ...scan, selectedPaths: [], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
+        getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
+        loadPropEditTemplate,
+        buildPropEditPreview,
+        getOperationJob: () => Promise.resolve(editJob(status))
+      }
+    );
+
+    const defaultAudio = () => screen.getAllByRole("combobox", { name: "Set default track" })[0];
+    await screen.findByText("Applying 1/1");
+    await waitFor(() => expect(defaultAudio()).toHaveValue("Audio 1"));
+
+    // The job moved the default flag to the second track; the rescan reports it.
+    scan = { updatedUtc: "2026-08-25T20:05:00Z", files: [scanned(2)] };
+    status = "Completed";
+    await waitFor(() => expect(defaultAudio()).toHaveValue("Audio 2"), { timeout: 4000 });
+
+    // Applying again must ask for the flags as they are now, not as they were.
+    const previewButton = screen.getByRole("button", { name: "Preview Summary" });
+    await waitFor(() => expect(previewButton).toBeEnabled());
+    await user.click(previewButton);
+    await waitFor(() => expect(buildPropEditPreview).toHaveBeenCalled());
+    expect(buildPropEditPreview.mock.calls[0][0]).toMatchObject({ selectedDefaultAudio: "Audio 2" });
+  });
+
   it("reloads its track template when Dashboard changes the shared template file", async () => {
     const user = userEvent.setup();
     const first = file("Episode 01.mkv");

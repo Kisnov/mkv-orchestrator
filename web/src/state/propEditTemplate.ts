@@ -26,7 +26,7 @@ import { useMediaLibrary } from "./MediaLibraryContext";
  */
 export function propEditTemplateKey(templatePath: string, files: MediaFileRow[]) {
   const signature = files
-    .map((file) => `${file.path}|${file.tracks.map((track) => `${track.type}:${track.id}:${track.language}:${track.name}`).join(",")}`)
+    .map((file) => `${file.path}|${file.tracks.map((track) => `${track.type}:${track.id}:${track.language}:${track.name}:${track.default}:${track.forced}`).join(",")}`)
     .join("\u0000");
   return ["propedit-template", templatePath, signature] as const;
 }
