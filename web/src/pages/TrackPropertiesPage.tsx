@@ -16,7 +16,7 @@ import {
 import { FileSelectionTable } from "../components/FileSelectionTable";
 import { PanelDivider } from "../components/PanelDivider";
 import { SectionHeader } from "../components/SectionHeader";
-import { PreviewSummaryModal } from "../components/PreviewSummaryModal";
+import { PreviewSummaryModal, type PreviewSummaryRow } from "../components/PreviewSummaryModal";
 import { describeTrackTargets } from "../lib/templateMatch";
 import { useFileSelection } from "../state/useFileSelection";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
@@ -90,7 +90,9 @@ export function TrackPropertiesPage() {
   const [statusText, setStatusText] = useState("Load scanned files from Dashboard, then select a template.");
   const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
   const [configurationReady, setConfigurationReady] = useState(false);
-  const [pendingApply, setPendingApply] = useState<{ request: PropEditPreviewRequest; plan: PropEditPreviewResponse } | null>(null);
+  // Holds the request, its plan and the differing files as they were when Apply was pressed.
+  const [pendingApply, setPendingApply] = useState<{ request: PropEditPreviewRequest; plan: PropEditPreviewResponse; rows: PreviewSummaryRow[] } | null>(null);
+
   const [filePanelPercent, setFilePanelPercent] = useState(50);
   const panelRef = useRef<HTMLDivElement>(null);
   const lastPreview = useRef<{ request: string; plan: PropEditPreviewResponse } | null>(null);
@@ -314,7 +316,7 @@ export function TrackPropertiesPage() {
       const previewed = lastPreview.current?.request === JSON.stringify(request) ? lastPreview.current.plan : null;
       const plan = previewed ?? await preview.mutateAsync(request);
       if (!plan.actions.length) { setStatusText("No changes are needed for the selected files."); return; }
-      if (differingRows.length > 0) { setPendingApply({ request, plan }); return; }
+      if (differingRows.length > 0) { setPendingApply({ request, plan, rows: differingRows }); return; }
       await applyPlan(request, plan);
     } catch { /* Mutation handlers display the error. */ }
   }
@@ -531,10 +533,11 @@ export function TrackPropertiesPage() {
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-5">
               <p className="text-sm leading-6 text-muted">
-                {differingRows.length === 1 ? "1 selected file differs" : `${differingRows.length} selected files differ`} from the template. Each edit goes to the track in the same position within its type, so check that these are the tracks you mean to change.
+                {pendingApply.rows.length === 1 ? "1 selected file differs" : `${pendingApply.rows.length} selected files differ`} from the template. Each edit goes to the track in the same position within its type, so check that these are the tracks you mean to change.
               </p>
               <div className="mt-4 overflow-hidden rounded-md border border-warning bg-input">
-                {differingRows.map((row) => (
+                {pendingApply.rows.map((row) => (
+
                   <div key={row.key} className="border-b border-border px-4 py-3 last:border-0">
                     <div className="font-semibold text-text">{row.title}</div>
                     <div className="mt-1 whitespace-pre-wrap text-xs leading-5 text-muted">{row.detail}</div>

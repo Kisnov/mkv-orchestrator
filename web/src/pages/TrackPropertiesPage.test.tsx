@@ -3,6 +3,7 @@ import type { BackendClient } from "../backend/client";
 import { renderWithBackend } from "../test/render";
 import type { MediaFileRow, OperationJobResponse, PropEditPreviewRequest, PropEditPreviewResponse, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
 import { act, screen, waitFor, within } from "@testing-library/react";
+import { useQueryClient } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -46,6 +47,11 @@ function editJob(status: OperationJobResponse["status"]): OperationJobResponse {
     id: "job-1", kind: "PropertyEdit", status, createdUtc: "2026-08-25T20:00:00Z", startedUtc: "2026-08-25T20:00:01Z", completedUtc: null,
     completed: 1, failed: 0, skipped: 0, total: 1, currentFile: "", currentFilePercent: 100, lines: [], muxResult: null, propEditResult: null, error: ""
   };
+}
+
+function Rescan() {
+  const queryClient = useQueryClient();
+  return <button type="button" onClick={() => void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] })}>Rescan</button>;
 }
 
 function SelectSecondTemplate({ path }: { path: string }) {
@@ -385,7 +391,7 @@ describe("Edit Tracks file selection", () => {
     }));
     const apply = vi.fn<(request: PropEditPreviewRequest) => Promise<never>>(() => Promise.reject(new Error("Test stops before tracking a job")));
     renderWithBackend(
-      <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
+      <MediaLibraryProvider><Rescan /><TrackPropertiesPage /></MediaLibraryProvider>,
       {
         getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-11-12T10:00:00Z", files: scanned, selectedPaths: [], summary: { total: 10, mkv: 10, mp4: 0, failed: 0, cached: 0 } }),
         getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
@@ -501,7 +507,32 @@ describe("Edit Tracks file selection", () => {
     expect(plan).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps confirming the files of the pending request when the scan changes underneath", async () => {
+    const user = userEvent.setup();
+    let scan = { updatedUtc: "2026-11-12T10:00:00Z", files: scanned };
+    const { apply } = renderPage({
+      getCurrentScanFiles: () => Promise.resolve({ ...scan, selectedPaths: [], summary: { total: 10, mkv: 10, mp4: 0, failed: 0, cached: 0 } })
+    });
+    const applyButton = await ready();
+
+    await user.click(screen.getByRole("checkbox", { name: "Select Episode 10.mkv" }));
+    await user.click(applyButton);
+    const dialog = await screen.findByRole("dialog");
+
+    // The rescan finds Episode 10 equal to the template, so the page stops counting it as differing.
+    scan = { updatedUtc: "2026-11-12T10:05:00Z", files: scanned.map((item) => item === differing[4] ? { ...item, tracks: equal[0].tracks } : item) };
+    await user.click(screen.getByRole("button", { name: "Rescan" }));
+    await screen.findByText("4 files differ from the template and are not selected.");
+
+    expect(within(dialog).getByText(/1 selected file differs/)).toBeInTheDocument();
+    expect(within(dialog).getByText("Episode 10.mkv")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Apply to 6 file(s)" }));
+    await waitFor(() => expect(apply).toHaveBeenCalledTimes(1));
+    expect(apply.mock.calls[0][0].selectedPaths).toEqual([...equalPaths, differing[4].path]);
+  });
+
   it("disables preview and apply when nothing is selected", async () => {
+
     const user = userEvent.setup();
     const { plan, apply } = renderPage();
     const applyButton = await ready();
