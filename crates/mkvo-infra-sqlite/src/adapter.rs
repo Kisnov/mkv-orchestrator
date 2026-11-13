@@ -532,13 +532,32 @@ impl OperationLog for SqliteRepositories {
         self.blocking(move |store| {
             let connection = store.connection()?;
             let limit = i64::try_from(query.limit).map_err(|_| StoreError::NumericOverflow)?;
+            // The stored spellings of every level at or above the minimum.
+            let levels = query
+                .minimum_level
+                .map(|minimum| {
+                    let levels: Vec<_> = [
+                        LogLevel::Trace,
+                        LogLevel::Debug,
+                        LogLevel::Information,
+                        LogLevel::Warning,
+                        LogLevel::Error,
+                    ]
+                    .into_iter()
+                    .filter(|level| log_rank(*level) >= log_rank(minimum))
+                    .map(|level| serde_json::to_string(&level))
+                    .collect::<Result<_, _>>()?;
+                    serde_json::to_string(&levels)
+                })
+                .transpose()?;
             let mut statement = connection.prepare(
                 "SELECT timestamp_ms, correlation_id, area, level, message, detail
                  FROM operation_logs
                  WHERE (?1 IS NULL OR area = ?1)
+                 AND (?3 IS NULL OR level IN (SELECT value FROM json_each(?3)))
                  ORDER BY timestamp_ms DESC LIMIT ?2",
             )?;
-            let rows = statement.query_map(params![query.area, limit], |row| {
+            let rows = statement.query_map(params![query.area, limit, levels], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -552,12 +571,6 @@ impl OperationLog for SqliteRepositories {
             for row in rows {
                 let (timestamp, correlation, area, level, message, detail) = row?;
                 let level: LogLevel = serde_json::from_str(&level)?;
-                if query
-                    .minimum_level
-                    .is_some_and(|minimum| log_rank(level) < log_rank(minimum))
-                {
-                    continue;
-                }
                 entries.push(OperationLogEntry {
                     timestamp_utc: DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
                         StoreError::Json(serde_json::Error::io(std::io::Error::new(
@@ -1174,6 +1187,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM rename_entries", [], |row| row.get(0))
             .expect("entries");
         assert_eq!(entries, 1);
+    }
+
+    /// The level filter has to apply before the limit, or newer quieter
+    /// entries crowd every warning out of the page.
+    #[tokio::test]
+    async fn the_level_filter_applies_before_the_limit() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        for (index, level) in [LogLevel::Error, LogLevel::Warning]
+            .into_iter()
+            .chain([LogLevel::Information; 5])
+            .enumerate()
+        {
+            let mut entry = log(&format!("entry {index}"), 0);
+            entry.timestamp_utc =
+                DateTime::from_timestamp_millis(1_000 + i64::try_from(index).unwrap()).unwrap();
+            entry.level = level;
+            OperationLog::append(&repositories, &entry)
+                .await
+                .expect("append");
+        }
+
+        let entries = OperationLog::query(
+            &repositories,
+            &LogQuery {
+                area: None,
+                minimum_level: Some(LogLevel::Warning),
+                limit: 2,
+            },
+        )
+        .await
+        .expect("query");
+        let levels: Vec<_> = entries.iter().map(|entry| entry.level).collect();
+        assert_eq!(levels, [LogLevel::Warning, LogLevel::Error]);
     }
 
     #[tokio::test]

@@ -450,7 +450,7 @@ mod tests {
         );
 
         drop(repositories);
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".v2.bak"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }

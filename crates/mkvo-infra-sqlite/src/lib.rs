@@ -43,6 +43,11 @@ pub enum StoreError {
         "the database was written by a newer version (schema {found}, this version reads up to {supported})"
     )]
     NewerSchema { found: u32, supported: u32 },
+    #[error(
+        "the database was not upgraded because it could not first be copied to {}: {reason}. Free some disk space or make that directory writable, then restart",
+        path.display()
+    )]
+    BackupFailed { path: PathBuf, reason: String },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -137,6 +142,7 @@ impl SqliteStore {
         }
         let mut connection = Connection::open(&path)?;
         configure_connection(&connection, busy_timeout)?;
+        back_up_before_migrating(&connection, &path)?;
         migrate(&mut connection)?;
         Ok(Self {
             path: Arc::new(path),
@@ -218,6 +224,37 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
     Ok(())
+}
+
+/// Copy an existing database that `migrate` is about to upgrade, so a failed
+/// upgrade or a downgrade can go back to it. A copy from an earlier upgrade
+/// from the same version is replaced only once the new one is complete.
+fn back_up_before_migrating(connection: &Connection, path: &Path) -> StoreResult<()> {
+    let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == 0 || current >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let backup = backup_path(path, current);
+    let partial = backup.with_extension("bak.partial");
+    let _ = std::fs::remove_file(&partial);
+    let copied = match partial.to_str() {
+        Some(target) => connection
+            .execute("VACUUM INTO ?1", [target])
+            .map_err(|error| error.to_string())
+            .and_then(|_| std::fs::rename(&partial, &backup).map_err(|error| error.to_string())),
+        None => Err("the path is not valid UTF-8".to_owned()),
+    };
+    copied.map_err(|reason| StoreError::BackupFailed {
+        path: backup,
+        reason,
+    })
+}
+
+/// Where the copy taken before migrating a database from `version` goes.
+fn backup_path(path: &Path, version: u32) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".v{version}.bak"));
+    PathBuf::from(name)
 }
 
 fn migration_v1(transaction: &Transaction<'_>) -> StoreResult<()> {
@@ -403,6 +440,9 @@ mod tests {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{}", self.0.display(), suffix));
             }
+            for version in 1..SCHEMA_VERSION {
+                let _ = std::fs::remove_file(backup_path(&self.0, version));
+            }
         }
     }
 
@@ -446,6 +486,111 @@ mod tests {
             ),
             "{reopened:?}"
         );
+    }
+
+    /// Build a database as a build at `version` left it, with one setting.
+    fn database_at_version(path: &Path, version: u32) {
+        let mut connection = Connection::open(path).expect("open");
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).expect("configure");
+        let transaction = connection.transaction().expect("transaction");
+        migration_v1(&transaction).expect("v1");
+        if version >= 2 {
+            migration_v2(&transaction).expect("v2");
+        }
+        transaction
+            .execute(
+                "INSERT INTO settings (key, version, value_json, updated_at_ms)
+                 VALUES ('app', 1, '{\"theme\":\"dark\"}', 1)",
+                [],
+            )
+            .expect("setting");
+        transaction
+            .pragma_update(None, "user_version", version)
+            .expect("version");
+        transaction.commit().expect("commit");
+    }
+
+    fn version_and_setting(path: &Path) -> (u32, String) {
+        let connection = Connection::open(path).expect("open");
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        let value = connection
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = 'app'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("setting");
+        (version, value)
+    }
+
+    /// A migration rewrites user data; the database it started from must survive it.
+    #[test]
+    fn migrating_an_older_database_keeps_a_copy_of_it() {
+        for version in [1, 2] {
+            let database = TestDatabase::new(&format!("backup-v{version}"));
+            database_at_version(&database.0, version);
+
+            let store = SqliteStore::open(&database.0).expect("migrate");
+            assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+            drop(store);
+
+            assert_eq!(
+                version_and_setting(&backup_path(&database.0, version)),
+                (version, r#"{"theme":"dark"}"#.to_owned())
+            );
+            assert_eq!(
+                version_and_setting(&database.0),
+                (SCHEMA_VERSION, r#"{"theme":"dark"}"#.to_owned())
+            );
+        }
+    }
+
+    /// A copy left by an earlier upgrade is older than what is about to migrate.
+    #[test]
+    fn a_new_backup_replaces_an_older_one() {
+        let database = TestDatabase::new("backup-replace");
+        database_at_version(&database.0, 2);
+        std::fs::write(backup_path(&database.0, 2), b"stale").expect("stale backup");
+
+        SqliteStore::open(&database.0).expect("migrate");
+        assert_eq!(version_and_setting(&backup_path(&database.0, 2)).0, 2);
+    }
+
+    /// Without its copy the database must stay as it was, and the error must say why.
+    #[test]
+    fn a_backup_that_cannot_be_written_stops_the_migration() {
+        let database = TestDatabase::new("backup-blocked");
+        database_at_version(&database.0, 2);
+        let partial = backup_path(&database.0, 2).with_extension("bak.partial");
+        std::fs::create_dir(&partial).expect("block the copy");
+
+        let opened = SqliteStore::open(&database.0);
+        let _ = std::fs::remove_dir(&partial);
+        let error = opened.expect_err("the migration must not run");
+        assert!(
+            matches!(&error, StoreError::BackupFailed { path, .. } if *path == backup_path(&database.0, 2)),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("Free some disk space"),
+            "{error}"
+        );
+        assert_eq!(
+            version_and_setting(&database.0),
+            (2, r#"{"theme":"dark"}"#.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_current_or_new_database_is_not_copied() {
+        let database = TestDatabase::new("backup-none");
+        drop(SqliteStore::open(&database.0).expect("create"));
+        drop(SqliteStore::open(&database.0).expect("reopen"));
+        for version in 0..=SCHEMA_VERSION {
+            assert!(!backup_path(&database.0, version).exists());
+        }
     }
 
     #[test]
