@@ -75,6 +75,37 @@ impl MkvoRuntime {
                     selection.subtitle_path
                 )));
             }
+            if !subtitle_path.is_absolute()
+                || subtitle_path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            {
+                return Err(RuntimeError::invalid(format!(
+                    "Manual subtitle path must be absolute, without '..': {}",
+                    selection.subtitle_path
+                )));
+            }
+            // It is muxed into the library and may be deleted afterwards, like any source;
+            // the desktop user may pick one anywhere on their own machine.
+            let confined = self.config().browse_scope != crate::BrowseScope::Unrestricted;
+            let outside = || {
+                RuntimeError::new(
+                    mkvo_contracts::ApiErrorCode::UnauthorizedPath,
+                    format!(
+                        "Manual subtitle is outside the authorized roots: {}",
+                        selection.subtitle_path
+                    ),
+                )
+            };
+            // Checked before the disk is touched, so nothing outside the roots is probed.
+            if confined
+                && !self
+                    .authorized_root_paths()
+                    .iter()
+                    .any(|root| mkvo_application::path_contains(root, &subtitle_path))
+            {
+                return Err(outside());
+            }
             if !tokio::fs::metadata(&subtitle_path)
                 .await
                 .is_ok_and(|metadata| metadata.is_file())
@@ -83,6 +114,17 @@ impl MkvoRuntime {
                     "Manual subtitle file was not found: {}",
                     selection.subtitle_path
                 )));
+            }
+            // A symlink inside a root can still lead outside it.
+            if confined
+                && self
+                    .dependencies()
+                    .paths
+                    .authorize_read(&subtitle_path)
+                    .await
+                    .is_err()
+            {
+                return Err(outside());
             }
             let subtitle_key = path_key(&subtitle_path.to_string_lossy());
             manual_subtitle_paths.insert(subtitle_key.clone());
@@ -2390,6 +2432,111 @@ pub(super) mod execution_tests {
 
     const WARNED: &str = "mkvmerge v102.0 ('Little Houses') 64-bit\n'a.srt': Using the demultiplexer for the format 'SRT subtitles'.\nWarning: 'a.srt' track 0: The start timestamp is smaller than that of the previous entry.\nThe file has been opened for writing.\nProgress: 96%\rProgress: 100%\rThe cue entries (the index) are being written...\nMultiplexing took 0 seconds.\n";
     const FAILED: &str = "mkvmerge v102.0 ('Little Houses') 64-bit\nError: The file 'Episode 01.mkv' could not be opened for reading: open file error.\n";
+
+    #[tokio::test]
+    async fn manual_subtitles_must_be_inside_the_authorized_roots() {
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("episode.mkv").await;
+        let outside = tempfile::tempdir().expect("outside");
+        let foreign = outside.path().join("secrets.srt");
+        std::fs::write(&foreign, "1\n").expect("foreign subtitle");
+        let inside = library.directory.path().join("episode.srt");
+        std::fs::write(&inside, "1\n").expect("subtitle");
+        let preview = |subtitle: &str| {
+            serde_json::from_value::<MuxPreviewRequest>(serde_json::json!({
+                "files": [mkvo_contracts::MediaFileRow::from(&episode)],
+                "selectedPaths": [episode.path.to_string_lossy()],
+                "removeUnwantedAudioLanguages": false,
+                "keepAudioLanguages": "",
+                "removeUnwantedSubtitleLanguages": false,
+                "keepSubtitleLanguages": "",
+                "removeUnwantedTrackIds": false,
+                "removeTrackIdsText": "",
+                "preserveChapters": true,
+                "preserveAttachments": true,
+                "muxMatchingExternalSubtitles": false,
+                "manualSubtitleSelections": [{
+                    "targetPath": episode.path.to_string_lossy(),
+                    "subtitlePath": subtitle,
+                }],
+                "externalSubtitleLanguage": "eng",
+                "externalSubtitleFormats": "srt",
+                "preserveExternalSubtitleFiles": false,
+                "skipMuxIfSubtitleAlreadyExists": false,
+                "extractSubtitles": false,
+                "extractSubtitleLanguages": "",
+                "extractOverwriteExistingFiles": false,
+                "convertMp4ToMkv": false,
+                "deleteMp4AfterConvert": false,
+                "planId": null,
+                "planFingerprint": null,
+                "idempotencyKey": null,
+            }))
+            .expect("request")
+        };
+
+        // Muxing it would copy the file into the library and then delete the original.
+        let error = library
+            .runtime
+            .build_mux_preview(preview(&foreign.to_string_lossy()))
+            .await
+            .expect_err("outside the roots");
+        assert_eq!(error.code, mkvo_contracts::ApiErrorCode::UnauthorizedPath);
+        assert!(foreign.exists());
+        // Outside the roots the answer must not depend on whether the file exists.
+        let error = library
+            .runtime
+            .build_mux_preview(preview(
+                &outside.path().join("missing.srt").to_string_lossy(),
+            ))
+            .await
+            .expect_err("missing outside the roots");
+        assert_eq!(error.code, mkvo_contracts::ApiErrorCode::UnauthorizedPath);
+        let escaping = library
+            .directory
+            .path()
+            .join("..")
+            .join(outside.path().file_name().expect("name"))
+            .join("secrets.srt");
+        for relative in [
+            "episode.srt".to_owned(),
+            escaping.to_string_lossy().into_owned(),
+        ] {
+            let error = library
+                .runtime
+                .build_mux_preview(preview(&relative))
+                .await
+                .expect_err("relative");
+            assert_eq!(
+                error.code,
+                mkvo_contracts::ApiErrorCode::InvalidRequest,
+                "{relative}"
+            );
+        }
+        let error = library
+            .runtime
+            .build_mux_preview(preview(
+                &library
+                    .directory
+                    .path()
+                    .join("missing.srt")
+                    .to_string_lossy(),
+            ))
+            .await
+            .expect_err("missing");
+        assert_eq!(error.code, mkvo_contracts::ApiErrorCode::NotFound);
+        library
+            .runtime
+            .build_mux_preview(preview(&inside.to_string_lossy()))
+            .await
+            .expect("inside the roots");
+        let mut config = library.runtime.config().clone();
+        config.browse_scope = crate::BrowseScope::Unrestricted;
+        MkvoRuntime::from_parts(config, library.runtime.dependencies().clone())
+            .build_mux_preview(preview(&foreign.to_string_lossy()))
+            .await
+            .expect("the desktop is not confined");
+    }
 
     #[tokio::test]
     async fn output_written_with_warnings_replaces_the_original() {
