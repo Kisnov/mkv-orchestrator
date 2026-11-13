@@ -1,33 +1,25 @@
-import { MobileOptions } from "../components/MobileOptions";
-import { FileName } from "../components/FileName";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import {
-  buildMuxPreview,
-  cancelOperationJob,
   getCurrentScanFiles,
   getWebSettings,
-  MuxPreviewRequest,
-  MuxPreviewResponse,
-  startMuxApply
+  MuxPreviewRequest
 } from "../api";
+import { fileColumns } from "../components/fileColumns";
+import { FileSelectionTable } from "../components/FileSelectionTable";
 import { LanguageChips } from "../components/LanguageChips";
-import { PanelDivider } from "../components/PanelDivider";
-import { PreviewSummaryModal } from "../components/PreviewSummaryModal";
-import { SectionHeader } from "../components/SectionHeader";
-import { SortableColumnHeader, type SortDirection } from "../components/SortableColumnHeader";
+import { OperationShell } from "../components/OperationShell";
+import { pathKey } from "../lib/pathKey";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
-import { useOperationJob } from "../state/OperationJobContext";
-import { createLocalId } from "../lib/localId";
+import { useLibrarySelection } from "../state/useFileSelection";
+import { buildMuxRequest, useMuxRequest } from "../state/useMuxRequest";
 
-type FileSortKey = "file" | "reader" | "codec" | "resolution" | "audio" | "subtitles" | "status";
+const columns = [fileColumns.reader, fileColumns.codec, fileColumns.resolution, fileColumns.audio, fileColumns.subtitles, fileColumns.status];
 
 export type MuxWorkflow = "remove" | "subtitles" | "convert";
 
 export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }) {
-  const { files, selectedPaths, setSelectedPaths, toggleSelectedPath, templateFilePath, syncFromBackend, isWorkingView } = useMediaLibrary();
-  const operation = useOperationJob();
+  const { files, setSelectedPaths, templateFilePath, syncFromBackend, isWorkingView } = useMediaLibrary();
   const currentScan = useQuery({ queryKey: ["current-scan-files"], queryFn: getCurrentScanFiles });
   const settings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
   const [subtitleTab, setSubtitleTab] = useState<"mux" | "extract">("mux");
@@ -54,19 +46,18 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
   const [extractOverwrite, setExtractOverwrite] = useState(false);
   const [convertMp4, setConvertMp4] = useState(false);
   const [deleteMp4AfterConvert, setDeleteMp4AfterConvert] = useState(false);
-  const [previewResult, setPreviewResult] = useState<MuxPreviewResponse | null>(null);
   const [previewRemovedTracks, setPreviewRemovedTracks] = useState<Record<string, string[]>>({});
-  const [statusText, setStatusText] = useState("Load scanned files from Dashboard, then choose an action.");
   const [settingsDefaultsApplied, setSettingsDefaultsApplied] = useState(false);
-  const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
-  const [selectionMenu, setSelectionMenu] = useState<{ x: number; y: number } | null>(null);
-  const [highlightedPaths, setHighlightedPaths] = useState<string[]>([]);
-  const [selectionAnchorPath, setSelectionAnchorPath] = useState("");
-  const [fileSort, setFileSort] = useState<{ key: FileSortKey; direction: SortDirection }>({ key: "file", direction: "asc" });
-  const [filePanelPercent, setFilePanelPercent] = useState(56);
-  const panelRef = useRef<HTMLDivElement>(null);
   const languageSuggestions = (type: string) => [...new Set(files.flatMap((file) => file.tracks.filter((track) => type === "subtitle" ? ["subtitle", "subtitles"].includes(track.type.toLowerCase()) : track.type.toLowerCase() === type).map((track) => track.language || "und")))];
   const initializedSelectionScope = useRef("");
+  const run = useMuxRequest({
+    label: "MKV Operations",
+    initialStatus: "Load scanned files from Dashboard, then choose an action.",
+    startedText: (total) => `Applying ${total} MKV operation(s)...`,
+    noChangesText: "No changes are needed for the selected files.",
+    cancelingText: "Canceling MKV operation job...",
+    onPreview: (_plan, request) => setPreviewRemovedTracks(buildRemovedTrackDetails(request))
+  });
 
   useEffect(() => {
     if (!currentScan.data) return;
@@ -75,9 +66,9 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
 
     syncFromBackend(scan);
     if (scan.files.length === 0) {
-      setPreviewResult(null);
+      run.setPreviewResult(null);
       setSelectedDetailPath("");
-      setStatusText("Load scanned files from Dashboard, then choose an action.");
+      run.setStatus("Load scanned files from Dashboard, then choose an action.");
     } else if (initializedSelectionScope.current !== selectionScope) {
       // MKV Operations starts every newly loaded scan as a full batch. Record
       // the scan identity first so later user deselection is preserved for the
@@ -85,6 +76,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       initializedSelectionScope.current = selectionScope;
       setSelectedPaths((isWorkingView ? files : scan.files).map((file) => file.path));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentScan.data, isWorkingView]);
 
   useEffect(() => {
@@ -98,14 +90,6 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
     setSelectedDetailPath((current) => current && files.some((file) => file.path === current) ? current : files[0]?.path ?? "");
   }, [files]);
 
-  useEffect(() => {
-    if (!selectionMenu) return;
-    const close = () => setSelectionMenu(null);
-    window.addEventListener("pointerdown", close);
-    return () => window.removeEventListener("pointerdown", close);
-  }, [selectionMenu]);
-
-  const mkvFiles = useMemo(() => files.filter((file) => file.extension.toLowerCase() === ".mkv"), [files]);
   const mp4Files = useMemo(() => files.filter((file) => file.extension.toLowerCase() === ".mp4"), [files]);
   const pageTitle = workflow === "remove" ? "Remove Tracks" : workflow === "subtitles" ? "Subtitles" : "Convert / Remux";
   const pageDescription = workflow === "remove"
@@ -117,75 +101,27 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
   useEffect(() => {
     if (workflow === "convert" && mp4Files.length > 0) setConvertMp4(true);
   }, [workflow, mp4Files.length]);
+  const templateFile = useMemo(
+    () => files.find((file) => pathKey(file.path) === pathKey(templateFilePath)) ?? files[0] ?? null,
+    [files, templateFilePath]
+  );
+  const selection = useLibrarySelection(files, templateFile);
   const selectedMkvPaths = useMemo(
-    () => selectedPaths.filter((path) => files.some((file) => file.path === path && file.extension.toLowerCase() === ".mkv")),
-    [files, selectedPaths]
+    () => selection.selectedPaths.filter((path) => files.some((file) => file.path === path && file.extension.toLowerCase() === ".mkv")),
+    [files, selection.selectedPaths]
   );
   const selectedMp4Paths = useMemo(
-    () => selectedPaths.filter((path) => files.some((file) => file.path === path && file.extension.toLowerCase() === ".mp4")),
-    [files, selectedPaths]
+    () => selection.selectedPaths.filter((path) => files.some((file) => file.path === path && file.extension.toLowerCase() === ".mp4")),
+    [files, selection.selectedPaths]
   );
-  const selectedNonMkvCount = selectedPaths.length - selectedMkvPaths.length;
   const selectedDetailFile = useMemo(
     () => files.find((file) => file.path === selectedDetailPath) ?? files[0] ?? null,
     [files, selectedDetailPath]
   );
-  const templateFile = useMemo(
-    () => files.find((file) => normalizePath(file.path) === normalizePath(templateFilePath)) ?? files[0] ?? null,
-    [files, templateFilePath]
-  );
-  const displayedFiles = useMemo(() => sortOperationFiles(files, fileSort.key, fileSort.direction, templateFile), [files, fileSort, templateFile]);
-  const selectedCount = selectedPaths.length;
-
-  const preview = useMutation({
-    mutationFn: buildMuxPreview,
-    onSuccess: (response, request) => {
-      setPreviewResult(response);
-      setPreviewRemovedTracks(buildRemovedTrackDetails(request));
-      setStatusText(response.status);
-    },
-    onError: (error) => setStatusText(error instanceof Error ? error.message : "Preview failed.")
-  });
-
-  const apply = useMutation({
-    mutationFn: startMuxApply,
-    onSuccess: (job) => {
-      operation.trackJob(job.id, "MKV Operations");
-      setStatusText(`Applying ${job.total} MKV operation(s)...`);
-    },
-    onError: (error) => setStatusText(error instanceof Error ? error.message : "Apply failed.")
-  });
-
-  const cancelApply = useMutation({ mutationFn: cancelOperationJob });
-  const runningJob = operation.activeOperation?.label === "MKV Operations" ? operation.job : undefined;
-  const isApplying = apply.isPending || (operation.activeOperation?.label === "MKV Operations" && operation.isRunning);
-
-  useEffect(() => {
-    if (!runningJob) return;
-
-    if (runningJob.status === "Running" || runningJob.status === "Queued" || runningJob.status === "WaitingForResources" || runningJob.status === "Canceling") {
-      const fileInfo = runningJob.currentFile ? ` | ${runningJob.currentFile} ${runningJob.currentFilePercent}%` : "";
-      setStatusText(`Applying ${runningJob.completed + runningJob.failed + runningJob.skipped}/${runningJob.total}${fileInfo}`);
-      return;
-    }
-
-    if (runningJob.muxResult) {
-      setPreviewResult(runningJob.muxResult);
-      setStatusText(runningJob.muxResult.status);
-    } else if (runningJob.status === "Failed") {
-      setStatusText(runningJob.error || "Apply failed.");
-    }
-
-    currentScan.refetch().then((result) => {
-      if (result.data) syncFromBackend(result.data);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runningJob?.status, runningJob?.completed, runningJob?.currentFile, runningJob?.currentFilePercent]);
+  const canRun = selectedMkvPaths.length > 0 || (convertMp4 && selectedMp4Paths.length > 0);
 
   function buildRequest(): MuxPreviewRequest {
-    return {
-      files,
-      selectedPaths: convertMp4 ? [...selectedMkvPaths, ...selectedMp4Paths] : selectedMkvPaths,
+    return buildMuxRequest(files, convertMp4 ? [...selectedMkvPaths, ...selectedMp4Paths] : selectedMkvPaths, {
       removeUnwantedAudioLanguages: removeAudio,
       keepAudioLanguages: audioLanguages,
       removeUnwantedSubtitleLanguages: removeSubtitles,
@@ -196,21 +132,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       preserveAttachments,
       preserveOriginal: !convertMp4 && !extractSubtitles && preserveOriginal,
       remuxOutputSuffix,
-      reorderTracks: false,
-      reorderTemplatePath: "",
-      reorderTemplateTrackIds: [],
-      formatSubtitles: false,
-      subtitleTrackSelections: [],
-      subtitleFontFamily: "",
-      subtitleFontSize: "48",
-      subtitlePrimaryColor: "#FFFFFF",
-      subtitleOutlineColor: "#000000",
-      subtitleOutlineSize: "2",
-      subtitleFontFileName: "",
-      subtitleFontDataBase64: "",
-      subtitleTimingOffsetMs: 0,
       muxMatchingExternalSubtitles: muxExternal,
-      manualSubtitleSelections: [],
       externalSubtitleLanguage: externalLanguage,
       externalSubtitleFormats: externalFormats,
       preserveExternalSubtitleFiles: preserveSidecars,
@@ -220,84 +142,29 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       extractOverwriteExistingFiles: extractOverwrite,
       convertMp4ToMkv: convertMp4,
       deleteMp4AfterConvert
-    };
-  }
-
-
-  function togglePath(path: string) {
-    toggleSelectedPath(path);
-  }
-
-  function highlightFile(path: string, index: number, modifiers: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }) {
-    setSelectedDetailPath(path);
-    if (modifiers.shiftKey && selectionAnchorPath) {
-      const anchorIndex = displayedFiles.findIndex((file) => normalizePath(file.path) === normalizePath(selectionAnchorPath));
-      if (anchorIndex >= 0) {
-        const start = Math.min(anchorIndex, index);
-        const end = Math.max(anchorIndex, index);
-        setHighlightedPaths(displayedFiles.slice(start, end + 1).map((file) => file.path));
-        return;
-      }
-    }
-    if (modifiers.ctrlKey || modifiers.metaKey) {
-      setHighlightedPaths((current) => current.some((item) => normalizePath(item) === normalizePath(path))
-        ? current.filter((item) => normalizePath(item) !== normalizePath(path))
-        : [...current, path]);
-      setSelectionAnchorPath(path);
-      return;
-    }
-    setHighlightedPaths([path]);
-    setSelectionAnchorPath(path);
-  }
-
-  function setHighlightedSelection(checked: boolean) {
-    if (highlightedPaths.length === 0) return;
-    const targets = new Set(highlightedPaths.map(normalizePath));
-    const next = checked
-      ? [...selectedPaths, ...highlightedPaths.filter((path) => !selectedPaths.some((selected) => normalizePath(selected) === normalizePath(path)))]
-      : selectedPaths.filter((path) => !targets.has(normalizePath(path)));
-    setSelectedPaths(next);
-  }
-
-  function toggleHighlightedSelection() {
-    if (highlightedPaths.length === 0) return;
-    const allSelected = highlightedPaths.every((path) => selectedPaths.some((selected) => normalizePath(selected) === normalizePath(path)));
-    setHighlightedSelection(!allSelected);
+    });
   }
 
   function runPreview() {
-    const hasConvertibleMp4s = convertMp4 && selectedMp4Paths.length > 0;
-    if (selectedMkvPaths.length === 0 && !hasConvertibleMp4s) {
-      setStatusText("MKV Operations requires at least one selected MKV file (or MP4 with conversion enabled).");
+    if (!canRun) {
+      run.setStatus("MKV Operations requires at least one selected MKV file (or MP4 with conversion enabled).");
       return;
     }
-
-    preview.mutate(buildRequest());
+    run.preview(buildRequest());
   }
 
-  async function runApply() {
-    if (selectedMkvPaths.length === 0 && !(convertMp4 && selectedMp4Paths.length > 0)) return;
-    const request = buildRequest();
-    try {
-      const plan = await preview.mutateAsync(request);
-      if (!plan.actions.length) { setStatusText("No changes are needed for the selected files."); return; }
-      await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? createLocalId() });
-    } catch { /* Mutation handlers display the error. */ }
-  }
-
-  function cancelRunningApply() {
-    if (!operation.activeOperation || operation.activeOperation.label !== "MKV Operations") return;
-    cancelApply.mutate(operation.activeOperation.id);
-    setStatusText("Canceling MKV operation job...");
-  }
+  const previewResult = run.previewResult;
 
   return (
-    <div className="workspace-page flex h-full min-h-0 flex-col">
-      <SectionHeader title={pageTitle} description={pageDescription} />
-
-      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(14rem,18.75rem)_minmax(0,1fr)] gap-3">
-        <section className="operation-sidebar flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
-          <MobileOptions>
+    <OperationShell
+      title={pageTitle}
+      description={pageDescription}
+      run={run}
+      canRun={canRun}
+      onPreview={runPreview}
+      onApply={() => { if (canRun) void run.apply(buildRequest()); }}
+      selectedText={`${selectedMkvPaths.length + (convertMp4 ? selectedMp4Paths.length : 0)} files selected`}
+      options={<>
           {workflow !== "subtitles" ? <div className="flex items-center justify-between">
             {workflow === "remove" ? <h2 className="text-base font-semibold">Track Options</h2> : <span />}
           </div> : null}
@@ -320,8 +187,6 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
 
           {workflow === "subtitles" ? (
             <div className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
-              </div>
               <div role="tablist" aria-label="Subtitle options" className="flex gap-3 border-b border-border">
                 {(["mux", "extract"] as const).map((tab) => <button
                   key={tab} type="button" role="tab" id={`subtitle-${tab}-tab`} aria-controls={`subtitle-${tab}-panel`}
@@ -375,81 +240,9 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
               <p className="text-xs leading-5 text-muted">Lossless container copy via mkvmerge - no re-encoding. The new .mkv is created next to the source file; files whose .mkv already exists are skipped.</p>
             </div>
           ) : null}
-
-
-          </MobileOptions>
-      <div className="mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3" aria-label="Operation actions">
-        <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 && !(convertMp4 && selectedMp4Paths.length > 0))} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
-        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 && !(convertMp4 && selectedMp4Paths.length > 0))} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
-        <span className="w-full text-xs text-muted">{selectedMkvPaths.length + (convertMp4 ? selectedMp4Paths.length : 0)} files selected</span>
-        <span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
-      </div>
-        </section>
-
-        <div ref={panelRef} className="grid min-h-0 min-w-0" style={{ gridTemplateRows: `minmax(0,${filePanelPercent}fr) 12px minmax(0,${100 - filePanelPercent}fr)` }}>
-          <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
-            <div className="flex shrink-0 items-center justify-between gap-3">
-              <h2 className="text-base font-semibold">File Info</h2>
-              <div className="mobile-file-actions"><div className="flex flex-wrap gap-2"><button type="button" className="rounded-md border border-border px-3" onClick={() => setSelectedPaths(files.map((file) => file.path))}>Select all</button><button type="button" className="rounded-md border border-border px-3" onClick={() => setSelectedPaths([])}>Clear selection</button></div></div>
-            </div>
-            <div
-              className="mt-3 min-h-0 flex-1 overflow-auto"
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (event.key !== " " || highlightedPaths.length === 0) return;
-                event.preventDefault();
-                toggleHighlightedSelection();
-              }}
-              aria-label="MKV Operations file selection"
-            >
-              <table className="file-info-table border-collapse text-left text-sm">
-                <thead className="sticky top-0 bg-card text-xs text-text">
-                  <tr>
-                    {(["file", "reader", "codec", "resolution", "audio", "subtitles", "status"] as FileSortKey[]).map((key) => (
-                      <SortableColumnHeader key={key} active={fileSort.key === key} direction={fileSort.direction} label={{ file: "File", reader: "Reader", codec: "Codec", resolution: "Resolution", audio: "Audio", subtitles: "Subtitles", status: "Status" }[key]} onSort={() => setFileSort((current) => ({ key, direction: current.key === key && current.direction === "asc" ? "desc" : "asc" }))} />
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayedFiles.map((file, index) => {
-                    const fileStatus = operationFileStatus(file, templateFile);
-                    return (
-                    <tr
-                      key={file.path}
-                      onClick={(event) => highlightFile(file.path, index, event)}
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        if (!highlightedPaths.some((path) => normalizePath(path) === normalizePath(file.path))) {
-                          setHighlightedPaths([file.path]);
-                          setSelectionAnchorPath(file.path);
-                        }
-                        setSelectedDetailPath(file.path);
-                        setSelectionMenu({ x: event.clientX, y: event.clientY });
-                      }}
-                      className={[highlightedPaths.some((path) => normalizePath(path) === normalizePath(file.path)) ? "bg-selected" : "bg-card", "cursor-pointer hover:bg-selected"].join(" ")}
-                    >
-                      <td className="border-b border-border px-3 py-2">
-                        <div className="flex min-w-0 items-center gap-3">
-                          <input type="checkbox" checked={selectedPaths.includes(file.path)} onClick={(event) => event.stopPropagation()} onChange={() => togglePath(file.path)} />
-                          <FileName value={file.fileName} />
-                        </div>
-                      </td>
-                      <td className="border-b border-border px-3 py-2">{file.reader}</td>
-                      <td className="border-b border-border px-3 py-2">{file.codec || "Unknown"}</td>
-                      <td className="border-b border-border px-3 py-2">{file.resolution || "Unknown"}</td>
-                      <td className="max-w-[15.625rem] truncate border-b border-border px-3 py-2" title={file.audioSummary}>{file.audioSummary || "None"}</td>
-                      <td className="max-w-[15.625rem] truncate border-b border-border px-3 py-2" title={file.subtitleSummary}>{file.subtitleSummary || "None"}</td>
-                      <td className={["truncate border-b border-border px-3 py-2", fileStatus === "Warning" ? "text-warning" : fileStatus === "Template" ? "text-template" : "text-success"].join(" ")}>{fileStatus}</td>
-                    </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <PanelDivider containerRef={panelRef} value={filePanelPercent} onChange={setFilePanelPercent} />
-          <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
+      </>}
+      files={<FileSelectionTable title="File Info" files={files} templateFile={templateFile} selection={selection} columns={columns} label="MKV Operations file selection" activePath={selectedDetailFile?.path} onActivate={setSelectedDetailPath} />}
+      details={<>
             <div className="flex shrink-0 gap-6 text-sm">
               <button onClick={() => setDetailTab("tracks")} className={detailTab === "tracks" ? "border-b border-accent pb-1 font-semibold text-text" : "pb-1 font-semibold text-muted"}>File Details: Tracks</button>
               <button onClick={() => setDetailTab("attachments")} className={detailTab === "attachments" ? "border-b border-accent pb-1 font-semibold text-text" : "pb-1 font-semibold text-muted"}>File Details: Attachments</button>
@@ -507,111 +300,45 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
                 </div>
               )}
             </div>
-          </section>
-
-        </div>
-      </div>
-      {isSummaryExpanded ? (
-        <PreviewSummaryModal
-          title={`${pageTitle} Preview Summary`}
-          emptyText="Build a preview to see planned MKV operations."
-          available={previewResult !== null}
-          status={previewResult?.status ?? ""}
-          summary={previewResult?.summary ?? ""}
-          metrics={[
-            { label: "Files changing", value: new Set(previewResult?.actions.map((action) => action.filePath) ?? []).size, tone: "text-success" },
-            { label: "Planned actions", value: previewResult?.actions.length ?? 0, tone: "text-accent" },
-            { label: "No change", value: previewResult?.noChangeFiles.length ?? 0, tone: "text-muted" },
-            { label: "Tools involved", value: new Set(previewResult?.actions.map((action) => action.toolName) ?? []).size, tone: "text-text" }
-          ]}
-          sections={[
-            {
-              title: "Planned operations",
-              emptyText: "No MKV operations are needed.",
-              rows: previewResult?.actions.map((action) => ({
-                key: `${action.filePath}-${action.index}`,
-                title: action.fileName,
-                detail: [
-                  action.description,
-                  ...(previewRemovedTracks[normalizePath(action.filePath)] ?? [])
-                ].join("\n"),
-                meta: `${action.operation} · ${action.toolName}`
-              })) ?? []
-            },
-            {
-              title: "No change",
-              emptyText: "Every selected file requires an operation.",
-              rows: previewResult?.noChangeFiles.map((filePath) => ({
-                key: filePath,
-                title: filePath.split(/[\\/]/).pop() || filePath,
-                detail: "No MKV operations are required for this file."
-              })) ?? []
-            }
-          ]}
-          onClose={() => setIsSummaryExpanded(false)}
-        />
-      ) : null}
-      {selectionMenu ? (
-        <div
-          role="menu"
-          aria-label="File selection options"
-          className="fixed z-[60] min-w-40 overflow-hidden rounded-lg border border-border bg-card p-1 shadow-[0_0.75rem_2.5rem_rgba(0,0,0,0.45)]"
-          style={{
-            left: Math.max(8, Math.min(selectionMenu.x, window.innerWidth - 180)),
-            top: Math.max(8, Math.min(selectionMenu.y, window.innerHeight - 256))
-          }}
-          onPointerDown={(event) => event.stopPropagation()}
-        >
-          <button
-            type="button"
-            role="menuitem"
-            disabled={highlightedPaths.length === 0}
-            onClick={() => {
-              setHighlightedSelection(true);
-              setSelectionMenu(null);
-            }}
-            className="flex w-full rounded-md px-3 py-2 text-left text-sm text-muted hover:bg-selected hover:text-text disabled:text-disabled"
-          >
-            Select highlighted rows
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            disabled={highlightedPaths.length === 0}
-            onClick={() => {
-              setHighlightedSelection(false);
-              setSelectionMenu(null);
-            }}
-            className="flex w-full rounded-md px-3 py-2 text-left text-sm text-muted hover:bg-selected hover:text-text disabled:text-disabled"
-          >
-            Deselect highlighted rows
-          </button>
-          <div className="my-1 border-t border-border" />
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setSelectedPaths(files.map((file) => file.path));
-              setSelectionMenu(null);
-            }}
-            className="flex w-full rounded-md px-3 py-2 text-left text-sm text-muted hover:bg-selected hover:text-text"
-          >
-            Select all
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setSelectedPaths([]);
-              setSelectionMenu(null);
-            }}
-            className="flex w-full rounded-md px-3 py-2 text-left text-sm text-muted hover:bg-selected hover:text-text"
-          >
-            Deselect all
-          </button>
-        </div>
-      ) : null}
-    </div>
+      </>}
+      summary={{
+        title: `${pageTitle} Preview Summary`,
+        emptyText: "Build a preview to see planned MKV operations.",
+        available: previewResult !== null,
+        status: previewResult?.status ?? "",
+        summary: previewResult?.summary ?? "",
+        metrics: [
+          { label: "Files changing", value: new Set(previewResult?.actions.map((action) => action.filePath) ?? []).size, tone: "text-success" },
+          { label: "Planned actions", value: previewResult?.actions.length ?? 0, tone: "text-accent" },
+          { label: "No change", value: previewResult?.noChangeFiles.length ?? 0, tone: "text-muted" },
+          { label: "Tools involved", value: new Set(previewResult?.actions.map((action) => action.toolName) ?? []).size, tone: "text-text" }
+        ],
+        sections: [
+          {
+            title: "Planned operations",
+            emptyText: "No MKV operations are needed.",
+            rows: previewResult?.actions.map((action) => ({
+              key: `${action.filePath}-${action.index}`,
+              title: action.fileName,
+              detail: [
+                action.description,
+                ...(previewRemovedTracks[pathKey(action.filePath)] ?? [])
+              ].join("\n"),
+              meta: `${action.operation} · ${action.toolName}`
+            })) ?? []
+          },
+          {
+            title: "No change",
+            emptyText: "Every selected file requires an operation.",
+            rows: previewResult?.noChangeFiles.map((filePath) => ({
+              key: filePath,
+              title: filePath.split(/[\\/]/).pop() || filePath,
+              detail: "No MKV operations are required for this file."
+            })) ?? []
+          }
+        ]
+      }}
+    />
   );
 }
 
@@ -642,53 +369,6 @@ function OutputOptions({ preserveOriginal, setPreserveOriginal, suffix, setSuffi
   );
 }
 
-function normalizePath(path: string) {
-  return path.replace(/\\/g, "/").toLowerCase();
-}
-
-function sortOperationFiles(files: ReturnType<typeof useMediaLibrary>["files"], key: FileSortKey, direction: SortDirection, templateFile: ReturnType<typeof useMediaLibrary>["files"][number] | null) {
-  const multiplier = direction === "asc" ? 1 : -1;
-  return files.map((file, index) => ({ file, index })).sort((left, right) => {
-    const value = (file: typeof left.file) => {
-      if (key === "file") return file.fileName;
-      if (key === "reader") return file.reader;
-      if (key === "codec") return file.codec || "Unknown";
-      if (key === "resolution") return file.resolution || "Unknown";
-      if (key === "audio") return file.audioSummary || "None";
-      if (key === "subtitles") return file.subtitleSummary || "None";
-      return operationFileStatus(file, templateFile);
-    };
-    const compared = value(left.file).localeCompare(value(right.file), undefined, { numeric: true, sensitivity: "base" });
-    return compared === 0 ? left.index - right.index : compared * multiplier;
-  }).map(({ file }) => file);
-}
-
-function operationFileStatus(file: ReturnType<typeof useMediaLibrary>["files"][number], templateFile: ReturnType<typeof useMediaLibrary>["files"][number] | null) {
-  if (!templateFile) return file.status;
-  if (normalizePath(file.path) === normalizePath(templateFile.path)) return "Template";
-  const values = ["codec", "resolution", "bitDepth", "audioSummary", "subtitleSummary"] as const;
-  const valueMismatch = values.some((key) => normalizeValue(file[key]) !== normalizeValue(templateFile[key]));
-  const trackMismatch = normalizeOperationTracks(file) !== normalizeOperationTracks(templateFile);
-  return valueMismatch || trackMismatch ? "Warning" : file.status;
-}
-
-function normalizeOperationTracks(file: ReturnType<typeof useMediaLibrary>["files"][number]) {
-  return file.tracks.map((track) => [
-    track.id,
-    track.trackNumber,
-    track.type,
-    track.codec,
-    track.language,
-    track.type.toLowerCase() === "video" ? "" : track.name,
-    track.default,
-    track.forced
-  ].map(String).map(normalizeValue).join("|")).join(";");
-}
-
-function normalizeValue(value: string) {
-  return value.trim().toLowerCase();
-}
-
 type RemovalPreviewInput = Pick<MuxPreviewRequest,
   "files"
   | "selectedPaths"
@@ -701,7 +381,7 @@ type RemovalPreviewInput = Pick<MuxPreviewRequest,
 >;
 
 export function buildRemovedTrackDetails(request: RemovalPreviewInput): Record<string, string[]> {
-  const selected = new Set(request.selectedPaths.map(normalizePath));
+  const selected = new Set(request.selectedPaths.map(pathKey));
   const explicitIds = request.removeUnwantedTrackIds
     ? new Set((request.removeTrackIdsText.match(/\d+/g) ?? []).map(Number))
     : new Set<number>();
@@ -710,7 +390,7 @@ export function buildRemovedTrackDetails(request: RemovalPreviewInput): Record<s
   const details: Record<string, string[]> = {};
 
   for (const file of request.files) {
-    const key = normalizePath(file.path);
+    const key = pathKey(file.path);
     if (!selected.has(key)) continue;
     const removed = file.tracks.filter((track) => {
       if (explicitIds.has(track.id)) return true;

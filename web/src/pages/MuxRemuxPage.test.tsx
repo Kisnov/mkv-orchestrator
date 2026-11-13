@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { buildRemovedTrackDetails, MuxRemuxPage } from "./MuxRemuxPage";
@@ -181,7 +181,7 @@ describe("MKV Operations file selection", () => {
     expect(await screen.findByText(/Applying 10\/283.*Episode 11\.mkv 50%/i)).toBeInTheDocument();
   });
 
-  it("selects every current file by default and offers select-all controls on right click", async () => {
+  it("selects every current file by default and picks the detail file by click or keyboard", async () => {
     const user = userEvent.setup();
     const files = [mediaFile("Episode 01.mkv"), { ...mediaFile("Episode 02.mkv"), subtitleSummary: "eng x2" }];
     const setFileSelection = vi.fn((selectedPaths: string[]) => Promise.resolve({
@@ -225,23 +225,26 @@ describe("MKV Operations file selection", () => {
     const rows = within(selection).getAllByRole("row").slice(1);
     expect(rows[0]).toHaveTextContent("Template");
     expect(rows[1]).toHaveTextContent("Warning");
-    await user.click(rows[0]);
-    fireEvent.click(rows[1], { ctrlKey: true });
-    fireEvent.keyDown(selection, { key: " " });
-    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).not.toBeChecked()));
 
-    fireEvent.keyDown(selection, { key: " " });
-    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).toBeChecked()));
+    // A click picks the file whose details show, without touching the selection.
+    await user.click(within(rows[1]).getByText("Episode 02.mkv"));
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    checkboxes.forEach((checkbox) => expect(checkbox).toBeChecked());
 
-    await user.click(rows[0]);
-    fireEvent.contextMenu(rows[0], { clientX: 120, clientY: 140 });
-    await user.click(screen.getByRole("menuitem", { name: "Deselect highlighted rows" }));
+    // The keyboard does the same: arrows pick, Space checks.
+    rows[1].focus();
+    await user.keyboard("{ArrowUp}");
+    expect(rows[0]).toHaveFocus();
+    expect(rows[0]).toHaveAttribute("aria-current", "true");
+    await user.keyboard(" ");
     await waitFor(() => expect(checkboxes[0]).not.toBeChecked());
     expect(checkboxes[1]).toBeChecked();
+    await waitFor(() => expect(setFileSelection).toHaveBeenLastCalledWith([files[1].path]));
 
-    fireEvent.contextMenu(rows[0], { clientX: 120, clientY: 140 });
-    await user.click(screen.getByRole("menuitem", { name: "Select highlighted rows" }));
-    await waitFor(() => expect(checkboxes[0]).toBeChecked());
+    await user.click(within(selection.parentElement!).getByRole("button", { name: "Select none" }));
+    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).not.toBeChecked()));
+    await user.click(within(selection.parentElement!).getByRole("button", { name: "Select all" }));
+    await waitFor(() => checkboxes.forEach((checkbox) => expect(checkbox).toBeChecked()));
   });
 
   it("sorts the visible file rows while preserving path-based selection", async () => {
