@@ -32,6 +32,7 @@ import {
 import type { SourceRoot, WebMediaServer, WebSettings, WebSettingsRequest } from "../api";
 import { FileBrowser } from "../components/FileBrowser";
 import SecuritySection from "../components/SecuritySection";
+import { useAutosave } from "../lib/useAutosave";
 import ffmpegLogo from "../assets/logos/ffmpeg.png";
 import mkvtoolnixLogo from "../assets/logos/mkvtoolnix.png";
 import tmdbLogo from "../assets/logos/tmdb.png";
@@ -188,10 +189,7 @@ export function SettingsPage() {
   const [customThemeName, setCustomThemeName] = useState("My Theme");
   const [settingsStatus, setSettingsStatus] = useState("");
   const [statusPopupVisible, setStatusPopupVisible] = useState(false);
-  const lastSavedFingerprint = useRef("");
-  const [hydrationRevision, setHydrationRevision] = useState<object | null>(null);
-  const hydrationTarget = useRef<object | null>(null);
-  const needsHydratedBaseline = useRef(false);
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     setStatusPopupVisible(Boolean(settingsStatus));
@@ -209,12 +207,11 @@ export function SettingsPage() {
     }
   }, [activeTab, requestedTab, setSearchParams]);
 
+  // Fill the form once, from the first settled load. Later responses (a save, a
+  // refetch) would overwrite whatever is being typed.
   useEffect(() => {
-    if (!webSettings.data) return;
-    const revision = {};
-    hydrationTarget.current = revision;
-    needsHydratedBaseline.current = true;
-    setHydrationRevision(revision);
+    if (hydrated || !webSettings.data || webSettings.isFetching || (!isDesktop && status.isPending)) return;
+    setHydrated(true);
     setLanguage(webSettings.data.tvdbLanguage || "eng");
     setProvider(webSettings.data.renameLookupProvider || "TVDB");
     setTemplate(webSettings.data.renameTemplate || defaultRenameTemplate);
@@ -246,8 +243,7 @@ export function SettingsPage() {
     setThemeName(selectedTheme);
     const applied = applyWebTheme(selectedTheme);
     setThemeJson(JSON.stringify(applied, null, 2));
-    lastSavedFingerprint.current = settingsFingerprint(settingsRequestFromSaved(webSettings.data));
-  }, [isDesktop, status.data?.mediaRoot, webSettings.data]);
+  }, [hydrated, isDesktop, status.isPending, status.data?.mediaRoot, webSettings.data, webSettings.isFetching]);
 
   const pendingSettingsRequest: WebSettingsRequest = {
     tvdbApiKey: tvdbApiKey || undefined,
@@ -285,76 +281,33 @@ export function SettingsPage() {
       libraries: server.libraries
     }))
   };
-  const pendingSettingsFingerprint = settingsFingerprint(pendingSettingsRequest);
-
-  async function saveSettings(
-    request: WebSettingsRequest = pendingSettingsRequest,
-    automatic = false
-  ): Promise<WebSettings | null> {
-    try {
-      if (automatic) setSettingsStatus("Saving settings…");
-      const saved = await saveWebSettings(request);
-      lastSavedFingerprint.current = settingsFingerprint(request);
+  const flushSettings = useAutosave({
+    request: pendingSettingsRequest,
+    ready: hydrated,
+    delayMillis: autoSaveDelayMillis,
+    save: saveWebSettings,
+    onPending: () => setSettingsStatus("Changes pending..."),
+    onSaving: () => setSettingsStatus("Saving settings…"),
+    onSaved: (saved, latest) => {
+      const previous = queryClient.getQueryData<WebSettings>(["web-settings"]);
       queryClient.setQueryData(["web-settings"], saved);
       queryClient.setQueryData(["settings"], saved);
-
-      if (automatic) {
+      // Only what the server owns; the fields keep what is typed in them.
+      setMediaServers((current) => current.map((server) => {
+        const match = saved.mediaServers.find((item) => item.id === server.id);
+        return match ? { ...server, hasApiKey: match.hasApiKey } : server;
+      }));
+      const droppedKeys = saved.mediaServers.filter((server) =>
+        !server.hasApiKey && previous?.mediaServers.some((item) => item.id === server.id && item.hasApiKey));
+      if (droppedKeys.length > 0) {
+        setSettingsStatus(`Settings saved. The URL changed, so enter the API key for ${droppedKeys.map((server) => server.name).join(", ")} again.`);
+      } else if (latest) {
         setSettingsStatus("Settings saved automatically.");
-        status.refetch();
-        return saved;
       }
-
-      setTvdbApiKey("");
-      setTvdbPin("");
-      setTmdbApiKey("");
-      setAnidbClient("");
-      setSettingsStatus("Settings saved.");
-      webSettings.refetch();
-      setLanguage(saved.tvdbLanguage);
-      setProvider(saved.renameLookupProvider);
-      setTemplate(saved.renameTemplate);
-      setRenameTemplatesText(saved.renameTemplates.join("\n"));
-      setAudioNamePresetsText(saved.audioNamePresets.join("\n"));
-      setSubtitleNamePresetsText(saved.subtitleNamePresets.join("\n"));
-      setLanguagePresetsText(saved.languagePresets.join("\n"));
-      setIgnoredSubfoldersText(saved.ignoredScanFolderNames.join("\n"));
-      setMuxAudioDefaults(saved.mkvMergeDefaultAudioLanguages);
-      setMuxSubtitleDefaults(saved.mkvMergeDefaultSubtitleLanguages);
-      setMkvToolNixDirectory(saved.mkvToolNixDirectory ?? "");
-      setFfmpegDirectory(saved.ffmpegDirectory ?? "");
-      setDefaultDirectory(saved.defaultRoot ?? "");
-      setDefaultDirectoryName(saved.defaultRootName || "Home");
-      setLibraryRoots(saved.libraryRoots.filter((root) => !sameFolderPath(root.path, saved.defaultRoot ?? "")));
-      setWatchFoldersText(saved.watchFolders.join("\n"));
-      setLiveWatcherEnabled(saved.enableLiveWatchFolderMonitoring);
-      setMediaServers(saved.mediaServers.map((server) => ({ ...server, apiKey: "" })));
-      const themes = replaceCustomWebThemes(saved.customThemes);
-      setAvailableThemes(themes);
-      setThemeName(saved.selectedThemeName);
-      setThemeJson(JSON.stringify(applyWebTheme(saved.selectedThemeName), null, 2));
       status.refetch();
-      return saved;
-    } catch (error) {
-      setSettingsStatus(error instanceof Error ? error.message : "Settings could not be saved.");
-      return null;
-    }
-  }
-
-  useEffect(() => {
-    if (!webSettings.data || hydrationRevision !== hydrationTarget.current) return;
-    if (needsHydratedBaseline.current) {
-      // Compare edits against the populated, normalized form, not raw server data.
-      lastSavedFingerprint.current = pendingSettingsFingerprint;
-      needsHydratedBaseline.current = false;
-      return;
-    }
-    if (pendingSettingsFingerprint === lastSavedFingerprint.current) return;
-    setSettingsStatus("Changes pending...");
-    const timer = window.setTimeout(() => {
-      void saveSettings(pendingSettingsRequest, true);
-    }, autoSaveDelayMillis);
-    return () => window.clearTimeout(timer);
-  }, [pendingSettingsFingerprint, webSettings.data, hydrationRevision]);
+    },
+    onError: (error) => setSettingsStatus(error instanceof Error ? error.message : "Settings could not be saved.")
+  });
 
   function addMediaServer() {
     if (!newServerUrl.trim()) {
@@ -441,8 +394,9 @@ export function SettingsPage() {
 
   async function syncServer(server: EditableMediaServer) {
     setSettingsStatus(`Saving and syncing ${server.name}...`);
-    const saved = await saveSettings();
-    const savedServer = saved?.mediaServers.find((item) => item.id === server.id);
+    const saved = await flushSettings();
+    if (!saved) return;
+    const savedServer = saved.mediaServers.find((item) => item.id === server.id);
     if (!savedServer) {
       setSettingsStatus("Save the media server before syncing.");
       return;
@@ -450,7 +404,9 @@ export function SettingsPage() {
 
     try {
       const result = await syncMediaServerLibraries(savedServer.id);
-      setMediaServers((current) => current.map((item) => item.id === savedServer.id ? { ...result.server, apiKey: "" } : item));
+      setMediaServers((current) => current.map((item) => item.id === savedServer.id
+        ? { ...item, hasApiKey: result.server.hasApiKey, lastSyncedUtc: result.server.lastSyncedUtc, libraries: result.server.libraries }
+        : item));
       setSettingsStatus(result.status);
       webSettings.refetch();
       status.refetch();
@@ -992,7 +948,8 @@ export function SettingsPage() {
                             className="mt-1 h-9 w-full rounded-md border border-border bg-card px-3 text-sm text-text outline-none placeholder:text-subtle focus:border-accent"
                           />
                         </label>
-                        <label className="block min-w-0">
+                        <div className="min-w-0">
+                        <label className="block">
                           <span className="text-[0.6875rem] font-semibold text-muted">API key / token</span>
                           <input
                             value={server.apiKey ?? ""}
@@ -1002,6 +959,10 @@ export function SettingsPage() {
                             className="mt-1 h-9 w-full rounded-md border border-border bg-card px-3 text-sm text-text outline-none placeholder:text-subtle focus:border-accent"
                           />
                         </label>
+                        {server.hasApiKey && !server.apiKey && urlChanged(server, webSettings.data?.mediaServers) ? (
+                          <p className="mt-1 text-[0.6875rem] text-warning">A new URL needs the API key again; the saved one is removed when this saves.</p>
+                        ) : null}
+                        </div>
                         <div className="flex gap-2">
                           <button
                             type="button"
@@ -1531,41 +1492,6 @@ function moveItem<T>(items: T[], from: number, to: number): T[] {
   return reordered;
 }
 
-function settingsRequestFromSaved(settings: WebSettings): WebSettingsRequest {
-  return {
-    tvdbLanguage: settings.tvdbLanguage,
-    renameLookupProvider: settings.renameLookupProvider,
-    renameTemplate: settings.renameTemplate,
-    renameTemplates: settings.renameTemplates,
-    audioNamePresets: settings.audioNamePresets,
-    subtitleNamePresets: settings.subtitleNamePresets,
-    languagePresets: settings.languagePresets,
-    ignoredScanFolderNames: settings.ignoredScanFolderNames,
-    mkvMergeDefaultAudioLanguages: settings.mkvMergeDefaultAudioLanguages,
-    mkvMergeDefaultSubtitleLanguages: settings.mkvMergeDefaultSubtitleLanguages,
-    defaultRoot: settings.defaultRoot,
-    defaultRootName: settings.defaultRootName,
-    libraryRoots: settings.libraryRoots,
-    watchFolders: settings.watchFolders,
-    enableLiveWatchFolderMonitoring: settings.enableLiveWatchFolderMonitoring,
-    selectedThemeName: settings.selectedThemeName,
-    customThemes: settings.customThemes,
-    mediaServers: settings.mediaServers.map((server) => ({
-      id: server.id,
-      name: server.name,
-      type: server.type,
-      serverUrl: server.serverUrl,
-      isDefault: server.isDefault,
-      libraries: server.libraries
-    })),
-    mediaServerPathMappings: settings.mediaServerPathMappings
-  };
-}
-
-function settingsFingerprint(request: WebSettingsRequest): string {
-  return JSON.stringify(request);
-}
-
 function SettingsTabButton({ tab, active, onSelect }: { tab: SettingsTabDefinition; active: boolean; onSelect: (tab: SettingsTabId) => void }) {
   const Icon = tab.Icon;
   return (
@@ -1660,12 +1586,22 @@ function normalizeRenameTemplates(value: string, selectedTemplate: string) {
     });
 }
 
-function createLocalId() {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
+/** Whether the server's URL differs from the saved one; the backend then drops its key. */
+function urlChanged(server: EditableMediaServer, saved: WebMediaServer[] | undefined) {
+  const savedUrl = saved?.find((item) => item.id === server.id)?.serverUrl;
+  const normalize = (url: string) => url.trim().replace(/\/+$/, "").toLowerCase();
+  return savedUrl !== undefined && normalize(savedUrl) !== normalize(server.serverUrl);
+}
 
-  return `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+// Always a UUID: the backend replaces any other id, and Sync could then not find the server.
+// `randomUUID` needs a secure context, which plain HTTP to a LAN address is not.
+function createLocalId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function formatDateTime(value: string) {

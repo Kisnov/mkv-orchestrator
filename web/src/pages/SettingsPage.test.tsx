@@ -687,6 +687,170 @@ describe("Settings media servers", () => {
   });
 });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+describe("Settings autosave", () => {
+  /// The response to a save used to be poured back into every field, so
+  /// whatever was typed while it was in flight disappeared.
+  it("keeps what was typed while a save was in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred<WebSettings>();
+    const saveWebSettings = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementation((request) => Promise.resolve(settings({ tvdbLanguage: request.tvdbLanguage })));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings
+    });
+    await openProvidersTab(user);
+    const language = screen.getByLabelText("Metadata Language");
+
+    fireEvent.change(language, { target: { value: "jpn" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    fireEvent.change(language, { target: { value: "kor" } });
+    first.resolve(settings({ tvdbLanguage: "jpn" }));
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    expect(language).toHaveValue("kor");
+    expect(saveWebSettings.mock.calls[1][0].tvdbLanguage).toBe("kor");
+  });
+
+  it("never has two saves in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred<WebSettings>();
+    const saveWebSettings = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(settings());
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings
+    });
+    await openProvidersTab(user);
+    const language = screen.getByLabelText("Metadata Language");
+
+    fireEvent.change(language, { target: { value: "jpn" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    fireEvent.change(language, { target: { value: "kor" } });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(saveWebSettings).toHaveBeenCalledTimes(1);
+
+    first.resolve(settings({ tvdbLanguage: "jpn" }));
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2));
+    expect(saveWebSettings.mock.calls[1][0].tvdbLanguage).toBe("kor");
+  });
+});
+
+describe("Settings media server saves", () => {
+  /// The reload after a save blanked the key field, so a key still being
+  /// typed was cut off at whatever the first save had sent.
+  it("keeps a typed API key in its field after the save", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [mediaServer()] }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: false })] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const key = screen.getByLabelText("API key / token");
+
+    fireEvent.change(key, { target: { value: "new-key" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalled(), { timeout: 2500 });
+    await screen.findByText("Settings saved automatically.");
+
+    expect(key).toHaveValue("new-key");
+    expect(saveWebSettings.mock.calls[0][0].mediaServers[0].apiKey).toBe("new-key");
+  });
+
+  it("never sends a blank key", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [mediaServer()] }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "abc" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "" } });
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls[1][0].mediaServers[0]).not.toHaveProperty("apiKey", "");
+  });
+
+  /// The backend drops a stored key when the URL changes, so the form says so
+  /// before and after the save instead of leaving masking dots behind.
+  it("warns that a new URL needs the key again", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({
+      mediaServers: [mediaServer({ serverUrl: "http://other.local:8096", hasApiKey: false })]
+    }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+
+    fireEvent.change(screen.getByLabelText("Server URL"), { target: { value: "http://other.local:8096" } });
+    expect(screen.getByText(/a new url needs the api key again/i)).toBeInTheDocument();
+
+    expect(await screen.findByText(/enter the api key for home again/i, undefined, { timeout: 2500 })).toBeInTheDocument();
+    expect(screen.getByLabelText("API key / token")).toHaveAttribute("placeholder", "API key or token");
+  });
+
+  /// Without `crypto.randomUUID` (plain HTTP on a LAN address) the new server
+  /// got an id the backend replaced, so Sync could not find it after saving.
+  it("syncs a server added where crypto.randomUUID is missing", async () => {
+    const user = userEvent.setup();
+    const realCrypto = globalThis.crypto;
+    vi.stubGlobal("crypto", { getRandomValues: realCrypto.getRandomValues.bind(realCrypto) });
+    try {
+      const saveWebSettings = vi.fn().mockImplementation((request) => Promise.resolve(settings({
+        mediaServers: request.mediaServers.map((server: { id: string }) => mediaServer({
+          id: uuidPattern.test(server.id) ? server.id : "0198c1d2-0000-7000-8000-0000000000ff"
+        }))
+      })));
+      const syncMediaServerLibraries = vi.fn((id: string) => Promise.resolve({
+        server: mediaServer({ id }),
+        libraries: [],
+        status: "Sync complete for Home: 0 library path(s)."
+      }));
+      renderWithBackend(<SettingsPage />, {
+        getStatus: () => Promise.resolve(status),
+        getWebSettings: () => Promise.resolve(settings()),
+        saveWebSettings,
+        syncMediaServerLibraries
+      });
+      await user.click(await screen.findByRole("button", { name: /^library$/i }));
+      await user.click(screen.getByRole("button", { name: "Add server" }));
+      await user.clear(screen.getByLabelText("Name"));
+      await user.type(screen.getByLabelText("Name"), "Home");
+      fireEvent.change(screen.getByLabelText("Server URL"), { target: { value: "http://jellyfin.local:8096" } });
+      await user.click(screen.getByRole("button", { name: "Add Server" }));
+      await user.click(screen.getByRole("button", { name: "Sync libraries for Home" }));
+
+      await waitFor(() => expect(syncMediaServerLibraries).toHaveBeenCalled());
+      expect(syncMediaServerLibraries.mock.calls[0][0]).toMatch(uuidPattern);
+      expect(syncMediaServerLibraries.mock.calls[0][0]).toBe(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].id);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("Settings attribution", () => {
   /// TMDB's API terms require this notice. The Avalonia About tab carried it;
   /// when that UI was deleted this became the only place it can appear.
