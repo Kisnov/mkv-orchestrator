@@ -75,11 +75,36 @@ impl MkvoRuntime {
                     selection.subtitle_path
                 )));
             }
-            if !subtitle_path.is_absolute() {
+            if !subtitle_path.is_absolute()
+                || subtitle_path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            {
                 return Err(RuntimeError::invalid(format!(
-                    "Manual subtitle path must be absolute: {}",
+                    "Manual subtitle path must be absolute, without '..': {}",
                     selection.subtitle_path
                 )));
+            }
+            // It is muxed into the library and may be deleted afterwards, like any source;
+            // the desktop user may pick one anywhere on their own machine.
+            let confined = self.config().browse_scope != crate::BrowseScope::Unrestricted;
+            let outside = || {
+                RuntimeError::new(
+                    mkvo_contracts::ApiErrorCode::UnauthorizedPath,
+                    format!(
+                        "Manual subtitle is outside the authorized roots: {}",
+                        selection.subtitle_path
+                    ),
+                )
+            };
+            // Checked before the disk is touched, so nothing outside the roots is probed.
+            if confined
+                && !self
+                    .authorized_root_paths()
+                    .iter()
+                    .any(|root| mkvo_application::path_contains(root, &subtitle_path))
+            {
+                return Err(outside());
             }
             if !tokio::fs::metadata(&subtitle_path)
                 .await
@@ -90,9 +115,8 @@ impl MkvoRuntime {
                     selection.subtitle_path
                 )));
             }
-            // It is muxed into the library and may be deleted afterwards, like any source;
-            // the desktop user may pick one anywhere on their own machine.
-            if self.config().browse_scope != crate::BrowseScope::Unrestricted
+            // A symlink inside a root can still lead outside it.
+            if confined
                 && self
                     .dependencies()
                     .paths
@@ -100,13 +124,7 @@ impl MkvoRuntime {
                     .await
                     .is_err()
             {
-                return Err(RuntimeError::new(
-                    mkvo_contracts::ApiErrorCode::UnauthorizedPath,
-                    format!(
-                        "Manual subtitle is outside the authorized roots: {}",
-                        selection.subtitle_path
-                    ),
-                ));
+                return Err(outside());
             }
             let subtitle_key = path_key(&subtitle_path.to_string_lossy());
             manual_subtitle_paths.insert(subtitle_key.clone());
@@ -2466,12 +2484,36 @@ pub(super) mod execution_tests {
             .expect_err("outside the roots");
         assert_eq!(error.code, mkvo_contracts::ApiErrorCode::UnauthorizedPath);
         assert!(foreign.exists());
+        // Outside the roots the answer must not depend on whether the file exists.
         let error = library
             .runtime
-            .build_mux_preview(preview("episode.srt"))
+            .build_mux_preview(preview(
+                &outside.path().join("missing.srt").to_string_lossy(),
+            ))
             .await
-            .expect_err("relative");
-        assert_eq!(error.code, mkvo_contracts::ApiErrorCode::InvalidRequest);
+            .expect_err("missing outside the roots");
+        assert_eq!(error.code, mkvo_contracts::ApiErrorCode::UnauthorizedPath);
+        let escaping = library
+            .directory
+            .path()
+            .join("..")
+            .join(outside.path().file_name().expect("name"))
+            .join("secrets.srt");
+        for relative in [
+            "episode.srt".to_owned(),
+            escaping.to_string_lossy().into_owned(),
+        ] {
+            let error = library
+                .runtime
+                .build_mux_preview(preview(&relative))
+                .await
+                .expect_err("relative");
+            assert_eq!(
+                error.code,
+                mkvo_contracts::ApiErrorCode::InvalidRequest,
+                "{relative}"
+            );
+        }
         let error = library
             .runtime
             .build_mux_preview(preview(
