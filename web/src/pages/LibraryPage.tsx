@@ -675,10 +675,10 @@ export function buildLibraryTitles(rows: LibraryAuditRow[], catalogItems: Librar
     current.fileCount += row.fileCount;
     current.mismatchFileCount += row.issueFilePaths.length;
     current.hasIssues ||= row.hasIssues;
-    current.allFilePaths = uniquePaths([...current.allFilePaths, ...row.allFilePaths]);
+    current.allFilePaths.push(...row.allFilePaths);
     grouped.set(key, current);
   }
-  return [...grouped.values()].map((title) => ({ ...title, seasons: [...title.seasons].sort((left, right) => seasonLabel(left).localeCompare(seasonLabel(right), undefined, { numeric: true })) })).sort((left, right) => left.title.localeCompare(right.title, undefined, { numeric: true }));
+  return [...grouped.values()].map((title) => ({ ...title, allFilePaths: uniquePaths(title.allFilePaths), seasons: [...title.seasons].sort((left, right) => seasonLabel(left).localeCompare(seasonLabel(right), undefined, { numeric: true })) })).sort((left, right) => left.title.localeCompare(right.title, undefined, { numeric: true }));
 }
 
 function auditTitle(row: LibraryAuditRow) {

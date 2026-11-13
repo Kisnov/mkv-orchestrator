@@ -86,6 +86,15 @@ describe("Library title aggregation", () => {
     expect(titles[0].catalogItem?.id).toBe("series-1");
   });
 
+  it("lists each file of a title once across all its seasons", () => {
+    const seasons = Array.from({ length: 300 }, (_, index) => ({ ...auditRow(index + 1, false), allFilePaths: ["/media/tv/Example Show/shared.mkv", `/media/tv/Example Show/${index}.mkv`] }));
+
+    const [title] = buildLibraryTitles(seasons, []);
+
+    expect(title.allFilePaths).toHaveLength(301);
+    expect(title.allFilePaths[0]).toBe("/media/tv/Example Show/shared.mkv");
+  });
+
   it("combines audit groups whose folder labels include the series and season", () => {
     const season1 = {
       ...auditRow(1, false),
