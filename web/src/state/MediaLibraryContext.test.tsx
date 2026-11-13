@@ -1,8 +1,9 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 
-import { MediaLibraryProvider, useMediaLibrary } from "./MediaLibraryContext";
+import { MediaLibraryProvider, MediaLibrarySynchronizer, useMediaLibrary } from "./MediaLibraryContext";
 import { createMockBackendClient } from "../backend/mockClient";
 import { setBackendClient } from "../backend/runtime";
 import type { MediaFileRow } from "../api";
@@ -59,6 +60,45 @@ describe("working set persistence", () => {
 
     // A fresh provider stands in for the reloaded page.
     const second = library();
+    expect(second.result.current.selectedPaths).toEqual(["/media/b.mkv"]);
+  });
+
+  /// The file list used to be written to sessionStorage on every change: the
+  /// whole library, serialized again for each checkbox. The backend holds it.
+  it("restores the files after a reload from the backend, not from the tab", async () => {
+    const scanned = [file("/media/a.mkv"), file("/media/b.mkv")];
+    setBackendClient(
+      createMockBackendClient({
+        getCurrentScanFiles: () => Promise.resolve({
+          updatedUtc: "2026-11-13T10:00:00Z",
+          files: scanned,
+          selectedPaths: ["/media/b.mkv"],
+          summary: { ...emptySummary, total: 2, mkv: 2 }
+        })
+      })
+    );
+    // A fresh page: its own query cache, provider and synchronizer.
+    const page = () => {
+      const queryClient = new QueryClient();
+      return renderHook(() => useMediaLibrary(), {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={queryClient}>
+            <MediaLibraryProvider>
+              <MediaLibrarySynchronizer />
+              {children}
+            </MediaLibraryProvider>
+          </QueryClientProvider>
+        )
+      });
+    };
+
+    const first = page();
+    await waitFor(() => expect(first.result.current.files).toEqual(scanned));
+    expect(JSON.stringify({ ...sessionStorage })).not.toContain("fileName");
+    first.unmount();
+
+    const second = page();
+    await waitFor(() => expect(second.result.current.files).toEqual(scanned));
     expect(second.result.current.selectedPaths).toEqual(["/media/b.mkv"]);
   });
 

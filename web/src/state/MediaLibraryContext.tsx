@@ -40,7 +40,6 @@ type MediaLibraryContextValue = {
 };
 
 const MediaLibraryContext = createContext<MediaLibraryContextValue | null>(null);
-const storageKey = "mkvo.web.scannedFiles";
 const templateStorageKey = "mkvo.web.templateFilePath";
 // Selection outlives the tab: it is a deliberate user action, and losing it
 // after a restart means re-picking files across a large library.
@@ -81,9 +80,9 @@ function isPathWithinSource(filePath: string, sourcePath: string): boolean {
  * to the authoritative answer anyway.
  */
 export function MediaLibraryProvider({ children }: { children: ReactNode }) {
-  const [files, setFilesState] = useState<MediaFileRow[]>(() =>
-    readStored<MediaFileRow[]>(sessionStorage, storageKey, [])
-  );
+  // Only paths are kept in the tab. The files come back from the backend
+  // working set, which MediaLibrarySynchronizer reads on every load.
+  const [files, setFilesState] = useState<MediaFileRow[]>([]);
   const [selectedPaths, setSelectedPathsState] = useState<string[]>(() =>
     readStored<string[]>(localStorage, selectionStorageKey, [])
   );
@@ -107,7 +106,6 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   });
 
-  useEffect(() => write(sessionStorage, storageKey, files), [files]);
   useEffect(() => write(localStorage, selectionStorageKey, selectedPaths), [selectedPaths]);
 
   useEffect(() => {
@@ -177,7 +175,6 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     setTemplateFilePath("");
     setSelectionError(null);
     try {
-      sessionStorage.removeItem(storageKey);
       sessionStorage.removeItem(templateStorageKey);
       localStorage.removeItem(selectionStorageKey);
     } catch {
