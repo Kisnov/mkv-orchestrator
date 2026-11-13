@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { AlertTriangle, CheckCircle2, Film, RefreshCw, Search, X } from "lucide-react";
@@ -315,6 +315,11 @@ export function LibraryPage() {
   const credentialMessage = (isCredentialError(catalog.error) ? catalog.error.message : undefined)
     ?? (selectedServerId ? rejectedPosterServers[selectedServerId] : undefined);
 
+  const openPosterMenu = useCallback((event: React.MouseEvent<HTMLButtonElement>, titleId: string) => {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY, titleId });
+  }, []);
+
   // An <img> cannot say why it failed, so the first failure per server asks once.
   const reportServerPosterError = useCallback((serverId: string, itemId: string, error?: unknown) => {
     const remember = (reason: unknown) => {
@@ -506,10 +511,7 @@ export function LibraryPage() {
               {displayedTitles.map((title) => {
                 const serverPoster = Boolean(selectedServerId && title.catalogItem?.hasPoster && !credentialMessage);
                 const posterUrl = serverPoster ? libraryArtworkUrl({ serverId: selectedServerId!, itemId: title.catalogItem!.id }, artworkGeneration) : undefined;
-                return <LibraryPosterCard key={title.id} title={title} serverId={selectedServerId} posterUrl={posterUrl} inlineServerPoster={serverPoster && posterUrl === undefined} artworkGeneration={artworkGeneration} onServerPosterError={reportServerPosterError} onOpen={() => setSelectedTitleId(title.id)} onContextMenu={(event) => {
-                  event.preventDefault();
-                  setContextMenu({ x: event.clientX, y: event.clientY, titleId: title.id });
-                }} />;
+                return <LibraryPosterCard key={title.id} title={title} serverId={selectedServerId} posterUrl={posterUrl} inlineServerPoster={serverPoster && posterUrl === undefined} artworkGeneration={artworkGeneration} onServerPosterError={reportServerPosterError} onOpen={setSelectedTitleId} onContextMenu={openPosterMenu} />;
               })}
             </div>
           ) : (
@@ -553,12 +555,14 @@ type PosterCardProps = {
   /** Ask for the media-server poster inline, where there is no image URL (desktop). */
   inlineServerPoster: boolean;
   artworkGeneration: number;
-  onOpen: () => void;
-  onContextMenu: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  onOpen: (titleId: string) => void;
+  onContextMenu: (event: React.MouseEvent<HTMLButtonElement>, titleId: string) => void;
   onServerPosterError: (serverId: string, itemId: string, error?: unknown) => void;
 };
 
-function LibraryPosterCard({ title, serverId, posterUrl, inlineServerPoster, artworkGeneration, onOpen, onContextMenu, onServerPosterError }: PosterCardProps) {
+// Memoised so progress text and filter typing do not repaint every card; off-screen
+// cards skip rendering, and the padding keeps the hover lift and ring inside their paint box.
+const LibraryPosterCard = memo(function LibraryPosterCard({ title, serverId, posterUrl, inlineServerPoster, artworkGeneration, onOpen, onContextMenu, onServerPosterError }: PosterCardProps) {
   const [card, seen] = useSeenOnScreen<HTMLButtonElement>();
   const [posterFailed, setPosterFailed] = useState(false);
   const serverPoster = posterUrl && !posterFailed ? posterUrl : "";
@@ -586,7 +590,7 @@ function LibraryPosterCard({ title, serverId, posterUrl, inlineServerPoster, art
     }
     : undefined;
   return (
-    <button ref={card} type="button" onClick={onOpen} onContextMenu={onContextMenu} className="group min-w-0 select-none text-left" title={title.title} aria-label={`Open ${title.title} library details`}>
+    <button ref={card} type="button" onClick={() => onOpen(title.id)} onContextMenu={(event) => onContextMenu(event, title.id)} className="group -m-1 min-w-0 select-none p-1 text-left [contain-intrinsic-size:auto_9.875rem_auto_18.5rem] [content-visibility:auto]" title={title.title} aria-label={`Open ${title.title} library details`}>
       <div className="relative aspect-[2/3] overflow-hidden rounded-xl bg-[#64748B] ring-1 ring-border transition duration-150 group-hover:-translate-y-1 group-hover:ring-2 group-hover:ring-accent group-focus-visible:ring-2 group-focus-visible:ring-accent">
         {imageUrl ? <img src={imageUrl} alt={`${title.title} poster`} loading="lazy" onError={onImageError} className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center bg-[#64748B] px-4 text-center text-xs font-bold uppercase tracking-wider text-white"><div><Film size={34} className="mx-auto mb-3 opacity-80" />No poster found</div></div>}
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-2 pb-2 pt-10">
@@ -596,7 +600,7 @@ function LibraryPosterCard({ title, serverId, posterUrl, inlineServerPoster, art
       <div className="mt-2 px-0.5"><div className="truncate text-sm font-semibold text-text">{title.title}</div><div className="mt-0.5 truncate text-xs text-subtle">{title.catalogItem?.year ? `${title.catalogItem.year} · ` : ""}{title.seasons.length} season{title.seasons.length === 1 ? "" : "s"} · {title.fileCount} files</div></div>
     </button>
   );
-}
+});
 
 function LibraryPosterContextMenu({ x, y, title, disabled, onRebuild }: { x: number; y: number; title: LibraryTitle | null; disabled: boolean; onRebuild: (title: LibraryTitle) => void }) {
   if (!title) return null;
