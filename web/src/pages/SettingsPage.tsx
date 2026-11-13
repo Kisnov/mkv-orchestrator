@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -32,11 +32,12 @@ import {
 import type { SourceRoot, WebMediaServer, WebSettings, WebSettingsRequest } from "../api";
 import { FileBrowser } from "../components/FileBrowser";
 import SecuritySection from "../components/SecuritySection";
+import { useAutosave } from "../lib/useAutosave";
 import ffmpegLogo from "../assets/logos/ffmpeg.png";
 import mkvtoolnixLogo from "../assets/logos/mkvtoolnix.png";
 import tmdbLogo from "../assets/logos/tmdb.png";
 import tvdbLogo from "../assets/logos/tvdb.png";
-import { applyWebTheme, getAllWebThemes, getStoredWebThemeName, getWebTheme, loadCustomWebThemes, normalizeWebTheme, removeCustomWebTheme, replaceCustomWebThemes, saveCustomWebTheme, webThemes } from "../theme";
+import { applyWebTheme, getAllWebThemes, getStoredWebThemeName, getWebTheme, normalizeWebTheme, removeCustomWebTheme, replaceCustomWebThemes, saveCustomWebTheme, webThemes } from "../theme";
 
 const settingsTabStorageKey = "mkvo.web.settingsTab";
 const defaultRenameTemplate = "{series} - S{season:00}E{episode:00} - {episodeTitle}";
@@ -98,6 +99,14 @@ type EditableMediaServer = WebMediaServer & {
   apiKey?: string;
 };
 
+// A stable React key per row, so removing or moving one never hands its inputs to another.
+type EditableRoot = SourceRoot & { key: string };
+
+let nextRootKey = 0;
+function editableRoot(root: SourceRoot): EditableRoot {
+  return { ...root, key: `root-${nextRootKey++}` };
+}
+
 const themeColorOptions = [
   { name: "Accent", label: "Accent", cssVariable: "--color-accent" },
   { name: "AccentHover", label: "Accent hover", cssVariable: "--color-accent-hover" },
@@ -133,7 +142,8 @@ export function SettingsPage() {
   const webSettings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
-  const activeTab: SettingsTabId = requestedTab && isSettingsTab(requestedTab) ? requestedTab : readStoredSettingsTab();
+  const [storedTab] = useState(readStoredSettingsTab);
+  const activeTab: SettingsTabId = requestedTab && isSettingsTab(requestedTab) ? requestedTab : storedTab;
   function setActiveTab(tab: SettingsTabId) {
     setSearchParams((current) => { const next = new URLSearchParams(current); next.set("tab", tab); return next; });
   }
@@ -166,7 +176,7 @@ export function SettingsPage() {
   const [muxSubtitleDefaults, setMuxSubtitleDefaults] = useState("eng");
   const [mkvToolNixDirectory, setMkvToolNixDirectory] = useState("");
   const [ffmpegDirectory, setFfmpegDirectory] = useState("");
-  const [libraryRoots, setLibraryRoots] = useState<SourceRoot[]>([]);
+  const [libraryRoots, setLibraryRoots] = useState<EditableRoot[]>([]);
   const [defaultDirectory, setDefaultDirectory] = useState("");
   const [defaultDirectoryName, setDefaultDirectoryName] = useState("Home");
   // Which row the browser is filling in, so one dialog serves every row.
@@ -176,6 +186,7 @@ export function SettingsPage() {
   const [mediaServers, setMediaServers] = useState<EditableMediaServer[]>([]);
   const [addingServer, setAddingServer] = useState(false);
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
+  const [editingUrlId, setEditingUrlId] = useState<string | null>(null);
   const [newServerName, setNewServerName] = useState("Media Server");
   const [newServerType, setNewServerType] = useState("Emby");
   const [newServerUrl, setNewServerUrl] = useState("");
@@ -185,13 +196,14 @@ export function SettingsPage() {
   const [themeName, setThemeName] = useState(() => getStoredWebThemeName());
   const [themeJson, setThemeJson] = useState(() => JSON.stringify(getWebTheme(getStoredWebThemeName()), null, 2));
   const [selectedThemeColor, setSelectedThemeColor] = useState<ThemeColorName>("AppTitle");
+  const currentThemeColors = useMemo(
+    () => normalizeWebTheme(availableThemes.find((theme) => theme.name === themeName) ?? webThemes[0]).colors,
+    [availableThemes, themeName]
+  );
   const [customThemeName, setCustomThemeName] = useState("My Theme");
   const [settingsStatus, setSettingsStatus] = useState("");
   const [statusPopupVisible, setStatusPopupVisible] = useState(false);
-  const lastSavedFingerprint = useRef("");
-  const [hydrationRevision, setHydrationRevision] = useState<object | null>(null);
-  const hydrationTarget = useRef<object | null>(null);
-  const needsHydratedBaseline = useRef(false);
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     setStatusPopupVisible(Boolean(settingsStatus));
@@ -209,12 +221,11 @@ export function SettingsPage() {
     }
   }, [activeTab, requestedTab, setSearchParams]);
 
+  // Fill the form once, from the first settled load. Later responses (a save, a
+  // refetch) would overwrite whatever is being typed.
   useEffect(() => {
-    if (!webSettings.data) return;
-    const revision = {};
-    hydrationTarget.current = revision;
-    needsHydratedBaseline.current = true;
-    setHydrationRevision(revision);
+    if (hydrated || !webSettings.data || webSettings.isFetching || (!isDesktop && status.isPending)) return;
+    setHydrated(true);
     setLanguage(webSettings.data.tvdbLanguage || "eng");
     setProvider(webSettings.data.renameLookupProvider || "TVDB");
     setTemplate(webSettings.data.renameTemplate || defaultRenameTemplate);
@@ -236,7 +247,7 @@ export function SettingsPage() {
       : loadedRoots[0]?.name || webSettings.data.defaultRootName;
     setDefaultDirectory(loadedHome);
     setDefaultDirectoryName(loadedHomeName || "Home");
-    setLibraryRoots(loadedRoots.filter((root) => !sameFolderPath(root.path, loadedHome)));
+    setLibraryRoots(loadedRoots.filter((root) => !sameFolderPath(root.path, loadedHome)).map(editableRoot));
     setWatchFoldersText((webSettings.data.watchFolders ?? []).join("\n"));
     setLiveWatcherEnabled(Boolean(webSettings.data.enableLiveWatchFolderMonitoring));
     setMediaServers((webSettings.data.mediaServers ?? []).map((server) => ({ ...server, apiKey: "" })));
@@ -246,8 +257,15 @@ export function SettingsPage() {
     setThemeName(selectedTheme);
     const applied = applyWebTheme(selectedTheme);
     setThemeJson(JSON.stringify(applied, null, 2));
-    lastSavedFingerprint.current = settingsFingerprint(settingsRequestFromSaved(webSettings.data));
-  }, [isDesktop, status.data?.mediaRoot, webSettings.data]);
+  }, [hydrated, isDesktop, status.isPending, status.data?.mediaRoot, webSettings.data, webSettings.isFetching]);
+
+  // The backend drops a stored key for any other URL, and a URL being typed passes
+  // through valid ones. So while its field has focus, a server with a stored key and
+  // no typed key keeps saving its saved URL; the new one goes out when the field is left.
+  function heldServerUrl(server: EditableMediaServer) {
+    if (editingUrlId !== server.id || !server.hasApiKey || server.apiKey) return undefined;
+    return webSettings.data?.mediaServers.find((item) => item.id === server.id)?.serverUrl;
+  }
 
   const pendingSettingsRequest: WebSettingsRequest = {
     tvdbApiKey: tvdbApiKey || undefined,
@@ -274,87 +292,55 @@ export function SettingsPage() {
     watchFolders: normalizeLineList(watchFoldersText),
     enableLiveWatchFolderMonitoring: liveWatcherEnabled,
     selectedThemeName: themeName,
-    customThemes: loadCustomWebThemes(),
+    customThemes: availableThemes.filter((theme) => !webThemes.includes(theme)),
     mediaServers: mediaServers.map((server) => ({
       id: server.id,
       name: server.name,
       type: server.type,
-      serverUrl: server.serverUrl,
+      serverUrl: heldServerUrl(server) ?? server.serverUrl,
       apiKey: server.apiKey || undefined,
       isDefault: server.isDefault,
       libraries: server.libraries
     }))
   };
-  const pendingSettingsFingerprint = settingsFingerprint(pendingSettingsRequest);
-
-  async function saveSettings(
-    request: WebSettingsRequest = pendingSettingsRequest,
-    automatic = false
-  ): Promise<WebSettings | null> {
-    try {
-      if (automatic) setSettingsStatus("Saving settings…");
-      const saved = await saveWebSettings(request);
-      lastSavedFingerprint.current = settingsFingerprint(request);
+  const flushSettings = useAutosave({
+    request: pendingSettingsRequest,
+    ready: hydrated,
+    delayMillis: autoSaveDelayMillis,
+    save: saveWebSettings,
+    onPending: () => setSettingsStatus("Changes pending..."),
+    onSaving: () => setSettingsStatus("Saving settings…"),
+    onSaved: (saved, latest, sent) => {
+      const previous = queryClient.getQueryData<WebSettings>(["web-settings"]);
       queryClient.setQueryData(["web-settings"], saved);
       queryClient.setQueryData(["settings"], saved);
-
-      if (automatic) {
+      // Only what the server owns, plus each key it now stores: a key left in its
+      // field would be sent again with every save, also to a URL changed later.
+      // A field edited since the request went out is left alone.
+      const clearIfStored = (isStored: boolean, sentValue: string | null | undefined) =>
+        (current: string) => isStored && sentValue && current === sentValue ? "" : current;
+      setTvdbApiKey(clearIfStored(saved.hasTvdbApiKey, sent.tvdbApiKey));
+      setTvdbPin(clearIfStored(saved.hasTvdbPin, sent.tvdbPin));
+      setTmdbApiKey(clearIfStored(saved.hasTmdbApiKey, sent.tmdbApiKey));
+      setAnidbClient(clearIfStored(saved.hasAnidbClient, sent.anidbClient));
+      setMediaServers((current) => current.map((server) => {
+        const match = saved.mediaServers.find((item) => item.id === server.id);
+        const sentKey = sent.mediaServers?.find((item) => item.id === server.id)?.apiKey;
+        return match
+          ? { ...server, hasApiKey: match.hasApiKey, apiKey: clearIfStored(match.hasApiKey, sentKey)(server.apiKey ?? "") }
+          : server;
+      }));
+      const droppedKeys = saved.mediaServers.filter((server) =>
+        !server.hasApiKey && previous?.mediaServers.some((item) => item.id === server.id && item.hasApiKey));
+      if (droppedKeys.length > 0) {
+        setSettingsStatus(`Settings saved. The URL changed, so enter the API key for ${droppedKeys.map((server) => server.name).join(", ")} again.`);
+      } else if (latest) {
         setSettingsStatus("Settings saved automatically.");
-        status.refetch();
-        return saved;
       }
-
-      setTvdbApiKey("");
-      setTvdbPin("");
-      setTmdbApiKey("");
-      setAnidbClient("");
-      setSettingsStatus("Settings saved.");
-      webSettings.refetch();
-      setLanguage(saved.tvdbLanguage);
-      setProvider(saved.renameLookupProvider);
-      setTemplate(saved.renameTemplate);
-      setRenameTemplatesText(saved.renameTemplates.join("\n"));
-      setAudioNamePresetsText(saved.audioNamePresets.join("\n"));
-      setSubtitleNamePresetsText(saved.subtitleNamePresets.join("\n"));
-      setLanguagePresetsText(saved.languagePresets.join("\n"));
-      setIgnoredSubfoldersText(saved.ignoredScanFolderNames.join("\n"));
-      setMuxAudioDefaults(saved.mkvMergeDefaultAudioLanguages);
-      setMuxSubtitleDefaults(saved.mkvMergeDefaultSubtitleLanguages);
-      setMkvToolNixDirectory(saved.mkvToolNixDirectory ?? "");
-      setFfmpegDirectory(saved.ffmpegDirectory ?? "");
-      setDefaultDirectory(saved.defaultRoot ?? "");
-      setDefaultDirectoryName(saved.defaultRootName || "Home");
-      setLibraryRoots(saved.libraryRoots.filter((root) => !sameFolderPath(root.path, saved.defaultRoot ?? "")));
-      setWatchFoldersText(saved.watchFolders.join("\n"));
-      setLiveWatcherEnabled(saved.enableLiveWatchFolderMonitoring);
-      setMediaServers(saved.mediaServers.map((server) => ({ ...server, apiKey: "" })));
-      const themes = replaceCustomWebThemes(saved.customThemes);
-      setAvailableThemes(themes);
-      setThemeName(saved.selectedThemeName);
-      setThemeJson(JSON.stringify(applyWebTheme(saved.selectedThemeName), null, 2));
       status.refetch();
-      return saved;
-    } catch (error) {
-      setSettingsStatus(error instanceof Error ? error.message : "Settings could not be saved.");
-      return null;
-    }
-  }
-
-  useEffect(() => {
-    if (!webSettings.data || hydrationRevision !== hydrationTarget.current) return;
-    if (needsHydratedBaseline.current) {
-      // Compare edits against the populated, normalized form, not raw server data.
-      lastSavedFingerprint.current = pendingSettingsFingerprint;
-      needsHydratedBaseline.current = false;
-      return;
-    }
-    if (pendingSettingsFingerprint === lastSavedFingerprint.current) return;
-    setSettingsStatus("Changes pending...");
-    const timer = window.setTimeout(() => {
-      void saveSettings(pendingSettingsRequest, true);
-    }, autoSaveDelayMillis);
-    return () => window.clearTimeout(timer);
-  }, [pendingSettingsFingerprint, webSettings.data, hydrationRevision]);
+    },
+    onError: (error) => setSettingsStatus(error instanceof Error ? error.message : "Settings could not be saved.")
+  });
 
   function addMediaServer() {
     if (!newServerUrl.trim()) {
@@ -441,8 +427,9 @@ export function SettingsPage() {
 
   async function syncServer(server: EditableMediaServer) {
     setSettingsStatus(`Saving and syncing ${server.name}...`);
-    const saved = await saveSettings();
-    const savedServer = saved?.mediaServers.find((item) => item.id === server.id);
+    const saved = await flushSettings();
+    if (!saved) return;
+    const savedServer = saved.mediaServers.find((item) => item.id === server.id);
     if (!savedServer) {
       setSettingsStatus("Save the media server before syncing.");
       return;
@@ -450,7 +437,9 @@ export function SettingsPage() {
 
     try {
       const result = await syncMediaServerLibraries(savedServer.id);
-      setMediaServers((current) => current.map((item) => item.id === savedServer.id ? { ...result.server, apiKey: "" } : item));
+      setMediaServers((current) => current.map((item) => item.id === savedServer.id
+        ? { ...item, hasApiKey: result.server.hasApiKey, lastSyncedUtc: result.server.lastSyncedUtc, libraries: result.server.libraries }
+        : item));
       setSettingsStatus(result.status);
       webSettings.refetch();
       status.refetch();
@@ -599,7 +588,7 @@ export function SettingsPage() {
                     ) : null}
 
                     {libraryRoots.map((root, index) => (
-                      <div key={index} className="grid items-center gap-2 sm:grid-cols-[7rem_minmax(10rem,1fr)_auto_auto_auto_auto]">
+                      <div key={root.key} className="grid items-center gap-2 sm:grid-cols-[7rem_minmax(10rem,1fr)_auto_auto_auto_auto]">
                         <input
                           value={root.name}
                           onChange={(event) =>
@@ -677,7 +666,7 @@ export function SettingsPage() {
 
                     <button
                       type="button"
-                      onClick={() => setLibraryRoots((current) => [...current, { name: "", path: "" }])}
+                      onClick={() => setLibraryRoots((current) => [...current, editableRoot({ name: "", path: "" })])}
                       className="mt-2 h-9 self-start rounded-md border border-border bg-button px-3 text-xs font-semibold text-muted transition hover:bg-button-hover hover:text-text"
                     >
                       Add folder
@@ -934,7 +923,9 @@ export function SettingsPage() {
 
           {activeTab === "library" ? (
             <div className="grid min-w-0 grid-cols-1 gap-3">
-              <SettingsCard title="Media Servers" description="Connect Emby, Jellyfin, or Plex. API keys and tokens are encrypted before they are stored." compactHeader actions={
+              <SettingsCard title="Media Servers" description={isDesktop
+                ? "Connect Emby, Jellyfin, or Plex. API keys and tokens are kept in the system credential store, or in a file in the app's configuration folder when there is none."
+                : "Connect Emby, Jellyfin, or Plex. API keys and tokens are stored unencrypted in secrets.json in the configuration folder, readable only by the server's user."} compactHeader actions={
                 <button type="button" aria-expanded={addingServer} aria-controls="add-media-server" onClick={() => setAddingServer(!addingServer)} className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-button px-4 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">
                   {addingServer ? <X size={16} /> : <Plus size={16} />}{addingServer ? "Cancel" : "Add server"}
                 </button>
@@ -988,11 +979,14 @@ export function SettingsPage() {
                           <input
                             value={server.serverUrl}
                             onChange={(event) => updateMediaServer(server.id, { serverUrl: event.target.value })}
+                            onFocus={() => setEditingUrlId(server.id)}
+                            onBlur={() => setEditingUrlId(null)}
                             placeholder="http://localhost:8096"
                             className="mt-1 h-9 w-full rounded-md border border-border bg-card px-3 text-sm text-text outline-none placeholder:text-subtle focus:border-accent"
                           />
                         </label>
-                        <label className="block min-w-0">
+                        <div className="min-w-0">
+                        <label className="block">
                           <span className="text-[0.6875rem] font-semibold text-muted">API key / token</span>
                           <input
                             value={server.apiKey ?? ""}
@@ -1002,6 +996,10 @@ export function SettingsPage() {
                             className="mt-1 h-9 w-full rounded-md border border-border bg-card px-3 text-sm text-text outline-none placeholder:text-subtle focus:border-accent"
                           />
                         </label>
+                        {server.hasApiKey && !server.apiKey && urlChanged(server, webSettings.data?.mediaServers) ? (
+                          <p className="mt-1 text-[0.6875rem] text-warning">A new URL needs the API key again: leaving the URL field saves it and removes the saved key.</p>
+                        ) : null}
+                        </div>
                         <div className="flex gap-2">
                           <button
                             type="button"
@@ -1211,7 +1209,7 @@ export function SettingsPage() {
                     <ThemeColorSelect
                       value={selectedThemeColor}
                       onChange={setSelectedThemeColor}
-                      colorFor={(name) => themeColorValue(themeJson, name, getWebTheme(themeName).colors[name] ?? "#000000")}
+                      colorFor={(name) => themeColorValue(themeJson, name, currentThemeColors[name] ?? "#000000")}
                     />
                   </label>
                   <ThemeColorField
@@ -1219,7 +1217,7 @@ export function SettingsPage() {
                     value={themeColorValue(
                       themeJson,
                       selectedThemeColor,
-                      getWebTheme(themeName).colors[selectedThemeColor] ?? "#000000"
+                      currentThemeColors[selectedThemeColor] ?? "#000000"
                     )}
                     onChange={(color) => {
                       const option = themeColorOptions.find((candidate) => candidate.name === selectedThemeColor);
@@ -1353,7 +1351,7 @@ export function SettingsPage() {
             setLibraryRoots((current) =>
               current.some((root) => sameFolderPath(root.path, path))
                 ? current
-                : [...current, { name: name || folderName(path), path }]
+                : [...current, editableRoot({ name: name || folderName(path), path })]
             );
           }}
           onSelect={(path, kind) => {
@@ -1531,41 +1529,6 @@ function moveItem<T>(items: T[], from: number, to: number): T[] {
   return reordered;
 }
 
-function settingsRequestFromSaved(settings: WebSettings): WebSettingsRequest {
-  return {
-    tvdbLanguage: settings.tvdbLanguage,
-    renameLookupProvider: settings.renameLookupProvider,
-    renameTemplate: settings.renameTemplate,
-    renameTemplates: settings.renameTemplates,
-    audioNamePresets: settings.audioNamePresets,
-    subtitleNamePresets: settings.subtitleNamePresets,
-    languagePresets: settings.languagePresets,
-    ignoredScanFolderNames: settings.ignoredScanFolderNames,
-    mkvMergeDefaultAudioLanguages: settings.mkvMergeDefaultAudioLanguages,
-    mkvMergeDefaultSubtitleLanguages: settings.mkvMergeDefaultSubtitleLanguages,
-    defaultRoot: settings.defaultRoot,
-    defaultRootName: settings.defaultRootName,
-    libraryRoots: settings.libraryRoots,
-    watchFolders: settings.watchFolders,
-    enableLiveWatchFolderMonitoring: settings.enableLiveWatchFolderMonitoring,
-    selectedThemeName: settings.selectedThemeName,
-    customThemes: settings.customThemes,
-    mediaServers: settings.mediaServers.map((server) => ({
-      id: server.id,
-      name: server.name,
-      type: server.type,
-      serverUrl: server.serverUrl,
-      isDefault: server.isDefault,
-      libraries: server.libraries
-    })),
-    mediaServerPathMappings: settings.mediaServerPathMappings
-  };
-}
-
-function settingsFingerprint(request: WebSettingsRequest): string {
-  return JSON.stringify(request);
-}
-
 function SettingsTabButton({ tab, active, onSelect }: { tab: SettingsTabDefinition; active: boolean; onSelect: (tab: SettingsTabId) => void }) {
   const Icon = tab.Icon;
   return (
@@ -1660,12 +1623,32 @@ function normalizeRenameTemplates(value: string, selectedTemplate: string) {
     });
 }
 
-function createLocalId() {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
+/** Whether the server's URL differs from the saved one; the backend then drops its key. */
+function urlChanged(server: EditableMediaServer, saved: WebMediaServer[] | undefined) {
+  const savedUrl = saved?.find((item) => item.id === server.id)?.serverUrl;
+  return savedUrl !== undefined && !sameServerUrl(savedUrl, server.serverUrl);
+}
 
-  return `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+/** The backend's `media_server_urls_equivalent`: scheme, host, effective port, path without trailing slashes. */
+function sameServerUrl(left: string, right: string) {
+  try {
+    const [a, b] = [new URL(left.trim()), new URL(right.trim())];
+    return a.protocol === b.protocol && a.hostname === b.hostname && a.port === b.port
+      && a.pathname.replace(/\/+$/, "") === b.pathname.replace(/\/+$/, "");
+  } catch {
+    return false;
+  }
+}
+
+// Always a UUID: the backend replaces any other id, and Sync could then not find the server.
+// `randomUUID` needs a secure context, which plain HTTP to a LAN address is not.
+function createLocalId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function formatDateTime(value: string) {
