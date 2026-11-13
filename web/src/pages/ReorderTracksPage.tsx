@@ -44,7 +44,7 @@ export function ReorderTracksPage() {
       const mkvPaths = (isWorkingView ? files : scan.files).filter((file) => file.extension.toLowerCase() === ".mkv").map((file) => file.path);
       const known = new Set(mkvPaths.map(normalizePath));
       // Opening the page starts a full batch; a later scan keeps the selection unless none of it is left.
-      if (opening || !selectedPaths.some((path) => known.has(normalizePath(path)))) setSelectedPaths(mkvPaths);
+      if (opening || !scan.selectedPaths.some((path) => known.has(normalizePath(path)))) setSelectedPaths(mkvPaths);
     }
   }, [currentScan.data, isWorkingView]);
 
