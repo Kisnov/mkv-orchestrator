@@ -417,9 +417,11 @@ async fn get_library_artwork_image(
             (header::CONTENT_TYPE, artwork.content_type),
             // The page versions the URL when a library is rebuilt.
             (header::CACHE_CONTROL, "private, max-age=86400".to_owned()),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
             // A media server's SVG must not run script on this origin.
-            (header::CONTENT_SECURITY_POLICY, "sandbox".to_owned()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'".to_owned(),
+            ),
         ],
         artwork.bytes,
     ))

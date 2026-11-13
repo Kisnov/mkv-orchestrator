@@ -110,10 +110,13 @@ async fn security_headers(request: Request, next: Next) -> Response {
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::X_FRAME_OPTIONS, "DENY"),
         (header::REFERRER_POLICY, "same-origin"),
-        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
     ] {
         headers.insert(name, HeaderValue::from_static(value));
     }
+    // A route may set a stricter policy, such as the sandbox on media-server posters.
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CONTENT_SECURITY_POLICY));
     response
 }
 
@@ -774,7 +777,7 @@ mod tests {
         );
         assert_eq!(
             response.headers()[header::CONTENT_SECURITY_POLICY],
-            "sandbox"
+            "sandbox; default-src 'none'"
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), [1, 2, 3, 4]);
