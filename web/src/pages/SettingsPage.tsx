@@ -186,6 +186,7 @@ export function SettingsPage() {
   const [mediaServers, setMediaServers] = useState<EditableMediaServer[]>([]);
   const [addingServer, setAddingServer] = useState(false);
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
+  const [editingUrlId, setEditingUrlId] = useState<string | null>(null);
   const [newServerName, setNewServerName] = useState("Media Server");
   const [newServerType, setNewServerType] = useState("Emby");
   const [newServerUrl, setNewServerUrl] = useState("");
@@ -258,6 +259,14 @@ export function SettingsPage() {
     setThemeJson(JSON.stringify(applied, null, 2));
   }, [hydrated, isDesktop, status.isPending, status.data?.mediaRoot, webSettings.data, webSettings.isFetching]);
 
+  // The backend drops a stored key for any other URL, and a URL being typed passes
+  // through valid ones. So while its field has focus, a server with a stored key and
+  // no typed key keeps saving its saved URL; the new one goes out when the field is left.
+  function heldServerUrl(server: EditableMediaServer) {
+    if (editingUrlId !== server.id || !server.hasApiKey || server.apiKey) return undefined;
+    return webSettings.data?.mediaServers.find((item) => item.id === server.id)?.serverUrl;
+  }
+
   const pendingSettingsRequest: WebSettingsRequest = {
     tvdbApiKey: tvdbApiKey || undefined,
     tvdbPin: tvdbPin || undefined,
@@ -288,7 +297,7 @@ export function SettingsPage() {
       id: server.id,
       name: server.name,
       type: server.type,
-      serverUrl: server.serverUrl,
+      serverUrl: heldServerUrl(server) ?? server.serverUrl,
       apiKey: server.apiKey || undefined,
       isDefault: server.isDefault,
       libraries: server.libraries
@@ -970,6 +979,8 @@ export function SettingsPage() {
                           <input
                             value={server.serverUrl}
                             onChange={(event) => updateMediaServer(server.id, { serverUrl: event.target.value })}
+                            onFocus={() => setEditingUrlId(server.id)}
+                            onBlur={() => setEditingUrlId(null)}
                             placeholder="http://localhost:8096"
                             className="mt-1 h-9 w-full rounded-md border border-border bg-card px-3 text-sm text-text outline-none placeholder:text-subtle focus:border-accent"
                           />
@@ -986,7 +997,7 @@ export function SettingsPage() {
                           />
                         </label>
                         {server.hasApiKey && !server.apiKey && urlChanged(server, webSettings.data?.mediaServers) ? (
-                          <p className="mt-1 text-[0.6875rem] text-warning">A new URL needs the API key again; the saved one is removed when this saves.</p>
+                          <p className="mt-1 text-[0.6875rem] text-warning">A new URL needs the API key again: leaving the URL field saves it and removes the saved key.</p>
                         ) : null}
                         </div>
                         <div className="flex gap-2">

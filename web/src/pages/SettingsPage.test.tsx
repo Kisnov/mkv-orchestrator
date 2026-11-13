@@ -899,6 +899,36 @@ describe("Settings media server saves", () => {
     expect(screen.getByLabelText("API key / token")).toHaveAttribute("placeholder", "API key or token");
   });
 
+  /// Editing 192.168.1.10 passes through 192.168.1.1, a valid URL. Saved after a
+  /// pause, it made the backend delete the key for good.
+  it("holds back a URL change until the field is left", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockImplementation((request) => Promise.resolve(settings({
+      watchFolders: request.watchFolders,
+      mediaServers: [mediaServer({ serverUrl: request.mediaServers[0].serverUrl })]
+    })));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ serverUrl: "http://192.168.1.10:8096" })] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const url = screen.getByLabelText("Server URL");
+
+    fireEvent.focus(url);
+    fireEvent.change(url, { target: { value: "http://192.168.1.1:8096" } });
+    expect(screen.getByText(/a new url needs the api key again/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Watch folders"), { target: { value: "/media/tv" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls[0][0].watchFolders).toEqual(["/media/tv"]);
+    expect(saveWebSettings.mock.calls[0][0].mediaServers[0].serverUrl).toBe("http://192.168.1.10:8096");
+
+    fireEvent.blur(url);
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls[1][0].mediaServers[0].serverUrl).toBe("http://192.168.1.1:8096");
+  });
+
   /// The warning must agree with the backend, which drops the key: paths are
   /// case-sensitive, a default port is no change.
   it("compares URLs the way the backend does", async () => {
