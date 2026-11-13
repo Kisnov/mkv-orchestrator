@@ -134,3 +134,27 @@ it("shows the end of a long log and copies all of it, saying it did", async () =
   expect(writeText.mock.calls[0][0]).toContain("line 1\nline 2");
   expect(await within(dialog).findByRole("button", { name: "Copied" })).toBeInTheDocument();
 });
+
+it("hides the options panel at any width and keeps the actions within reach", async () => {
+  localStorage.clear();
+  const onApply = vi.fn();
+  const user = userEvent.setup();
+  const { unmount } = shell(idle, { onApply });
+
+  await user.click(screen.getByRole("button", { name: "Hide options" }));
+  expect(screen.queryByRole("heading", { name: "Reorder Options" })).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "File Info" })).toBeInTheDocument();
+  expect(screen.getByText("2 files selected")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+  expect(onApply).toHaveBeenCalledTimes(1);
+  expect(localStorage.getItem("mkvo.operationOptions.hidden")).toBe("true");
+  unmount();
+
+  // The choice carries over to the next operation opened.
+  shell(idle);
+  const show = screen.getByRole("button", { name: "Show options" });
+  expect(show).toHaveAttribute("aria-expanded", "false");
+  await user.click(show);
+  expect(screen.getByRole("heading", { name: "Reorder Options" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Hide options" })).toHaveFocus();
+});
