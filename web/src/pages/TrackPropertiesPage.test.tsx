@@ -284,6 +284,37 @@ describe("Track Properties template synchronization", () => {
     expect(loadPropEditTemplate).toHaveBeenCalledTimes(reads);
   });
 
+  it("never takes a non-MKV file as the template", async () => {
+    const user = userEvent.setup();
+    const movie = { ...file("Episode 00.mp4"), extension: ".mp4" };
+    const first = file("Episode 01.mkv");
+    const second = file("Episode 02.mkv");
+    const files = [movie, first, second];
+    window.sessionStorage.setItem("mkvo.web.scannedFiles", JSON.stringify(files));
+    window.sessionStorage.setItem("mkvo.web.templateFilePath", movie.path);
+    const loadPropEditTemplate = vi.fn((request: PropEditTemplateRequest) => Promise.resolve(template(request.templatePath ?? "")));
+    const buildPropEditPreview = vi.fn<(request: PropEditPreviewRequest) => Promise<PropEditPreviewResponse>>(() => Promise.resolve({
+      actions: [], skipped: [], noChange: [], summary: "No changes", status: "No changes", planId: null, planFingerprint: null, idempotencyKey: null
+    }));
+
+    renderWithBackend(
+      <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
+      {
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-25T20:00:00Z", files, selectedPaths: [], summary: { total: 3, mkv: 2, mp4: 1, failed: 0, cached: 0 } }),
+        getWebSettings: () => Promise.resolve({ audioNamePresets: [], subtitleNamePresets: [], languagePresets: [] } as unknown as WebSettings),
+        loadPropEditTemplate,
+        buildPropEditPreview
+      }
+    );
+
+    await screen.findByText(`Template loaded: ${first.fileName}`);
+    expect(screen.getByRole("combobox", { name: /template file/i })).toHaveValue(first.path);
+    expect(loadPropEditTemplate).not.toHaveBeenCalledWith(expect.objectContaining({ templatePath: movie.path }));
+    await user.click(screen.getByRole("button", { name: "Preview Summary" }));
+    await waitFor(() => expect(buildPropEditPreview).toHaveBeenCalled());
+    expect(buildPropEditPreview.mock.calls[0][0]).toMatchObject({ templatePath: first.path, selectedPaths: [first.path, second.path] });
+  });
+
   it("reloads its track template when Dashboard changes the shared template file", async () => {
     const user = userEvent.setup();
     const first = file("Episode 01.mkv");

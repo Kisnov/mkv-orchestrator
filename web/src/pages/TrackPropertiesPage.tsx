@@ -100,16 +100,19 @@ export function TrackPropertiesPage() {
     syncFromBackend(currentScan.data);
   }, [currentScan.data]);
 
+  const mkvFiles = useMemo(() => files.filter((file) => file.extension.toLowerCase() === ".mkv"), [files]);
+
   useEffect(() => {
-    const sharedTemplate = files.some((file) => file.path === templateFilePath) ? templateFilePath : "";
-    const currentTemplate = files.some((file) => file.path === templatePath) ? templatePath : "";
-    const nextTemplate = sharedTemplate || currentTemplate || files.find((file) => file.extension.toLowerCase() === ".mkv")?.path || "";
+    // The shared template can be any scanned file; only an MKV can be edited.
+    const sharedTemplate = mkvFiles.some((file) => file.path === templateFilePath) ? templateFilePath : "";
+    const currentTemplate = mkvFiles.some((file) => file.path === templatePath) ? templatePath : "";
+    const nextTemplate = sharedTemplate || currentTemplate || mkvFiles[0]?.path || "";
     if (nextTemplate !== templatePath) setTemplatePath(nextTemplate);
     if (nextTemplate && nextTemplate !== templateFilePath) setTemplateFilePath(nextTemplate);
-  }, [files, templateFilePath, templatePath]);
+  }, [mkvFiles, templateFilePath, templatePath]);
 
-  const mkvFiles = useMemo(() => files.filter((file) => file.extension.toLowerCase() === ".mkv"), [files]);
-  const templateFile = useMemo(() => files.find((file) => file.path === templatePath) ?? null, [files, templatePath]);
+  const templateFile = useMemo(() => mkvFiles.find((file) => file.path === templatePath) ?? null, [mkvFiles, templatePath]);
+
   // Page-local: selections made in Rename, Mux/Remux, or the library do not narrow this workflow.
   const selection = useFileSelection(mkvFiles, templateFile);
   const selectedMkvPaths = selection.selectedPaths;
