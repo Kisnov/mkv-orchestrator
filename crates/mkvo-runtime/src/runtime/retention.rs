@@ -9,18 +9,17 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl MkvoRuntime {
     /// Delete expired plans, and the finished jobs, journals and logs older
-    /// than `rename.history_retention_days`. Zero days keeps them forever.
-    /// Rename batches are left alone: undo reads them.
+    /// than `rename.history_retention_days`. Zero days keeps them forever,
+    /// but still clears what older builds stored and nothing reads. Rename
+    /// batches are left alone: undo reads them.
     pub async fn prune_history(&self) -> RuntimeResult<u64> {
         let dependencies = &self.inner.dependencies;
         let now = Utc::now();
         let mut removed = dependencies.plans.remove_expired(now).await?;
         let (settings, _revision) = dependencies.settings.load().await?;
         let days = settings.rename.history_retention_days;
-        if days > 0 {
-            let cutoff = now - TimeDelta::days(i64::from(days));
-            removed += dependencies.jobs.prune_history(cutoff).await?;
-        }
+        let cutoff = (days > 0).then(|| now - TimeDelta::days(i64::from(days)));
+        removed += dependencies.jobs.prune_history(cutoff).await?;
         Ok(removed)
     }
 
@@ -98,6 +97,63 @@ mod tests {
         let (_directory, runtime) = runtime_with_logs(0).await;
         assert_eq!(runtime.prune_history().await.unwrap(), 0);
         assert_eq!(log_messages(&runtime).await, ["recent", "old"]);
+    }
+
+    /// The per-file events older builds stored are read by nothing, so they
+    /// are not history worth keeping even when history is kept forever.
+    #[tokio::test]
+    async fn zero_retention_days_still_clears_per_file_job_events() {
+        use mkvo_contracts::{JobEvent, JobEventEnvelope, JobKind, JobSnapshot, JobStatus};
+
+        let (_directory, runtime) = runtime_with_logs(0).await;
+        let jobs = &runtime.inner.dependencies.jobs;
+        let scanned = JobSnapshot {
+            id: mkvo_domain::JobId::new(),
+            kind: JobKind::Scan,
+            status: JobStatus::Canceled,
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            idempotency_key: mkvo_domain::IdempotencyKey::generate(),
+            request_fingerprint: "request".to_owned(),
+            plan_id: None,
+            created_utc: Utc::now(),
+            started_utc: None,
+            completed_utc: None,
+            completed: 0,
+            failed: 0,
+            skipped: 0,
+            total: 0,
+            current_file: String::new(),
+            current_file_percent: 0,
+            lines: Vec::new(),
+            result: None,
+            error: None,
+            revision: 0,
+        };
+        jobs.insert(&scanned).await.unwrap();
+        let per_file = JobEvent::Progress {
+            completed: 1,
+            total: 2,
+            current_file: "a.mkv".to_owned(),
+            current_file_percent: 100,
+        };
+        let ended = JobEvent::Canceled {
+            message: String::new(),
+        };
+        for (sequence, event) in [(0, per_file.clone()), (1, per_file), (2, ended)] {
+            jobs.append_event(&JobEventEnvelope {
+                job_id: scanned.id,
+                correlation_id: scanned.correlation_id,
+                sequence,
+                emitted_utc: Utc::now(),
+                event,
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(runtime.prune_history().await.unwrap(), 2);
+        assert_eq!(log_messages(&runtime).await, ["recent", "old"]);
+        assert!(jobs.get(scanned.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

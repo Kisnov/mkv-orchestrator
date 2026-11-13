@@ -179,9 +179,11 @@ pub trait JobRepository: Send + Sync {
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError>;
     /// Delete the history that finished before `cutoff`: terminal jobs with
     /// their events and journals, finished journals of operations that had no
-    /// job, and operation logs. Returns the rows deleted. A store that keeps
-    /// no history has nothing to delete.
-    async fn prune_history(&self, _cutoff: DateTime<Utc>) -> Result<u64, PortError> {
+    /// job, and operation logs. With or without a cutoff, also clear what
+    /// older builds stored and nothing reads: job events other than the one
+    /// that ended the job, and the file lists inside scan results. Returns
+    /// the rows deleted. A store that keeps no history has nothing to delete.
+    async fn prune_history(&self, _cutoff: Option<DateTime<Utc>>) -> Result<u64, PortError> {
         Ok(0)
     }
 }

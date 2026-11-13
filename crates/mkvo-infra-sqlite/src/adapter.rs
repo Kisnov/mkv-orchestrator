@@ -21,6 +21,10 @@ use crate::{
 };
 
 const SETTINGS_KEY: &str = "app";
+/// Rows deleted per transaction while pruning.
+const PRUNE_BATCH: usize = 1_000;
+/// Scan payloads rewritten per transaction; one can be tens of megabytes.
+const STRIP_BATCH: usize = 2;
 
 /// Composition-friendly bundle. A single WAL-configured store can be shared by
 /// desktop and server hosts and registered for each application repository port.
@@ -60,6 +64,22 @@ impl SqliteRepositories {
             .await
             .map_err(|error| PortError::Other(format!("SQLite task failed: {error}")))?
             .map_err(store_port_error)
+    }
+
+    /// Run `batch` until it finds nothing left. Each run is its own short
+    /// transaction, so other requests get the connection in between.
+    async fn repeat<F>(&self, batch: F) -> Result<u64, PortError>
+    where
+        F: Fn(SqliteStore) -> Result<u64, StoreError> + Clone + Send + 'static,
+    {
+        let mut total = 0;
+        loop {
+            let done = self.blocking(batch.clone()).await?;
+            if done == 0 {
+                return Ok(total);
+            }
+            total += done;
+        }
     }
 }
 
@@ -279,9 +299,26 @@ impl JobRepository for SqliteRepositories {
         .await
     }
 
-    async fn prune_history(&self, cutoff: DateTime<Utc>) -> Result<u64, PortError> {
-        self.blocking(move |store| store.prune_history(cutoff.timestamp_millis()))
-            .await
+    async fn prune_history(&self, cutoff: Option<DateTime<Utc>>) -> Result<u64, PortError> {
+        let mut removed = self
+            .repeat(|store| store.delete_superseded_job_events(PRUNE_BATCH))
+            .await?;
+        if let Some(cutoff) = cutoff {
+            let cutoff_ms = cutoff.timestamp_millis();
+            removed += self
+                .repeat(move |store| store.delete_finished_jobs(cutoff_ms, PRUNE_BATCH))
+                .await?;
+            removed += self
+                .blocking(move |store| store.delete_finished_journals_and_logs(cutoff_ms))
+                .await?;
+        }
+        // After the deletes, so nothing about to go is rewritten first.
+        self.repeat(|store| store.strip_scan_file_lists(STRIP_BATCH))
+            .await?;
+        removed += self
+            .blocking(|store| store.delete_unended_job_events())
+            .await?;
+        Ok(removed)
     }
 }
 
@@ -861,7 +898,7 @@ mod tests {
         }
 
         let cutoff = Utc::now() - chrono::TimeDelta::days(90);
-        let removed = JobRepository::prune_history(&repositories, cutoff)
+        let removed = JobRepository::prune_history(&repositories, Some(cutoff))
             .await
             .expect("prune");
         assert_eq!(removed, 6);
@@ -904,41 +941,157 @@ mod tests {
         assert_eq!(logs[0].message, "recent");
     }
 
-    /// Older builds kept every scanned file, twice, in the job. Those rows
-    /// are still read by the recent-jobs list until they age out.
+    fn event(
+        job: &JobSnapshot,
+        sequence: u64,
+        event: mkvo_contracts::JobEvent,
+    ) -> JobEventEnvelope {
+        JobEventEnvelope {
+            job_id: job.id,
+            correlation_id: job.correlation_id,
+            sequence,
+            emitted_utc: Utc::now(),
+            event,
+        }
+    }
+
+    async fn stored_events(
+        repositories: &SqliteRepositories,
+        job: &JobSnapshot,
+    ) -> Vec<serde_json::Value> {
+        let id = job.id.to_string();
+        repositories
+            .blocking(move |store| {
+                let connection = store.connection()?;
+                let mut statement = connection.prepare(
+                    "SELECT payload_json FROM job_events WHERE job_id = ?1 ORDER BY sequence",
+                )?;
+                let rows = statement.query_map([id], |row| row.get::<_, String>(0))?;
+                rows.map(|row| serde_json::from_str(&row?).map_err(StoreError::from))
+                    .collect()
+            })
+            .await
+            .expect("events")
+    }
+
+    /// A database written by an older build: an event or two per scanned
+    /// file, and the whole file list in both the result and the final event.
+    /// None of it is read, so it goes even when history is kept forever.
     #[tokio::test]
-    async fn pruning_strips_the_file_lists_older_builds_left_in_scan_results() {
-        use mkvo_contracts::JobStatus;
+    async fn pruning_clears_what_older_builds_stored_whatever_the_retention() {
+        use mkvo_contracts::{JobEvent, JobLogLevel, JobStatus, JobSummary};
 
         let repositories =
             SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
-        let mut legacy = job(JobStatus::Completed);
-        legacy.result = Some(serde_json::json!({
+        let fat_result = serde_json::json!({
             "files": ["a".repeat(100_000)],
             "rows": ["b".repeat(100_000)],
             "skipped": ["broken.mkv: unreadable"],
             "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
-        }));
-        JobRepository::insert(&repositories, &legacy)
-            .await
-            .expect("insert");
+        });
+        let slim_result = serde_json::json!({
+            "skipped": ["broken.mkv: unreadable"],
+            "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
+        });
+        let mut scanned = job(JobStatus::Completed);
+        scanned.result = Some(fat_result.clone());
+        // The process died mid-scan, so there is no final event.
+        let crashed = job(JobStatus::Failed);
+        let current = job(JobStatus::Completed);
+        for snapshot in [&scanned, &crashed, &current] {
+            JobRepository::insert(&repositories, snapshot)
+                .await
+                .expect("insert");
+        }
 
-        let cutoff = Utc::now() - chrono::TimeDelta::days(90);
-        JobRepository::prune_history(&repositories, cutoff)
+        let mut per_file = vec![JobEvent::StatusChanged {
+            status: JobStatus::Running,
+        }];
+        for file in 1..=12 {
+            per_file.push(JobEvent::Progress {
+                completed: file,
+                total: 12,
+                current_file: "a.mkv".to_owned(),
+                current_file_percent: 100,
+            });
+            per_file.push(JobEvent::Log {
+                level: JobLogLevel::Warning,
+                line: "Skipped a.mkv".to_owned(),
+            });
+        }
+        let completed = |result| JobEvent::Completed {
+            summary: JobSummary::default(),
+            result,
+        };
+        let mut events = Vec::new();
+        for (sequence, per_file_event) in (0..).zip(&per_file) {
+            events.push(event(&scanned, sequence, per_file_event.clone()));
+            events.push(event(&crashed, sequence, per_file_event.clone()));
+        }
+        events.push(event(&scanned, 25, completed(Some(fat_result))));
+        events.push(event(&current, 7, completed(None)));
+        for envelope in &events {
+            JobRepository::append_event(&repositories, envelope)
+                .await
+                .expect("event");
+        }
+
+        let removed = JobRepository::prune_history(&repositories, None)
             .await
             .expect("prune");
+        assert_eq!(removed, 50);
 
-        let stored = JobRepository::get(&repositories, legacy.id)
+        let kept = stored_events(&repositories, &scanned).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["event"]["type"], "completed");
+        assert_eq!(kept[0]["event"]["result"], slim_result);
+        assert!(stored_events(&repositories, &crashed).await.is_empty());
+        assert_eq!(stored_events(&repositories, &current).await.len(), 1);
+
+        let stored = JobRepository::get(&repositories, scanned.id)
             .await
             .expect("get")
-            .expect("job is recent, so it stays");
-        assert_eq!(
-            stored.result,
-            Some(serde_json::json!({
-                "skipped": ["broken.mkv: unreadable"],
-                "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
-            }))
-        );
+            .expect("history is kept forever, so the job stays");
+        assert_eq!(stored.result, Some(slim_result));
+    }
+
+    /// The first prune of an old database has hundreds of thousands of rows
+    /// to delete while requests are being served on the same connection.
+    #[tokio::test]
+    async fn job_events_are_deleted_in_bounded_batches() {
+        use mkvo_contracts::{JobEvent, JobStatus};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let scanned = job(JobStatus::Canceled);
+        JobRepository::insert(&repositories, &scanned)
+            .await
+            .expect("insert");
+        for sequence in 0..13 {
+            let last = JobEvent::Canceled {
+                message: String::new(),
+            };
+            let status = JobEvent::StatusChanged {
+                status: JobStatus::Running,
+            };
+            let envelope = event(
+                &scanned,
+                sequence,
+                if sequence == 12 { last } else { status },
+            );
+            JobRepository::append_event(&repositories, &envelope)
+                .await
+                .expect("event");
+        }
+
+        let store = repositories.store();
+        let batches: Vec<u64> = (0..4)
+            .map(|_| store.delete_superseded_job_events(5).expect("batch"))
+            .collect();
+        assert_eq!(batches, [5, 5, 2, 0]);
+        let kept = stored_events(&repositories, &scanned).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["event"]["type"], "canceled");
     }
 
     #[tokio::test]
