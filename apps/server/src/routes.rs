@@ -89,6 +89,10 @@ pub(crate) fn api_router(state: AppState) -> Router {
         .route("/api/library/audit", post(run_library_audit))
         .route("/api/library/catalog", post(get_library_catalog))
         .route("/api/library/artwork", post(get_library_artwork))
+        .route(
+            "/api/library/artwork/{server_id}/{item_id}",
+            get(get_library_artwork_image),
+        )
         .route("/api/library/local-artwork", post(get_library_local_artwork))
         .route("/api/watch/health", get(get_watch_health))
         .route("/api/jobs/recent", get(list_recent_jobs))
@@ -397,6 +401,30 @@ async fn get_library_artwork(
     Json(request): Json<LibraryArtworkRequest>,
 ) -> Result<impl IntoResponse, HttpError> {
     Ok(Json(state.runtime.get_library_artwork(request).await?))
+}
+
+/// The poster itself, so the browser can load, cache and drop it like any image.
+async fn get_library_artwork_image(
+    State(state): State<AppState>,
+    Path((server_id, item_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, HttpError> {
+    let artwork = state
+        .runtime
+        .get_library_artwork_bytes(LibraryArtworkRequest { server_id, item_id })
+        .await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, artwork.content_type),
+            // The page versions the URL when a library is rebuilt.
+            (header::CACHE_CONTROL, "private, max-age=86400".to_owned()),
+            // A media server's SVG must not run script on this origin.
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'".to_owned(),
+            ),
+        ],
+        artwork.bytes,
+    ))
 }
 
 async fn get_library_local_artwork(

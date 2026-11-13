@@ -421,6 +421,17 @@ impl MkvoRuntime {
             .await;
 
         let mut state = self.inner.current_scan.write().await;
+        // Nothing of it could be read: keep the working set rather than empty it.
+        if read.is_empty()
+            && !state
+                .files
+                .iter()
+                .any(|file| wanted.contains(&key(&file.path)))
+        {
+            return mkvo_contracts::FileSelectionResponse {
+                selected_paths: state.selected_display_paths(),
+            };
+        }
         let replaced = state.keep_only(&wanted, read);
         // The scan that produced them may not have been asked for its files yet.
         if let Some(job) = state.scan_job.take() {
@@ -1014,6 +1025,30 @@ mod tests {
         };
         let adopted = host.runtime.set_file_selection(handoff).await.unwrap();
         assert_eq!(adopted.selected_paths.len(), 2);
+    }
+
+    /// A title whose files all moved away must not empty the Dashboard.
+    #[tokio::test]
+    async fn a_handoff_with_nothing_readable_keeps_the_working_set() {
+        let host = host(0);
+        let dashboard = folder(&host, "dashboard", 2);
+        let id = start(&host, &dashboard).await;
+        finished(&host, id).await;
+        let before = host.runtime.get_current_scan_files().await.unwrap();
+
+        let adopted = host
+            .runtime
+            .set_file_selection(mkvo_contracts::FileSelectionRequest {
+                paths: vec![display_path(&dashboard.join("gone.mkv"))],
+                replace_working_set: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(adopted.selected_paths, before.selected_paths);
+        let after = host.runtime.get_current_scan_files().await.unwrap();
+        assert_eq!(after.files.len(), 2);
+        assert_eq!(after.updated_utc, before.updated_utc);
     }
 
     /// A job of `kind` that runs until the returned sender is dropped.

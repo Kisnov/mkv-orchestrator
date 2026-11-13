@@ -221,6 +221,11 @@ export class TauriBackendClient implements BackendClient {
     return this.invoke<LibraryArtworkResponse>("get_library_artwork", { request }, "LibraryArtworkResponse");
   }
 
+  // The desktop shell has no HTTP origin to load images from.
+  libraryArtworkUrl(): undefined {
+    return undefined;
+  }
+
   getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse> {
     return this.invoke<LibraryArtworkResponse>("get_library_local_artwork", { request }, "LibraryArtworkResponse");
   }

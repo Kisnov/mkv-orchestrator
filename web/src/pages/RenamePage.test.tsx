@@ -3,10 +3,10 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 
-import { countCompletedRenameRows, RenamePage } from "./RenamePage";
+import { RenamePage } from "./RenamePage";
 import { MediaLibraryProvider, useMediaLibrary } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow } from "../api";
+import type { MediaFileRow, RenameApplyResponse, RenamePreviewResponse } from "../api";
 
 function mediaFile(fileName: string): MediaFileRow {
   return {
@@ -86,23 +86,50 @@ const searchResult = (format: "movie" | "series") => ({
 });
 
 describe("rename apply progress", () => {
-  it("counts source paths that have left the live scan as completed", () => {
-    const first = mediaFile("Episode 01.mkv");
-    const second = mediaFile("Episode 02.mkv");
-    const rows = [first, second].map((file) => ({
-      selected: true,
-      sourcePath: file.path,
-      currentFileName: file.fileName,
-      detected: "",
-      episodeName: "",
-      newFileName: `Renamed ${file.fileName}`,
-      confidence: "High",
-      status: "Ready",
-      canApply: true
-    }));
+  beforeEach(() => {
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+  });
 
-    expect(countCompletedRenameRows(rows, [second])).toBe(1);
-    expect(countCompletedRenameRows(rows, [])).toBe(2);
+  /// The backend moves the working set only once every file is renamed, so
+  /// re-reading the whole list while it works can only show 0 of N.
+  it("does not re-read the file list while a rename runs, and reads it once after", async () => {
+    const file = mediaFile("Obsession (Bluray) 2026.mkv");
+    const scan = { updatedUtc: "2026-08-16T12:00:00Z", files: [file], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 }, selectedPaths: [file.path] };
+    const getCurrentScanFiles = vi.fn(() => Promise.resolve(scan));
+    const row = { selected: true, sourcePath: file.path, currentFileName: file.fileName, detected: "", episodeName: "", newFileName: "Obsession (2026).mkv", confidence: "High", status: "Ready", canApply: true };
+    let finish: () => void = () => undefined;
+    const applyRenamePreview = vi.fn(() => new Promise<RenameApplyResponse>((resolve) => {
+      finish = () => resolve({ items: [{ ...row, status: "Renamed" }], summary: "1 renamed", status: "Renamed 1 file" });
+    }));
+    const user = userEvent.setup();
+    renderWithBackend(
+      <MediaLibraryProvider>
+        <Scan fileNames={[file.fileName]} />
+        <RenamePage />
+      </MediaLibraryProvider>,
+      {
+        getCurrentScanFiles,
+        searchRenameMetadata: () => Promise.resolve({ results: [searchResult("movie")] }),
+        loadRenameScopes: () => Promise.resolve({ scopes: [] }),
+        buildRenamePreview: () => Promise.resolve({ items: [row], summary: "1 ready", status: "Ready", planId: "plan", planFingerprint: "fp", idempotencyKey: "key" } as RenamePreviewResponse),
+        applyRenamePreview
+      }
+    );
+    await user.type((await screen.findAllByRole("textbox"))[0], "Obsession");
+    await user.click(screen.getByRole("button", { name: /^search$/i }));
+    await screen.findByText(/not applicable to a movie/i);
+    const apply = screen.getByRole("button", { name: "Apply Changes" });
+    await waitFor(() => expect(apply).toBeEnabled());
+    await user.click(apply);
+    await waitFor(() => expect(applyRenamePreview).toHaveBeenCalled());
+    const readsBefore = getCurrentScanFiles.mock.calls.length;
+
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    expect(getCurrentScanFiles).toHaveBeenCalledTimes(readsBefore);
+
+    finish();
+    await waitFor(() => expect(getCurrentScanFiles).toHaveBeenCalledTimes(readsBefore + 1));
   });
 });
 

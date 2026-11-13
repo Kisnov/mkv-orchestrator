@@ -110,10 +110,13 @@ async fn security_headers(request: Request, next: Next) -> Response {
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::X_FRAME_OPTIONS, "DENY"),
         (header::REFERRER_POLICY, "same-origin"),
-        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
     ] {
         headers.insert(name, HeaderValue::from_static(value));
     }
+    // A route may set a stricter policy, such as the sandbox on media-server posters.
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CONTENT_SECURITY_POLICY));
     response
 }
 
@@ -713,6 +716,107 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_text(response).await.contains("MKVO test UI"));
+    }
+
+    /// Answers every request with a tiny JPEG, standing in for Jellyfin.
+    fn fake_poster_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                    line.clear();
+                }
+                let _ = reader.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ncontent-length: 4\r\nconnection: close\r\n\r\n\x01\x02\x03\x04",
+                );
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn media_server_posters_are_served_as_cacheable_images() {
+        let host = TestHost::new(None);
+        let saved = host
+            .runtime
+            .save_web_settings(mkvo_contracts::WebSettingsRequest {
+                media_servers: Some(vec![mkvo_contracts::WebMediaServerRequest {
+                    id: None,
+                    name: Some("Home".to_owned()),
+                    server_type: Some("jellyfin".to_owned()),
+                    server_url: Some(fake_poster_server()),
+                    api_key: Some("k".to_owned()),
+                    is_default: true,
+                    libraries: Some(Vec::new()),
+                }]),
+                ..mkvo_contracts::WebSettingsRequest::default()
+            })
+            .await
+            .unwrap();
+        let server_id = &saved.media_servers[0].id;
+        let router = host.router();
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/library/artwork/{server_id}/show-1?v=2"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, max-age=86400"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "sandbox; default-src 'none'"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), [1, 2, 3, 4]);
+
+        for (path, status) in [
+            (
+                "/api/library/artwork/unknown-server/show-1",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                &format!("/api/library/artwork/{server_id}/..%2Fsecret"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn media_server_posters_require_a_session() {
+        let host = TestHost::new(Some(BasicAuth {
+            username: "mkvo".to_owned(),
+            password: "secret".to_owned(),
+        }));
+        let response = host
+            .router()
+            .oneshot(
+                Request::get("/api/library/artwork/server/show-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

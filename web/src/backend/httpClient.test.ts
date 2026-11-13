@@ -25,6 +25,15 @@ describe("HttpBackendClient library audits", () => {
   });
 });
 
+describe("HttpBackendClient library posters", () => {
+  it("addresses a media-server poster by a versioned image URL", () => {
+    const client = new HttpBackendClient({ baseUrl: "http://nas:8080/" });
+
+    expect(client.libraryArtworkUrl({ serverId: "server 1", itemId: "show/1" }, 3))
+      .toBe("http://nas:8080/api/library/artwork/server%201/show%2F1?v=3");
+  });
+});
+
 describe("HttpBackendClient timeouts", () => {
   function timedOutSignal() {
     const controller = new AbortController();

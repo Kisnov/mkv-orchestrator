@@ -324,6 +324,10 @@ export class HttpBackendClient implements BackendClient {
     return this.json<LibraryArtworkResponse>("/api/library/artwork", "POST", request, "LibraryArtworkResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
+  libraryArtworkUrl(request: LibraryArtworkRequest, version: number): string {
+    return this.url(`/api/library/artwork/${encodeURIComponent(request.serverId)}/${encodeURIComponent(request.itemId)}?v=${version}`);
+  }
+
   getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse> {
     return this.json<LibraryArtworkResponse>("/api/library/local-artwork", "POST", request, "LibraryArtworkResponse", LONG_REQUEST_TIMEOUT_MS);
   }

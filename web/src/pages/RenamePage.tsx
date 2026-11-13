@@ -327,7 +327,8 @@ export function RenamePage() {
     mutationFn: applyRenamePreview,
     onMutate: (request) => {
       const total = request.items.filter((row) => row.selected && row.canApply).length;
-      setStatusText(`0 of ${total} complete`);
+      // The backend renames inline and moves the working set once at the end, so there is no progress to show.
+      setStatusText(`Renaming ${total} file(s)...`);
     },
     onSuccess: async (response) => {
       const renames = response.items.flatMap((result, index) => {
@@ -345,37 +346,6 @@ export function RenamePage() {
     },
     onError: (error) => setStatusText(error instanceof Error ? error.message : "Rename apply failed.")
   });
-
-  useEffect(() => {
-    if (!apply.isPending || !apply.variables) return;
-    const pendingRows = apply.variables.items.filter((row) => row.selected && row.canApply);
-    let stopped = false;
-    let polling = false;
-
-    const updateRenameProgress = async () => {
-      if (polling) return;
-      polling = true;
-      try {
-        const result = await currentScan.refetch();
-        if (stopped || !result.data) return;
-        syncFromBackend(result.data);
-        const completed = countCompletedRenameRows(pendingRows, result.data.files);
-        setStatusText(`${completed} of ${pendingRows.length} complete`);
-      } finally {
-        polling = false;
-      }
-    };
-
-    void updateRenameProgress();
-    const interval = window.setInterval(() => void updateRenameProgress(), 750);
-    return () => {
-      stopped = true;
-      window.clearInterval(interval);
-    };
-    // Polling is tied to this one mutation. Library synchronization causes
-    // renders but must not restart the timer or issue overlapping requests.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apply.isPending]);
 
   const undoBatch = useMutation({
     mutationFn: undoRenameBatch,
@@ -1570,11 +1540,6 @@ function makeUnavailableRenameRow(file: MediaFileRow, status: string): RenamePre
 
 function normalizeRenamePath(path: string) {
   return path.replace(/\\/g, "/").toLowerCase();
-}
-
-export function countCompletedRenameRows(rows: RenamePreviewRow[], files: MediaFileRow[]) {
-  const currentPaths = new Set(files.map((file) => normalizeRenamePath(file.path)));
-  return rows.filter((row) => !currentPaths.has(normalizeRenamePath(row.sourcePath))).length;
 }
 
 function buildOptionList(values: string[], current: string) {

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router-dom";
 
@@ -7,7 +7,9 @@ import { buildLibraryTitles, LibraryPage, resetLibraryViewCacheForTests } from "
 import { DashboardPage } from "./DashboardPage";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
+import { ApiError } from "../api";
 import type { LibraryAuditRow, MediaFileRow, ScanJobResponse, WebSettings } from "../api";
+import type { BackendClient } from "../backend/client";
 
 function auditRow(season: number, hasIssues: boolean): LibraryAuditRow {
   const root = `/media/tv/Example Show/Season ${season}`;
@@ -84,6 +86,15 @@ describe("Library title aggregation", () => {
     expect(titles[0].catalogItem?.id).toBe("series-1");
   });
 
+  it("lists each file of a title once across all its seasons", () => {
+    const seasons = Array.from({ length: 300 }, (_, index) => ({ ...auditRow(index + 1, false), allFilePaths: ["/media/tv/Example Show/shared.mkv", `/media/tv/Example Show/${index}.mkv`] }));
+
+    const [title] = buildLibraryTitles(seasons, []);
+
+    expect(title.allFilePaths).toHaveLength(301);
+    expect(title.allFilePaths[0]).toBe("/media/tv/Example Show/shared.mkv");
+  });
+
   it("combines audit groups whose folder labels include the series and season", () => {
     const season1 = {
       ...auditRow(1, false),
@@ -118,6 +129,7 @@ describe("Library poster workflow", () => {
     }];
     const files = rows.flatMap((row) => row.allFilePaths.map(media));
     const previous = media("/media/old/Previous Scan.mkv");
+    let workingSet = [previous];
     const handoffSettings = settings();
     handoffSettings.mediaServers[0].libraries[0].containerPath = "/media/handoff";
     const completedJob = {
@@ -146,17 +158,15 @@ describe("Library poster workflow", () => {
         startScan: () => Promise.resolve({ ...completedJob, status: "Queued", files: [] }),
         getScanJob: () => Promise.resolve(completedJob),
         buildLibraryAudit: () => Promise.resolve({ summary: { groups: 1, files: files.length, issueGroups: 1, standardGroups: 0 }, items: rows }),
-        setFileSelection: (selectedPaths) => Promise.resolve({
-          updatedUtc: "2026-08-28T20:00:01Z",
-          files,
-          selectedPaths,
-          summary: completedJob.summary
-        }),
+        setFileSelection: (selectedPaths, replaceWorkingSet) => {
+          if (replaceWorkingSet) workingSet = files.filter((file) => selectedPaths.includes(file.path));
+          return Promise.resolve({ selectedPaths });
+        },
         getCurrentScanFiles: () => Promise.resolve({
-          updatedUtc: "2026-08-20T20:00:00Z",
-          files: [previous],
-          selectedPaths: [previous.path],
-          summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 }
+          updatedUtc: workingSet[0] === previous ? "2026-08-20T20:00:00Z" : "2026-08-28T20:00:01Z",
+          files: workingSet,
+          selectedPaths: workingSet.map((file) => file.path),
+          summary: { total: workingSet.length, mkv: workingSet.length, mp4: 0, failed: 0, cached: 0 }
         })
       }
     );
@@ -203,7 +213,8 @@ describe("Library poster workflow", () => {
         startScan: () => Promise.resolve({ ...completedJob, status: "Queued", files: [] }),
         getScanJob: () => Promise.resolve(completedJob),
         buildLibraryAudit: () => Promise.resolve({ summary: { groups: 2, files: 4, issueGroups: 1, standardGroups: 1 }, items: rows }),
-        setFileSelection
+        setFileSelection,
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-22T20:00:00Z", files, selectedPaths: [], summary: completedJob.summary })
       }
     );
 
@@ -373,6 +384,207 @@ describe("Library poster workflow", () => {
     });
     await waitFor(() => expect(buildLibraryAudit).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/example show rebuilt: 4 files/i)).toBeInTheDocument();
+  });
+
+  function posterBackend(overrides: Partial<BackendClient> = {}): Partial<BackendClient> {
+    const rows = [auditRow(1, false)];
+    const files = rows.flatMap((row) => row.allFilePaths.map(media));
+    const job = {
+      id: "poster-scan",
+      status: "Completed",
+      completed: files.length,
+      total: files.length,
+      files,
+      summary: { total: files.length, mkv: files.length, mp4: 0, failed: 0, cached: 0 },
+      skipped: [],
+      error: ""
+    } as ScanJobResponse;
+    return {
+      getWebSettings: () => Promise.resolve(settings()),
+      getLibraryCatalog: () => Promise.resolve({ items: [{ id: "series-1", title: "Example Show", year: 2024, mediaType: "series", hasPoster: true }] }),
+      libraryArtworkUrl: ({ serverId, itemId }, version) => `/api/library/artwork/${serverId}/${itemId}?v=${version}`,
+      startScan: () => Promise.resolve({ ...job, status: "Queued", files: [] }),
+      getScanJob: () => Promise.resolve(job),
+      buildLibraryAudit: () => Promise.resolve({ summary: { groups: 1, files: files.length, issueGroups: 0, standardGroups: 1 }, items: rows }),
+      ...overrides
+    };
+  }
+
+  it("loads a media-server poster as an image URL instead of inline data", async () => {
+    const getLibraryArtwork = vi.fn();
+    const getLibraryLocalArtwork = vi.fn();
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({ getLibraryArtwork, getLibraryLocalArtwork })
+    );
+
+    const poster = await screen.findByRole("img", { name: "Example Show poster" });
+    expect(poster).toHaveAttribute("src", "/api/library/artwork/server-1/series-1?v=1");
+    expect(poster).toHaveAttribute("loading", "lazy");
+    expect(getLibraryArtwork).not.toHaveBeenCalled();
+    expect(getLibraryLocalArtwork).not.toHaveBeenCalled();
+  });
+
+  it("asks once why a poster failed and points a rejected key at Settings", async () => {
+    const rejected = new ApiError("Jellyfin rejected the stored API key (HTTP 401). Enter the key again in Settings.", { code: "credential_rejected", status: 424 });
+    const getLibraryArtwork = vi.fn().mockRejectedValue(rejected);
+    const getLibraryLocalArtwork = vi.fn().mockRejectedValue(new Error("No local poster"));
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({ getLibraryArtwork, getLibraryLocalArtwork })
+    );
+
+    fireEvent.error(await screen.findByRole("img", { name: "Example Show poster" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
+    expect(screen.getByRole("link", { name: /open settings/i })).toHaveAttribute("href", "/settings");
+    await waitFor(() => expect(getLibraryLocalArtwork).toHaveBeenCalledTimes(1));
+    expect(getLibraryArtwork).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("img", { name: "Example Show poster" })).not.toBeInTheDocument();
+  });
+
+  it("asks again after an answer that was not about the key", async () => {
+    const show = (name: string): LibraryAuditRow => ({ ...auditRow(1, false), folderPath: `/media/tv/${name}/Season 1`, folderName: `${name} / Season 1`, allFilePaths: [`/media/tv/${name}/Season 1/Episode 01.mkv`] });
+    const rows = [show("Alpha Show"), show("Beta Show"), show("Gamma Show")];
+    let release: () => void = () => undefined;
+    const getLibraryArtwork = vi.fn()
+      .mockImplementationOnce(() => new Promise((_, reject) => { release = () => reject(new ApiError("Not found", { code: "not_found", status: 404 })); }))
+      .mockRejectedValue(new ApiError("Jellyfin rejected the stored API key.", { code: "credential_rejected", status: 424 }));
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({
+        getLibraryArtwork,
+        getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")),
+        getLibraryCatalog: () => Promise.resolve({ items: [
+          { id: "alpha", title: "Alpha Show", year: 2024, mediaType: "series", hasPoster: true },
+          { id: "beta", title: "Beta Show", year: 2024, mediaType: "series", hasPoster: true },
+          { id: "gamma", title: "Gamma Show", year: 2024, mediaType: "series", hasPoster: true }
+        ] }),
+        buildLibraryAudit: () => Promise.resolve({ summary: { groups: 3, files: 3, issueGroups: 0, standardGroups: 3 }, items: rows })
+      })
+    );
+
+    fireEvent.error(await screen.findByRole("img", { name: "Alpha Show poster" }));
+    fireEvent.error(screen.getByRole("img", { name: "Beta Show poster" }));
+    expect(getLibraryArtwork).toHaveBeenCalledTimes(1);
+    release();
+    await waitFor(() => expect(getLibraryArtwork.mock.results[0].value).rejects.toThrow("Not found"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.error(screen.getByRole("img", { name: "Gamma Show poster" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
+    expect(getLibraryArtwork).toHaveBeenCalledTimes(2);
+  });
+
+  it("requests no media-server posters while the catalog says the key is rejected", async () => {
+    const libraryArtworkUrl = vi.fn(() => "/poster");
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({
+        libraryArtworkUrl,
+        getLibraryCatalog: () => Promise.reject(new ApiError("Jellyfin rejected the stored API key.", { code: "credential_rejected", status: 424 })),
+        getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster"))
+      })
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
+    expect(await screen.findByText(/no poster found/i)).toBeInTheDocument();
+    expect(libraryArtworkUrl).not.toHaveBeenCalled();
+  });
+
+  it("sends a title to Dashboard with the backend's rows, not copies kept in the browser", async () => {
+    const user = userEvent.setup();
+    const backend = posterBackend({ getLibraryCatalog: () => Promise.resolve({ items: [] }), getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")) });
+    const held = media("/media/tv/Example Show/Season 1/Episode 01.mkv");
+    const setFileSelection = vi.fn().mockResolvedValue({ selectedPaths: [held.path] });
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      {
+        ...backend,
+        setFileSelection,
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-22T20:00:00Z", files: [{ ...held, fileName: "Fresh from backend.mkv" }], selectedPaths: [], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } })
+      }
+    );
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+
+    await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith([
+      "/media/tv/Example Show/Season 1/Episode 01.mkv",
+      "/media/tv/Example Show/Season 1/Episode 02.mkv"
+    ], true));
+    await waitFor(() => expect(setFileSelection).toHaveBeenLastCalledWith([held.path], true));
+  });
+
+  function openTitleWith(overrides: Partial<BackendClient>) {
+    const backend = posterBackend({ getLibraryCatalog: () => Promise.resolve({ items: [] }), getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")), ...overrides });
+    renderWithBackend(
+      <MediaLibraryProvider>
+        <Routes>
+          <Route path="/" element={<LibraryPage />} />
+          <Route path="/dashboard" element={<h1>Dashboard</h1>} />
+        </Routes>
+      </MediaLibraryProvider>,
+      backend
+    );
+  }
+
+  it("leaves Dashboard alone when none of the title's files can be read", async () => {
+    const user = userEvent.setup();
+    const setFileSelection = vi.fn().mockResolvedValue({ selectedPaths: ["/media/other.mkv"] });
+    openTitleWith({
+      setFileSelection,
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-22T20:00:00Z", files: [media("/media/other.mkv")], selectedPaths: ["/media/other.mkv"], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } })
+    });
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(await within(dialog).findByText(/none of this title's files could be read/i)).toBeInTheDocument();
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("heading", { name: "Dashboard" })).not.toBeInTheDocument();
+  });
+
+  it("says so in the dialog when the sent files cannot be loaded back", async () => {
+    const user = userEvent.setup();
+    openTitleWith({
+      setFileSelection: () => Promise.resolve({ selectedPaths: [] }),
+      getCurrentScanFiles: () => Promise.reject(new Error("server went away"))
+    });
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+
+    expect(await within(screen.getByRole("dialog")).findByText(/server went away/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /send all files to dashboard/i })).toBeEnabled();
+  });
+
+  it("runs one hand-off at a time and shows its progress in the dialog", async () => {
+    const user = userEvent.setup();
+    let release: (value: { selectedPaths: string[] }) => void = () => undefined;
+    const setFileSelection = vi.fn().mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+    openTitleWith({ setFileSelection, getCurrentScanFiles: () => new Promise(() => undefined) });
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    const sendAll = screen.getByRole("button", { name: /send all files to dashboard/i });
+    await user.dblClick(sendAll);
+
+    expect(within(screen.getByRole("dialog")).getByText(/sending example show to dashboard/i)).toBeInTheDocument();
+    expect(sendAll).toBeDisabled();
+    expect(screen.getByRole("button", { name: /send mismatches \+ template to dashboard/i })).toBeDisabled();
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+    release({ selectedPaths: [] });
+  });
+
+  it("says it is auditing once the scan has finished", async () => {
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({ buildLibraryAudit: () => new Promise(() => undefined) })
+    );
+
+    expect(await screen.findByText(/auditing/i)).toBeInTheDocument();
+    expect(screen.queryByText(/scanning preparing/i)).not.toBeInTheDocument();
   });
 
   it("does not save an empty library when the scan's files are no longer held", async () => {
