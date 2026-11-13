@@ -203,21 +203,11 @@ pub(super) fn redacted_remux_command(item: &RemuxPlanItem) -> String {
     )
 }
 
-pub(super) fn same_path(left: &Path, right: &Path) -> bool {
-    path_key(&left.to_string_lossy()) == path_key(&right.to_string_lossy())
-}
+pub(super) use mkvo_domain::same_path;
 
-/// Comparison key for a path in workflow lookups.
-///
-/// Scanned files carry the canonical path, which on Windows has the
-/// extended-length `\\?\` prefix, while rows from the UI carry the plain form.
-/// The prefix is dropped first so both spellings of one file share a key;
-/// otherwise row lookups miss and fall back to re-fingerprinting the file.
+/// [`mkvo_domain::path_key`] for a path that arrives as text from the UI.
 pub(super) fn path_key(value: &str) -> String {
-    mkvo_domain::normalized_path_text(Path::new(value))
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    mkvo_domain::path_key(Path::new(value))
 }
 
 pub(super) fn file_name(path: &Path) -> String {
@@ -314,7 +304,11 @@ mod tests {
             Path::new(r"\\?\UNC\nas\media\Episode 01.mkv"),
             Path::new(r"\\nas\media\Episode 01.mkv")
         ));
-        assert_eq!(path_key(r"\\?\C:\Media\Show"), path_key("c:/media/show/"));
+        assert_eq!(path_key(r"\\?\C:\Media\Show"), path_key("C:/Media/Show/"));
+        assert_eq!(
+            path_key("/media/Show") == path_key("/media/show"),
+            cfg!(any(windows, target_os = "macos"))
+        );
         assert!(!same_path(
             Path::new(r"\\?\C:\Media\Show\Episode 01.mkv"),
             Path::new(r"C:\Media\Show\Episode 02.mkv")
