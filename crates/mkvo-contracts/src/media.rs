@@ -28,7 +28,23 @@ pub struct MediaFileDto {
     pub attachments: Vec<MediaAttachmentDto>,
 }
 
-impl From<&MediaFile> for MediaFileDto {
+/// What a file's DTO and its Dashboard row both show.
+pub(crate) struct MediaFileSummary {
+    pub(crate) path: String,
+    pub(crate) file_name: String,
+    pub(crate) extension: String,
+    pub(crate) reader: String,
+    pub(crate) codec: String,
+    pub(crate) resolution: String,
+    pub(crate) bit_depth: String,
+    pub(crate) hdr: String,
+    pub(crate) video_summary: String,
+    pub(crate) audio_summary: String,
+    pub(crate) subtitle_summary: String,
+    pub(crate) attachment_summary: String,
+}
+
+impl From<&MediaFile> for MediaFileSummary {
     fn from(file: &MediaFile) -> Self {
         let videos: Vec<_> = file.tracks_of_kind(TrackKind::Video).collect();
         let audios: Vec<_> = file.tracks_of_kind(TrackKind::Audio).collect();
@@ -50,9 +66,7 @@ impl From<&MediaFile> for MediaFileDto {
             } else {
                 format!(".{extension}")
             },
-            status: file.status,
             reader: reader_name(file),
-            container_title: file.container.title.clone().unwrap_or_default(),
             video_summary: [codec.as_str(), resolution.as_str(), bit_depth.as_str()]
                 .into_iter()
                 .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("unknown"))
@@ -67,6 +81,28 @@ impl From<&MediaFile> for MediaFileDto {
             audio_summary: language_summary(&audios),
             subtitle_summary: language_summary(&subtitles),
             attachment_summary: attachment_summary(&file.attachments),
+        }
+    }
+}
+
+impl From<&MediaFile> for MediaFileDto {
+    fn from(file: &MediaFile) -> Self {
+        let summary = MediaFileSummary::from(file);
+        Self {
+            path: summary.path,
+            file_name: summary.file_name,
+            extension: summary.extension,
+            status: file.status,
+            reader: summary.reader,
+            container_title: file.container.title.clone().unwrap_or_default(),
+            video_summary: summary.video_summary,
+            codec: summary.codec,
+            resolution: summary.resolution,
+            bit_depth: summary.bit_depth,
+            hdr: summary.hdr,
+            audio_summary: summary.audio_summary,
+            subtitle_summary: summary.subtitle_summary,
+            attachment_summary: summary.attachment_summary,
             fingerprint: (&file.fingerprint).into(),
             tracks: file.tracks.iter().map(Into::into).collect(),
             attachments: file.attachments.iter().map(Into::into).collect(),

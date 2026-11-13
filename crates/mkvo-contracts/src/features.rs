@@ -7,6 +7,7 @@ use mkvo_domain::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::media::MediaFileSummary;
 use crate::{JobSnapshot, JobStatus, MediaAttachmentDto, MediaFileDto, SourceRoot};
 use mkvo_domain::JobId;
 
@@ -51,21 +52,21 @@ pub struct MediaFileRow {
 
 impl From<&MediaFile> for MediaFileRow {
     fn from(file: &MediaFile) -> Self {
-        let dto = MediaFileDto::from(file);
+        let summary = MediaFileSummary::from(file);
         Self {
-            path: dto.path,
-            file_name: dto.file_name,
-            extension: dto.extension,
+            path: summary.path,
+            file_name: summary.file_name,
+            extension: summary.extension,
             status: compatibility_status(file),
-            reader: dto.reader,
-            codec: dto.codec,
-            resolution: dto.resolution,
-            bit_depth: dto.bit_depth,
-            hdr: dto.hdr,
-            video_summary: dto.video_summary,
-            audio_summary: dto.audio_summary,
-            subtitle_summary: dto.subtitle_summary,
-            attachment_summary: dto.attachment_summary,
+            reader: summary.reader,
+            codec: summary.codec,
+            resolution: summary.resolution,
+            bit_depth: summary.bit_depth,
+            hdr: summary.hdr,
+            video_summary: summary.video_summary,
+            audio_summary: summary.audio_summary,
+            subtitle_summary: summary.subtitle_summary,
+            attachment_summary: summary.attachment_summary,
             tracks: file
                 .tracks
                 .iter()
@@ -89,7 +90,7 @@ impl From<&MediaFile> for MediaFileRow {
                     forced: track.forced,
                 })
                 .collect(),
-            attachments: dto.attachments,
+            attachments: file.attachments.iter().map(Into::into).collect(),
         }
     }
 }
