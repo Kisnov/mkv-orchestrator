@@ -202,13 +202,10 @@ impl RateLimiter {
     }
 
     async fn acquire(&self) {
-        let slot = {
-            let mut next = self.next.lock().await;
-            let slot = (*next).max(Instant::now());
-            *next = slot + self.interval;
-            slot
-        };
-        tokio::time::sleep_until(slot).await;
+        // Held through the wait so a canceled waiter gives its slot back.
+        let mut next = self.next.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = Instant::now() + self.interval;
     }
 }
 
@@ -385,6 +382,17 @@ mod tests {
         limiter.acquire().await;
         limiter.acquire().await;
         assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_canceled_wait_does_not_keep_its_slot() {
+        let limiter = RateLimiter::new(Duration::from_secs(2));
+        let started = Instant::now();
+        limiter.acquire().await;
+        let canceled = tokio::time::timeout(Duration::from_secs(1), limiter.acquire()).await;
+        assert!(canceled.is_err());
+        limiter.acquire().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
     }
 
     #[test]
