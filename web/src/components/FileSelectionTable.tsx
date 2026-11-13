@@ -88,7 +88,7 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <h2 className="text-base font-semibold">{title}</h2>
-          <div className="mt-1 text-xs text-muted">{selected.size} of {files.length} selected{filter.trim() ? <span> · {rows.length} shown</span> : null}</div>
+          <div aria-live="polite" className="mt-1 text-xs text-muted">{selected.size} of {files.length} selected{filter.trim() ? <span> · {rows.length} shown</span> : null}</div>
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <input type="search" aria-label="Filter files by name" placeholder="Filter by name" value={filter} onChange={(event) => selection.setFilter(event.target.value)} className="h-8 w-40 rounded-md border border-border bg-input px-2.5 text-xs text-text outline-none placeholder:text-subtle focus:border-accent" />
@@ -121,7 +121,8 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
         </> : null}
       </div>
       <div className="mt-3 min-h-0 flex-1 overflow-auto" aria-label={label}>
-        <table className="file-info-table file-selection-table border-collapse text-left text-sm">
+        {/* With row picking the rows are the controls, so it is a grid of selectable rows. */}
+        <table role={onActivate ? "grid" : undefined} aria-multiselectable={onActivate ? true : undefined} className="file-info-table file-selection-table border-collapse text-left text-sm">
           <thead className="sticky top-0 bg-card text-xs text-text">
             <tr>
               {[{ key: "file", label: "File" }, ...columns].map(({ key, label: heading }) => (
@@ -143,6 +144,8 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
                   aria-label={`Select ${file.fileName}`}
                   checked={selected.has(file.path)}
                   disabled={reasons.has(file.path)}
+                  // Space on the row checks it, so the row is the single tab stop.
+                  tabIndex={onActivate ? -1 : undefined}
                   title={reasons.get(file.path)}
                   onChange={(event) => {
                     const shiftKey = shiftOnLabel.current || (event.nativeEvent as MouseEvent).shiftKey;
@@ -157,6 +160,7 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
                     ref={(element) => { if (element) rowElements.current.set(file.path, element); else rowElements.current.delete(file.path); }}
                     tabIndex={onActivate ? (file.path === focusPath ? 0 : -1) : undefined}
                     aria-current={active ? "true" : undefined}
+                    aria-selected={onActivate ? selected.has(file.path) : undefined}
                     onClick={onActivate ? (event) => { if (!(event.target as Element).closest("input, button, label")) onActivate(file.path); } : undefined}
                     onKeyDown={onActivate ? (event) => onRowKeyDown(event, file.path) : undefined}
                     className={[

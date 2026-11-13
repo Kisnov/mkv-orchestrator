@@ -342,3 +342,23 @@ describe("FileSelectionTable colours", () => {
     expect(within(row("02.mkv")).getByText("Scanned")).toHaveClass("text-success");
   });
 });
+
+describe("FileSelectionTable accessibility", () => {
+  it("keeps picking rows in one tab stop and exposes their checked state on the row", async () => {
+    const user = userEvent.setup();
+    render(<ActiveHarness />);
+
+    expect(screen.getByRole("grid")).toHaveAttribute("aria-multiselectable", "true");
+    expect(box("01.mkv")).toHaveAttribute("tabindex", "-1");
+    expect(row("01.mkv")).toHaveAttribute("aria-selected", "true");
+    expect(row("04.mkv")).toHaveAttribute("aria-selected", "false");
+    row("04.mkv").focus();
+    await user.keyboard(" ");
+    expect(row("04.mkv")).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("announces the selected count politely", () => {
+    render(<Harness />);
+    expect(screen.getByText("3 of 6 selected").closest("[aria-live]")).toHaveAttribute("aria-live", "polite");
+  });
+});
