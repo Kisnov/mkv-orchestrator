@@ -456,7 +456,8 @@ impl LiveJob {
     }
 
     /// Reach a terminal state. Subscribers are told even when the repository
-    /// write fails; that error is returned so the job can stay in memory.
+    /// write fails; that error is returned so the job can stay in memory. A
+    /// refused event is not: the stored snapshot already says how it ended.
     async fn terminate(
         &self,
         apply: impl FnOnce(&mut JobSnapshot) -> JobEvent,
@@ -472,9 +473,9 @@ impl LiveJob {
         };
         let persisted = self.persist().await.map(drop);
         let envelope = self.envelope(event);
-        let stored = self.repository.append_event(&envelope).await;
+        let _ = self.repository.append_event(&envelope).await;
         let _ = self.events.send(envelope);
-        persisted.and(stored.map_err(Into::into))
+        persisted
     }
 
     async fn finish(&self, outcome: ApplicationResult<JobCompletion>) -> ApplicationResult<()> {
@@ -1048,12 +1049,13 @@ mod tests {
         wait_for_status(&supervisor, next.id, JobStatus::Completed).await;
     }
 
-    /// Counts snapshot writes and can refuse the terminal one.
+    /// Counts snapshot writes and can refuse the terminal one or the events.
     #[derive(Default)]
     struct ObservedRepository {
         inner: InMemoryJobRepository,
         updates: AtomicUsize,
         refuse_terminal: bool,
+        refuse_events: bool,
     }
 
     #[async_trait]
@@ -1090,6 +1092,9 @@ mod tests {
         }
 
         async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
+            if self.refuse_events {
+                return Err(PortError::Other("disk full".to_owned()));
+            }
             self.inner.append_event(event).await
         }
     }
@@ -1125,6 +1130,34 @@ mod tests {
         assert_eq!(stored.status, JobStatus::Running);
         let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
         assert_eq!(snapshot.status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_saved_terminal_state_leaves_memory_even_if_its_event_was_refused() {
+        let repository = Arc::new(ObservedRepository {
+            refuse_events: true,
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(
+            JobSupervisor::new(repository.clone())
+                .with_completed_job_retention(Duration::from_millis(5)),
+        );
+        let accepted = supervisor
+            .start(spec("unlogged-key", Vec::new()), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..400 {
+            if !supervisor.live.read().await.contains_key(&accepted.id) {
+                let stored = repository.get(accepted.id).await.unwrap().unwrap();
+                assert_eq!(stored.status, JobStatus::Completed);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("a durable terminal job stayed in live memory");
     }
 
     fn discovered(path: &str) -> JobEvent {
