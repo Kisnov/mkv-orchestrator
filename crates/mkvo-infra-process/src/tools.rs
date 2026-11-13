@@ -101,6 +101,7 @@ impl ToolRegistryBuilder {
                 search_directories: self.search_directories,
             })),
             versions: Arc::new(RwLock::new(HashMap::new())),
+            resolved: Arc::default(),
         }
     }
 }
@@ -141,6 +142,9 @@ pub struct ToolRegistry {
     /// and every apply, and the answer only changes when the binary does -- so
     /// it is measured once per binary rather than once per operation.
     versions: Arc<RwLock<HashMap<ToolKind, (ToolIdentity, ToolStatus)>>>,
+    /// Paths already searched for, kept while the file is still there, with
+    /// the configuration generation they were found under.
+    resolved: Arc<RwLock<(u64, HashMap<ToolKind, PathBuf>)>>,
 }
 
 impl ToolRegistry {
@@ -165,9 +169,39 @@ impl ToolRegistry {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *configuration = next;
+        drop(configuration);
+        let mut resolved = self
+            .resolved
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolved.0 += 1;
+        resolved.1.clear();
     }
 
     pub fn resolve(&self, kind: ToolKind) -> Option<ResolvedTool> {
+        let (generation, remembered) = {
+            let resolved = self
+                .resolved
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (resolved.0, resolved.1.get(&kind).cloned())
+        };
+        if let Some(path) = remembered.filter(|path| path.is_file()) {
+            return Some(ResolvedTool { kind, path });
+        }
+        let found = self.search(kind)?;
+        let mut resolved = self
+            .resolved
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reconfigure during the search makes this answer stale.
+        if resolved.0 == generation {
+            resolved.1.insert(kind, found.path.clone());
+        }
+        Some(found)
+    }
+
+    fn search(&self, kind: ToolKind) -> Option<ResolvedTool> {
         let configuration = self
             .configuration
             .read()
@@ -464,6 +498,53 @@ mod version_cache_tests {
             registry.cached_status(ToolKind::MkvMerge, &tool_identity(&tool)),
             None,
             "a replaced binary must be measured again"
+        );
+    }
+
+    /// Every probe resolves its tool, so the search over every directory and
+    /// `PATH` runs once per tool, until the result vanishes or settings change.
+    #[test]
+    fn a_resolved_tool_is_remembered_until_it_vanishes() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (first, second) = (directory.path().join("a"), directory.path().join("b"));
+        std::fs::create_dir_all(&first).expect("first dir");
+        std::fs::create_dir_all(&second).expect("second dir");
+        let name = ToolKind::MkvMerge.executable_name();
+        std::fs::write(second.join(&name), b"binary").expect("write tool");
+        let registry = ToolRegistry::builder()
+            .search_directory(&first)
+            .search_directory(&second)
+            .build();
+        let found = |registry: &ToolRegistry| registry.resolve(ToolKind::MkvMerge).unwrap().path;
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&second).unwrap()));
+
+        // A copy appearing earlier in the search order is not looked for again.
+        std::fs::write(first.join(&name), b"binary").expect("write earlier tool");
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&second).unwrap()));
+
+        std::fs::remove_file(second.join(&name)).expect("remove tool");
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&first).unwrap()));
+    }
+
+    #[test]
+    fn reconfiguring_forgets_resolved_tools() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (first, second) = (directory.path().join("a"), directory.path().join("b"));
+        std::fs::create_dir_all(&first).expect("first dir");
+        std::fs::create_dir_all(&second).expect("second dir");
+        let name = ToolKind::MkvMerge.executable_name();
+        std::fs::write(first.join(&name), b"binary").expect("write first");
+        std::fs::write(second.join(&name), b"binary").expect("write second");
+        let registry = ToolRegistry::builder().search_directory(&first).build();
+        registry.resolve(ToolKind::MkvMerge).unwrap();
+
+        registry.reconfigure(std::iter::empty(), [second.clone()]);
+        assert!(
+            registry
+                .resolve(ToolKind::MkvMerge)
+                .unwrap()
+                .path
+                .starts_with(std::fs::canonicalize(&second).unwrap())
         );
     }
 
