@@ -62,7 +62,7 @@ impl MkvoRuntime {
     pub async fn start_watchers(&self) -> RuntimeResult<WatchStartReport> {
         // Every host calls this once at startup, whether or not it watches.
         self.spawn_history_pruning();
-        let settings = self.settings_service().load().await?.settings;
+        let settings = self.settings_service().load_settings().await?;
         let Some(watcher) = self.dependencies().watcher.clone() else {
             return Ok(WatchStartReport {
                 enabled: settings.watch.enabled,
