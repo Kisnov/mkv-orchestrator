@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::warn;
 
 use crate::{
@@ -9,6 +11,7 @@ use crate::{
 };
 
 const JOB_PROGRESS_EVENT: &str = "mkvo-job-progress";
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 
 fn job_progress_payload(kind: &'static str, job: &Value) -> Option<Value> {
     let Some(job_id) = job.get("id").and_then(Value::as_str) else {
@@ -32,9 +35,30 @@ fn emit_job_progress(app: &AppHandle, kind: &'static str, job: &Value) {
     }
 }
 
+/// Run `emit_current` after each burst of job events, at most once per
+/// `interval`, until it reports the job has ended. A scan announces every file,
+/// and sending the whole job to the window for each one floods it.
+async fn relay_progress<T: Clone, F: Future<Output = bool>>(
+    mut events: broadcast::Receiver<T>,
+    interval: Duration,
+    mut emit_current: impl FnMut() -> F,
+) {
+    loop {
+        let emitted_at = tokio::time::Instant::now();
+        if emit_current().await {
+            return;
+        }
+        match events.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+        tokio::time::sleep_until(emitted_at + interval).await;
+    }
+}
+
 fn follow_scan_progress(app: AppHandle, runtime: RuntimeState, job_id: String) {
     tauri::async_runtime::spawn(async move {
-        let mut events = match runtime.subscribe_job_events(&job_id).await {
+        let events = match runtime.subscribe_job_events(&job_id).await {
             Ok(events) => events,
             Err(error) => {
                 warn!(%error, %job_id, "could not subscribe to scan progress");
@@ -42,7 +66,7 @@ fn follow_scan_progress(app: AppHandle, runtime: RuntimeState, job_id: String) {
             }
         };
 
-        loop {
+        relay_progress(events, PROGRESS_EMIT_INTERVAL, || async {
             match runtime.get_scan_job(&job_id).await {
                 Ok(job) => {
                     let terminal = job.status.is_terminal();
@@ -52,27 +76,21 @@ fn follow_scan_progress(app: AppHandle, runtime: RuntimeState, job_id: String) {
                             warn!(%error, %job_id, "could not serialize scan progress");
                         }
                     }
-                    if terminal {
-                        return;
-                    }
+                    terminal
                 }
                 Err(error) => {
                     warn!(%error, %job_id, "could not load scan progress");
-                    return;
+                    true
                 }
             }
-
-            match events.recv().await {
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
-            }
-        }
+        })
+        .await;
     });
 }
 
 fn follow_operation_progress(app: AppHandle, runtime: RuntimeState, job_id: String) {
     tauri::async_runtime::spawn(async move {
-        let mut events = match runtime.subscribe_job_events(&job_id).await {
+        let events = match runtime.subscribe_job_events(&job_id).await {
             Ok(events) => events,
             Err(error) => {
                 warn!(%error, %job_id, "could not subscribe to operation progress");
@@ -80,7 +98,7 @@ fn follow_operation_progress(app: AppHandle, runtime: RuntimeState, job_id: Stri
             }
         };
 
-        loop {
+        relay_progress(events, PROGRESS_EMIT_INTERVAL, || async {
             match runtime.get_operation_job(&job_id).await {
                 Ok(job) => {
                     let terminal = job.status.is_terminal();
@@ -90,21 +108,15 @@ fn follow_operation_progress(app: AppHandle, runtime: RuntimeState, job_id: Stri
                             warn!(%error, %job_id, "could not serialize operation progress");
                         }
                     }
-                    if terminal {
-                        return;
-                    }
+                    terminal
                 }
                 Err(error) => {
                     warn!(%error, %job_id, "could not load operation progress");
-                    return;
+                    true
                 }
             }
-
-            match events.recv().await {
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
-            }
-        }
+        })
+        .await;
     });
 }
 
@@ -459,7 +471,47 @@ pub async fn clear_logs(runtime: State<'_, RuntimeState>) -> CommandResult {
 
 #[cfg(test)]
 mod tests {
-    use super::job_progress_payload;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn progress_bursts_reach_the_window_at_a_bounded_rate() {
+        let (sender, receiver) = broadcast::channel(256);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicBool::new(false));
+        let relay = tokio::spawn({
+            let (emitted, ended) = (Arc::clone(&emitted), Arc::clone(&ended));
+            relay_progress(receiver, Duration::from_millis(200), move || {
+                emitted.fetch_add(1, Ordering::SeqCst);
+                let ended = ended.load(Ordering::SeqCst);
+                async move { ended }
+            })
+        });
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            sender.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let elapsed = started.elapsed().as_millis();
+        ended.store(true, Ordering::SeqCst);
+        sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay stops once the job ends")
+            .unwrap();
+
+        // One emit to start, then at most one per 200 ms, plus the last one.
+        let limit = 2 + usize::try_from(elapsed / 200).unwrap() + 1;
+        let emitted = emitted.load(Ordering::SeqCst);
+        assert!(
+            (2..=limit).contains(&emitted),
+            "{emitted} emits in {elapsed} ms"
+        );
+    }
 
     #[test]
     fn job_progress_payload_matches_the_frontend_contract() {
