@@ -9,6 +9,7 @@ import {
   getLibraryArtwork,
   getLibraryCatalog,
   getLibraryLocalArtwork,
+  getCurrentScanFiles,
   getScanJob,
   getWebSettings,
   libraryArtworkUrl,
@@ -16,6 +17,7 @@ import {
   LibraryAuditRow,
   LibraryCatalogItem,
   MediaFileRow,
+  setFileSelection,
   startScan,
   WebSettings
 } from "../api";
@@ -24,9 +26,9 @@ import { useMediaLibrary } from "../state/MediaLibraryContext";
 
 type LibraryFilter = "all" | "matching" | "mismatch";
 
+// Only the audit is kept: the file rows come back from the backend on a handoff.
 type LibraryViewSnapshot = {
   auditResult: LibraryAuditResponse;
-  libraryFiles: MediaFileRow[];
   statusText: string;
   artworkGeneration: number;
 };
@@ -58,7 +60,6 @@ export function LibraryPage() {
   const { setWorkingView } = useMediaLibrary();
   const webSettings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
   const [auditResult, setAuditResult] = useState<LibraryAuditResponse | null>(null);
-  const [libraryFiles, setLibraryFiles] = useState<MediaFileRow[]>([]);
   const [selectedTitleId, setSelectedTitleId] = useState("");
   const [selectedSource, setSelectedSource] = useState("");
   const [scanJobId, setScanJobId] = useState<string | null>(null);
@@ -142,6 +143,7 @@ export function LibraryPage() {
     queryKey: ["library-cache-job", scanJobId],
     queryFn: () => getScanJob(scanJobId!),
     enabled: scanJobId !== null,
+    gcTime: 0,
     refetchInterval: (query) => {
       const job = query.state.data;
       return job && ["Completed", "Failed", "Skipped", "Canceled"].includes(job.status) ? false : 1000;
@@ -178,14 +180,15 @@ export function LibraryPage() {
       const pending = pendingTitleRebuild;
       setPendingTitleRebuild(null);
       setIsAuditingLibraries(true);
+      // The audit needs only the paths; dropping the job lets its rows go.
+      setScanJobId(null);
       void buildLibraryAudit(currentScanJob.files).then((response) => {
-        const snapshot = mergeTitleSnapshot(pending.sourceId, pending.title, currentScanJob.files, response);
+        const snapshot = mergeTitleSnapshot(pending.sourceId, pending.title, response);
         libraryViewCache.set(pending.sourceId, snapshot);
         const source = sourceOptions.find((candidate) => candidate.id === pending.sourceId);
         if (source) void persistLibrarySnapshot(source.id, librarySnapshotSignature(source, webSettings.data), snapshot);
         if (mounted.current && selectedSourceRef.current === pending.sourceId) {
           setAuditResult(snapshot.auditResult);
-          setLibraryFiles(snapshot.libraryFiles);
           setArtworkGeneration(snapshot.artworkGeneration);
           setStatusText(snapshot.statusText);
         }
@@ -197,16 +200,16 @@ export function LibraryPage() {
     } else if (currentScanJob.status === "Completed" && currentScanJob.id === pendingOverviewScanId) {
       setPendingOverviewScanId(null);
       setIsAuditingLibraries(true);
+      setScanJobId(null);
       const sources = buildSourcesRef.current;
       void Promise.allSettled(sources.map(async (source) => {
         const files = filesForLibrarySource(currentScanJob.files, source);
         const response = await buildLibraryAudit(files);
-        const snapshot = librarySnapshot(source.id, files, response);
+        const snapshot = librarySnapshot(source.id, response);
         libraryViewCache.set(source.id, snapshot);
         void persistLibrarySnapshot(source.id, librarySnapshotSignature(source, webSettings.data), snapshot);
         if (mounted.current && selectedSourceRef.current === source.id) {
           setAuditResult(snapshot.auditResult);
-          setLibraryFiles(snapshot.libraryFiles);
           setArtworkGeneration(snapshot.artworkGeneration);
           setStatusText(snapshot.statusText);
         }
@@ -273,14 +276,15 @@ export function LibraryPage() {
         if (libraryViewCache.has(source.id)) continue;
         const stored = await loadLibrarySnapshot(source.id);
         if (!canceled && stored?.signature === librarySnapshotSignature(source, webSettings.data)) {
-          libraryViewCache.set(source.id, stored.snapshot);
+          // Older snapshots also stored every file row; keep only what is used.
+          const { auditResult, statusText, artworkGeneration } = stored.snapshot;
+          libraryViewCache.set(source.id, { auditResult, statusText, artworkGeneration });
         }
       }
       if (canceled) return;
       const restored = libraryViewCache.get(selectedSourceRef.current);
       if (restored) {
         setAuditResult(restored.auditResult);
-        setLibraryFiles(restored.libraryFiles);
         setArtworkGeneration(restored.artworkGeneration);
         setStatusText(restored.statusText);
       }
@@ -337,7 +341,6 @@ export function LibraryPage() {
     const cached = libraryViewCache.get(id);
     setSelectedSource(id);
     setAuditResult(cached?.auditResult ?? null);
-    setLibraryFiles(cached?.libraryFiles ?? []);
     setArtworkGeneration(cached?.artworkGeneration ?? 0);
     setStatusText(cached?.statusText ?? "Loading this library automatically...");
   }
@@ -346,11 +349,6 @@ export function LibraryPage() {
     if (sourceOptions.length === 0) {
       setStatusText("Configure a library first.");
       return;
-    }
-    // Keep a completed view visible during Refresh/Rebuild. It is replaced
-    // atomically when the new scan and audit finish.
-    if (!auditResult) {
-      setLibraryFiles([]);
     }
     setSelectedTitleId("");
     startLibraryBuild(forceRefresh);
@@ -388,12 +386,23 @@ export function LibraryPage() {
     });
   }
 
-  function handoffToDashboard(title: LibraryTitle, mode: "mismatch" | "all") {
+  async function handoffToDashboard(title: LibraryTitle, mode: "mismatch" | "all") {
     const paths = mode === "all"
       ? title.allFilePaths
       : uniquePaths(title.seasons.flatMap((season) => season.hasIssues ? [season.templateFilePath, ...season.issueFilePaths] : []));
     const wanted = new Set(paths.map(normalizePath));
-    const selectedFiles = libraryFiles.filter((file) => wanted.has(normalizePath(file.path)));
+    setStatusText(`Sending ${title.title} to Dashboard...`);
+    let scannedFiles: MediaFileRow[];
+    try {
+      // The backend reads these files from its probe cache and holds them as the working set.
+      await setFileSelection(paths, true);
+      scannedFiles = (await getCurrentScanFiles()).files;
+    } catch (error) {
+      if (mounted.current) setStatusText(error instanceof Error ? error.message : "The files could not be sent to Dashboard.");
+      return;
+    }
+    if (!mounted.current) return;
+    const selectedFiles = scannedFiles.filter((file) => wanted.has(normalizePath(file.path)));
     if (selectedFiles.length === 0) {
       setStatusText("The selected title has no scanned files available for Dashboard.");
       return;
@@ -511,7 +520,7 @@ export function LibraryPage() {
         </div>
       </section>
 
-      {selectedTitle ? <LibraryTitleDialog title={selectedTitle} serverId={selectedSourceOption?.serverId} onClose={() => setSelectedTitleId("")} onSendMismatches={() => handoffToDashboard(selectedTitle, "mismatch")} onSendAll={() => handoffToDashboard(selectedTitle, "all")} onRebuild={() => rebuildTitle(selectedTitle)} /> : null}
+      {selectedTitle ? <LibraryTitleDialog title={selectedTitle} serverId={selectedSourceOption?.serverId} onClose={() => setSelectedTitleId("")} onSendMismatches={() => void handoffToDashboard(selectedTitle, "mismatch")} onSendAll={() => void handoffToDashboard(selectedTitle, "all")} onRebuild={() => rebuildTitle(selectedTitle)} /> : null}
       {contextMenu ? <LibraryPosterContextMenu x={contextMenu.x} y={contextMenu.y} title={titles.find((title) => title.id === contextMenu.titleId) ?? null} disabled={isBusy} onRebuild={rebuildTitle} /> : null}
     </div>
   );
@@ -717,15 +726,14 @@ function filesForLibrarySource(files: MediaFileRow[], source: LibrarySourceOptio
     return roots.some((root) => path === root || path.startsWith(`${root}/`));
   });
 }
-function librarySnapshot(sourceId: string, files: MediaFileRow[], response: LibraryAuditResponse): LibraryViewSnapshot {
+function librarySnapshot(sourceId: string, response: LibraryAuditResponse): LibraryViewSnapshot {
   return {
     auditResult: response,
-    libraryFiles: files,
     statusText: `Library ready: ${response.summary.groups} season/folder groups, ${response.summary.files} files, ${response.summary.issueGroups} warning groups.`,
     artworkGeneration: (libraryViewCache.get(sourceId)?.artworkGeneration ?? 0) + 1
   };
 }
-function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, files: MediaFileRow[], response: LibraryAuditResponse): LibraryViewSnapshot {
+function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, response: LibraryAuditResponse): LibraryViewSnapshot {
   const previous = libraryViewCache.get(sourceId);
   const roots = title.seasons.map((season) => normalizePath(season.folderPath));
   const isInTitle = (path: string) => {
@@ -736,10 +744,6 @@ function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, files: MediaF
     ...(previous?.auditResult.items ?? []).filter((row) => !isInTitle(row.folderPath)),
     ...response.items
   ];
-  const libraryFiles = uniqueFiles([
-    ...(previous?.libraryFiles ?? []).filter((file) => !isInTitle(file.path)),
-    ...files
-  ]);
   const issueGroups = items.filter((row) => row.hasIssues).length;
   return {
     auditResult: {
@@ -751,7 +755,6 @@ function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, files: MediaF
         standardGroups: items.length - issueGroups
       }
     },
-    libraryFiles,
     statusText: `${title.title} rebuilt: ${response.summary.files} files, ${response.summary.issueGroups} warning groups.`,
     artworkGeneration: (previous?.artworkGeneration ?? 0) + 1
   };
@@ -761,15 +764,6 @@ function titleSourcePaths(title: LibraryTitle) {
     const folder = folderName(season.folderPath);
     return isSeasonFolderName(folder) ? parentPath(season.folderPath) : season.folderPath;
   }));
-}
-function uniqueFiles(files: MediaFileRow[]) {
-  const seen = new Set<string>();
-  return files.filter((file) => {
-    const key = normalizePath(file.path);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 function uniquePaths(paths: string[]) {
   const seen = new Set<string>();

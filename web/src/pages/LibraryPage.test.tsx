@@ -129,6 +129,7 @@ describe("Library poster workflow", () => {
     }];
     const files = rows.flatMap((row) => row.allFilePaths.map(media));
     const previous = media("/media/old/Previous Scan.mkv");
+    let workingSet = [previous];
     const handoffSettings = settings();
     handoffSettings.mediaServers[0].libraries[0].containerPath = "/media/handoff";
     const completedJob = {
@@ -157,17 +158,15 @@ describe("Library poster workflow", () => {
         startScan: () => Promise.resolve({ ...completedJob, status: "Queued", files: [] }),
         getScanJob: () => Promise.resolve(completedJob),
         buildLibraryAudit: () => Promise.resolve({ summary: { groups: 1, files: files.length, issueGroups: 1, standardGroups: 0 }, items: rows }),
-        setFileSelection: (selectedPaths) => Promise.resolve({
-          updatedUtc: "2026-08-28T20:00:01Z",
-          files,
-          selectedPaths,
-          summary: completedJob.summary
-        }),
+        setFileSelection: (selectedPaths, replaceWorkingSet) => {
+          if (replaceWorkingSet) workingSet = files.filter((file) => selectedPaths.includes(file.path));
+          return Promise.resolve({ selectedPaths });
+        },
         getCurrentScanFiles: () => Promise.resolve({
-          updatedUtc: "2026-08-20T20:00:00Z",
-          files: [previous],
-          selectedPaths: [previous.path],
-          summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 }
+          updatedUtc: workingSet[0] === previous ? "2026-08-20T20:00:00Z" : "2026-08-28T20:00:01Z",
+          files: workingSet,
+          selectedPaths: workingSet.map((file) => file.path),
+          summary: { total: workingSet.length, mkv: workingSet.length, mp4: 0, failed: 0, cached: 0 }
         })
       }
     );
@@ -214,7 +213,8 @@ describe("Library poster workflow", () => {
         startScan: () => Promise.resolve({ ...completedJob, status: "Queued", files: [] }),
         getScanJob: () => Promise.resolve(completedJob),
         buildLibraryAudit: () => Promise.resolve({ summary: { groups: 2, files: 4, issueGroups: 1, standardGroups: 1 }, items: rows }),
-        setFileSelection
+        setFileSelection,
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-22T20:00:00Z", files, selectedPaths: [], summary: completedJob.summary })
       }
     );
 
@@ -457,6 +457,30 @@ describe("Library poster workflow", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
     expect(await screen.findByText(/no poster found/i)).toBeInTheDocument();
     expect(libraryArtworkUrl).not.toHaveBeenCalled();
+  });
+
+  it("sends a title to Dashboard with the backend's rows, not copies kept in the browser", async () => {
+    const user = userEvent.setup();
+    const backend = posterBackend({ getLibraryCatalog: () => Promise.resolve({ items: [] }), getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")) });
+    const held = media("/media/tv/Example Show/Season 1/Episode 01.mkv");
+    const setFileSelection = vi.fn().mockResolvedValue({ selectedPaths: [held.path] });
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      {
+        ...backend,
+        setFileSelection,
+        getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-22T20:00:00Z", files: [{ ...held, fileName: "Fresh from backend.mkv" }], selectedPaths: [], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } })
+      }
+    );
+
+    await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+
+    await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith([
+      "/media/tv/Example Show/Season 1/Episode 01.mkv",
+      "/media/tv/Example Show/Season 1/Episode 02.mkv"
+    ], true));
+    await waitFor(() => expect(setFileSelection).toHaveBeenLastCalledWith([held.path], true));
   });
 
   it("does not save an empty library when the scan's files are no longer held", async () => {
