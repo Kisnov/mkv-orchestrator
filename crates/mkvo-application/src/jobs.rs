@@ -456,7 +456,8 @@ impl LiveJob {
     }
 
     /// Reach a terminal state. Subscribers are told even when the repository
-    /// write fails; that error is returned so the job can stay in memory.
+    /// write fails; that error is returned so the job can stay in memory. A
+    /// refused event is not: the stored snapshot already says how it ended.
     async fn terminate(
         &self,
         apply: impl FnOnce(&mut JobSnapshot) -> JobEvent,
@@ -472,9 +473,9 @@ impl LiveJob {
         };
         let persisted = self.persist().await.map(drop);
         let envelope = self.envelope(event);
-        let stored = self.repository.append_event(&envelope).await;
+        let _ = self.repository.append_event(&envelope).await;
         let _ = self.events.send(envelope);
-        persisted.and(stored.map_err(Into::into))
+        persisted
     }
 
     async fn finish(&self, outcome: ApplicationResult<JobCompletion>) -> ApplicationResult<()> {
@@ -580,15 +581,15 @@ impl JobContext {
                 snapshot.total = total;
                 snapshot.current_file.clone_from(&current_file);
                 snapshot.current_file_percent = current_file_percent.min(100);
+                // Under the lock, like status changes, so events keep its order.
+                self.live.publish(JobEvent::Progress {
+                    completed: snapshot.completed,
+                    total,
+                    current_file,
+                    current_file_percent: snapshot.current_file_percent,
+                });
             })
-            .await?;
-        self.live.publish(JobEvent::Progress {
-            completed: completed.min(total),
-            total,
-            current_file,
-            current_file_percent: current_file_percent.min(100),
-        });
-        Ok(())
+            .await
     }
 
     pub async fn record_completed(&self) -> ApplicationResult<()> {
@@ -624,10 +625,9 @@ impl JobContext {
                 if snapshot.lines.len() > limit {
                     snapshot.lines.drain(0..snapshot.lines.len() - limit);
                 }
+                self.live.publish(JobEvent::Log { level, line });
             })
-            .await?;
-        self.live.publish(JobEvent::Log { level, line });
-        Ok(())
+            .await
     }
 
     pub async fn emit(&self, event: JobEvent) -> ApplicationResult<()> {
@@ -1048,12 +1048,16 @@ mod tests {
         wait_for_status(&supervisor, next.id, JobStatus::Completed).await;
     }
 
-    /// Counts snapshot writes and can refuse the terminal one.
+    /// Counts snapshot writes and can refuse the terminal one or the events.
     #[derive(Default)]
     struct ObservedRepository {
         inner: InMemoryJobRepository,
         updates: AtomicUsize,
         refuse_terminal: bool,
+        refuse_events: bool,
+        /// Holds the first write of a snapshot with one file done until released.
+        hold_first_file: Option<Arc<tokio::sync::Semaphore>>,
+        held: Notify,
     }
 
     #[async_trait]
@@ -1065,6 +1069,12 @@ mod tests {
         async fn update(&self, snapshot: &JobSnapshot) -> Result<(), PortError> {
             if self.refuse_terminal && snapshot.status.is_terminal() {
                 return Err(PortError::Other("disk full".to_owned()));
+            }
+            if let Some(gate) = &self.hold_first_file
+                && snapshot.completed == 1
+            {
+                self.held.notify_one();
+                gate.acquire().await.unwrap().forget();
             }
             self.updates.fetch_add(1, Ordering::SeqCst);
             self.inner.update(snapshot).await
@@ -1090,6 +1100,9 @@ mod tests {
         }
 
         async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
+            if self.refuse_events {
+                return Err(PortError::Other("disk full".to_owned()));
+            }
             self.inner.append_event(event).await
         }
     }
@@ -1125,6 +1138,34 @@ mod tests {
         assert_eq!(stored.status, JobStatus::Running);
         let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
         assert_eq!(snapshot.status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_saved_terminal_state_leaves_memory_even_if_its_event_was_refused() {
+        let repository = Arc::new(ObservedRepository {
+            refuse_events: true,
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(
+            JobSupervisor::new(repository.clone())
+                .with_completed_job_retention(Duration::from_millis(5)),
+        );
+        let accepted = supervisor
+            .start(spec("unlogged-key", Vec::new()), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..400 {
+            if !supervisor.live.read().await.contains_key(&accepted.id) {
+                let stored = repository.get(accepted.id).await.unwrap().unwrap();
+                assert_eq!(stored.status, JobStatus::Completed);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("a durable terminal job stayed in live memory");
     }
 
     fn discovered(path: &str) -> JobEvent {
@@ -1213,6 +1254,45 @@ mod tests {
         assert_eq!(stored.completed, 2);
         let live = supervisor.get(accepted.id).await.unwrap().unwrap();
         assert_eq!(live.current_file, "b.mkv");
+    }
+
+    /// A save in flight must not let a later update be announced first.
+    #[tokio::test(start_paused = true)]
+    async fn progress_is_announced_in_the_order_it_changed() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let repository = Arc::new(ObservedRepository {
+            hold_first_file: Some(Arc::clone(&gate)),
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let observed = Arc::clone(&repository);
+        let accepted = supervisor
+            .start(spec("ordered-key", Vec::new()), |context| async move {
+                released.await.unwrap();
+                tokio::time::sleep(PROGRESS_PERSIST_INTERVAL).await;
+                let first = context.clone();
+                let first = tokio::spawn(async move { first.progress(1, 3, "a.mkv", 100).await });
+                observed.held.notified().await;
+                context.progress(2, 3, "b.mkv", 100).await?;
+                gate.add_permits(10);
+                first.await.unwrap()?;
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+        release.send(()).unwrap();
+
+        let mut announced = Vec::new();
+        loop {
+            match events.recv().await.unwrap().event {
+                JobEvent::Progress { completed, .. } => announced.push(completed),
+                JobEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(announced, [1, 2]);
     }
 
     #[tokio::test]
