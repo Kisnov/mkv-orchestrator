@@ -443,6 +443,39 @@ describe("Library poster workflow", () => {
     expect(screen.queryByRole("img", { name: "Example Show poster" })).not.toBeInTheDocument();
   });
 
+  it("asks again after an answer that was not about the key", async () => {
+    const show = (name: string): LibraryAuditRow => ({ ...auditRow(1, false), folderPath: `/media/tv/${name}/Season 1`, folderName: `${name} / Season 1`, allFilePaths: [`/media/tv/${name}/Season 1/Episode 01.mkv`] });
+    const rows = [show("Alpha Show"), show("Beta Show"), show("Gamma Show")];
+    let release: () => void = () => undefined;
+    const getLibraryArtwork = vi.fn()
+      .mockImplementationOnce(() => new Promise((_, reject) => { release = () => reject(new ApiError("Not found", { code: "not_found", status: 404 })); }))
+      .mockRejectedValue(new ApiError("Jellyfin rejected the stored API key.", { code: "credential_rejected", status: 424 }));
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({
+        getLibraryArtwork,
+        getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")),
+        getLibraryCatalog: () => Promise.resolve({ items: [
+          { id: "alpha", title: "Alpha Show", year: 2024, mediaType: "series", hasPoster: true },
+          { id: "beta", title: "Beta Show", year: 2024, mediaType: "series", hasPoster: true },
+          { id: "gamma", title: "Gamma Show", year: 2024, mediaType: "series", hasPoster: true }
+        ] }),
+        buildLibraryAudit: () => Promise.resolve({ summary: { groups: 3, files: 3, issueGroups: 0, standardGroups: 3 }, items: rows })
+      })
+    );
+
+    fireEvent.error(await screen.findByRole("img", { name: "Alpha Show poster" }));
+    fireEvent.error(screen.getByRole("img", { name: "Beta Show poster" }));
+    expect(getLibraryArtwork).toHaveBeenCalledTimes(1);
+    release();
+    await waitFor(() => expect(getLibraryArtwork.mock.results[0].value).rejects.toThrow("Not found"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.error(screen.getByRole("img", { name: "Gamma Show poster" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
+    expect(getLibraryArtwork).toHaveBeenCalledTimes(2);
+  });
+
   it("requests no media-server posters while the catalog says the key is rejected", async () => {
     const libraryArtworkUrl = vi.fn(() => "/poster");
     renderWithBackend(

@@ -323,7 +323,7 @@ export function LibraryPage() {
     setContextMenu({ x: event.clientX, y: event.clientY, titleId });
   }, []);
 
-  // An <img> cannot say why it failed, so the first failure per server asks once.
+  // An <img> cannot say why it failed, so a failure asks the server, one question at a time.
   const reportServerPosterError = useCallback((serverId: string, itemId: string, error?: unknown) => {
     const remember = (reason: unknown) => {
       if (!isCredentialError(reason)) return;
@@ -335,7 +335,13 @@ export function LibraryPage() {
     }
     if (probedPosterServers.current.has(serverId)) return;
     probedPosterServers.current.add(serverId);
-    getLibraryArtwork({ serverId, itemId }).catch(remember);
+    getLibraryArtwork({ serverId, itemId }).then(() => false, (reason: unknown) => {
+      remember(reason);
+      return isCredentialError(reason);
+    }).then((rejected) => {
+      // Only a refused key ends the questions; a missing poster says nothing about it.
+      if (!rejected) probedPosterServers.current.delete(serverId);
+    });
   }, []);
 
   function selectSource(id: string) {
