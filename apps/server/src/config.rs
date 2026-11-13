@@ -25,6 +25,8 @@ pub struct ServerConfig {
     pub auth_enabled: bool,
     pub auth_username: String,
     pub secure_cookies: bool,
+    pub allowed_hosts: Vec<String>,
+    pub tool_directories: Vec<PathBuf>,
     pub provider_secret_overrides: BTreeMap<String, String>,
     pub request_body_limit_bytes: usize,
     pub graceful_shutdown_seconds: u64,
@@ -57,7 +59,7 @@ impl ServerConfig {
         )?;
 
         let source_roots = parse_source_roots(get("MKVO_SOURCE_ROOTS").as_deref(), &media_root)?;
-        let legacy_mode = get("MKVO_AUTH_MODE");
+        let legacy_mode = get("MKVO_AUTH_MODE").filter(|value| !value.trim().is_empty());
         let auth_mode = legacy_mode
             .clone()
             .unwrap_or_else(|| "auto".to_owned())
@@ -105,6 +107,32 @@ impl ServerConfig {
             "basic" | "disabled" => credentials,
             _ => bail!("MKVO_AUTH_MODE must be one of: auto, basic, disabled"),
         };
+        if !auth_enabled
+            && !bind.ip().is_loopback()
+            && !parse_bool("MKVO_ALLOW_NO_LOGIN", get("MKVO_ALLOW_NO_LOGIN"))?.unwrap_or(false)
+        {
+            let text = config_dir.join("admin-password.txt");
+            let hash = config_dir.join("admin-password.hash");
+            let password = if !text.exists() && hash.exists() {
+                format!(
+                    "the password you signed in with before (only its hash is left, in {}; delete it to generate a new one)",
+                    hash.display()
+                )
+            } else {
+                format!("the password stored in {}", text.display())
+            };
+            bail!(
+                "Login is turned off (MKVO_AUTH_ENABLED=false or MKVO_AUTH_MODE=disabled) but MKVO_BIND={bind} accepts network connections, so anyone on the network could rename, remux and delete your media. Remove that setting to sign in as '{auth_username}' with {password} or with MKVO_PASSWORD, or set MKVO_ALLOW_NO_LOGIN=true to keep running without login on a trusted network"
+            );
+        }
+        let allowed_hosts = list(get("MKVO_ALLOWED_HOSTS"))
+            .into_iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+        let tool_directories = list(get("MKVO_TOOL_DIRECTORIES"))
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         let provider_secret_overrides = [
             ("MKVO_TVDB_API_KEY", "provider.tvdb.api_key"),
             ("MKVO_TVDB_PIN", "provider.tvdb.pin"),
@@ -128,6 +156,8 @@ impl ServerConfig {
             auth_enabled,
             auth_username,
             secure_cookies,
+            allowed_hosts,
+            tool_directories,
             provider_secret_overrides,
             request_body_limit_bytes,
             graceful_shutdown_seconds,
@@ -146,6 +176,16 @@ fn parse_bool(name: &str, value: Option<String>) -> Result<Option<bool>> {
         Some("false") => Ok(Some(false)),
         _ => bail!("{name} must be true or false"),
     }
+}
+
+fn list(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split([';', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_positive<T>(name: &str, value: Option<String>, default: T) -> Result<T>
@@ -297,16 +337,89 @@ mod tests {
     }
 
     #[test]
-    fn permits_explicit_unauthenticated_non_loopback_bind() {
+    fn refuses_network_bind_without_login_unless_confirmed() {
+        for (key, value) in [
+            ("MKVO_AUTH_MODE", "disabled"),
+            ("MKVO_AUTH_ENABLED", "false"),
+        ] {
+            let mut values = BTreeMap::from([("MKVO_BIND", "0.0.0.0:8080"), (key, value)]);
+            let error = ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("MKVO_ALLOW_NO_LOGIN=true"), "{error}");
+            values.insert("MKVO_ALLOW_NO_LOGIN", "true");
+            let config =
+                ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).unwrap();
+            assert!(!config.auth_enabled);
+            assert!(!config.bind.ip().is_loopback());
+        }
+        let values = BTreeMap::from([
+            ("MKVO_BIND", "127.0.0.1:8080"),
+            ("MKVO_AUTH_ENABLED", "false"),
+        ]);
+        assert!(ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).is_ok());
+    }
+
+    #[test]
+    fn refusal_names_the_file_that_holds_the_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_dir = directory.path().to_string_lossy().into_owned();
         let values = BTreeMap::from([
             ("MKVO_BIND", "0.0.0.0:8080"),
-            ("MKVO_AUTH_MODE", "disabled"),
+            ("MKVO_AUTH_ENABLED", "false"),
+            ("MKVO_CONFIG_DIR", config_dir.as_str()),
+        ]);
+        let refusal = || {
+            ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+                .err()
+                .unwrap()
+                .to_string()
+        };
+        assert!(refusal().contains("admin-password.txt"));
+        // After the first sign-in only the hash is left.
+        std::fs::write(directory.path().join("admin-password.hash"), "$argon2id$").unwrap();
+        let message = refusal();
+        assert!(message.contains("admin-password.hash"), "{message}");
+        assert!(!message.contains("admin-password.txt"), "{message}");
+    }
+
+    #[test]
+    fn blank_container_variables_keep_the_login_default() {
+        let values = BTreeMap::from([
+            ("MKVO_BIND", "0.0.0.0:8080"),
+            ("MKVO_AUTH_MODE", ""),
+            ("MKVO_AUTH_ENABLED", ""),
+            ("MKVO_TOOL_DIRECTORIES", ""),
         ]);
         let config =
             ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).unwrap();
+        assert!(config.auth_enabled);
+        assert!(config.tool_directories.is_empty());
+    }
 
-        assert!(!config.bind.ip().is_loopback());
-        assert!(config.auth.is_none());
+    #[test]
+    fn parses_allowed_hosts() {
+        let config = ServerConfig::from_lookup(|key| {
+            (key == "MKVO_ALLOWED_HOSTS").then(|| " NAS.local, mkvo.example.com ;".to_owned())
+        })
+        .unwrap();
+        assert_eq!(config.allowed_hosts, ["nas.local", "mkvo.example.com"]);
+    }
+
+    #[test]
+    fn parses_tool_directories() {
+        let config = ServerConfig::from_lookup(|key| {
+            (key == "MKVO_TOOL_DIRECTORIES").then(|| "/opt/mkvtoolnix; /opt/ffmpeg/bin".to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            config.tool_directories,
+            [
+                PathBuf::from("/opt/mkvtoolnix"),
+                PathBuf::from("/opt/ffmpeg/bin")
+            ]
+        );
     }
 
     #[test]

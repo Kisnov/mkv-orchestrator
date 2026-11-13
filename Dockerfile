@@ -49,6 +49,7 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
     && mkdir -p /media /config
 ENV MKVO_BIND=0.0.0.0:8080 \
+    RUST_LOG=info \
     MKVO_MEDIA_ROOT=/media \
     MKVO_CONFIG_DIR=/config \
     MKVO_UI_DIR=/app/web \
