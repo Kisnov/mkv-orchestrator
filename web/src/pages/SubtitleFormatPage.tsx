@@ -204,6 +204,7 @@ export function SubtitleFormatPage() {
       onPreview={() => { if (canRun) run.preview(request()); }}
       onApply={() => { if (canRun) void run.apply(request()); }}
       selectedText={`${selectedMkvPaths.length} files selected · ${selectedTrackCount} tracks across ${compatibleCount} files`}
+      hiddenSelected={selectedMkvPaths.filter(selection.isHidden).length}
       options={<div className="space-y-3">
         <h2 className="text-base font-semibold">Format Options</h2>
         <label className="block"><span className="text-xs font-semibold text-muted">Saved font</span><select aria-label="Saved font" value={selectedFontId} onChange={(event) => { const font = fontLibrary.find((item) => item.id === event.target.value); if (font) void selectFont(font); }} className="mt-1.5 h-9 w-full rounded-md border border-border bg-input px-2 text-sm"><optgroup label="Bundled fonts">{fontLibrary.filter((font) => font.builtIn).map((font) => <option key={font.id} value={font.id}>{font.family}</option>)}</optgroup>{fontLibrary.some((font) => !font.builtIn) ? <optgroup label="Imported fonts">{fontLibrary.filter((font) => !font.builtIn).map((font) => <option key={font.id} value={font.id}>{font.family}</option>)}</optgroup> : null}</select></label>

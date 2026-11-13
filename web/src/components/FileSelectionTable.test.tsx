@@ -37,6 +37,7 @@ function Harness({ initialFiles = files, initialTemplatePath = initialFiles[0].p
       <button type="button" onClick={() => setScanned((current) => current.map((item) => ({ ...item })))}>Refresh files</button>
       <button type="button" onClick={() => setScanned((current) => [...current, file("07.mkv", "jpn")])}>Add a differing file</button>
       <output>{selection.selectedPaths.join(",")}</output>
+      <span aria-label="hidden">{selection.selectedPaths.filter(selection.isHidden).length}</span>
       <FileSelectionTable title="Files" files={scanned} templateFile={templateFile} selection={selection} warnDiffering />
     </>
   );
@@ -215,6 +216,8 @@ describe("FileSelectionTable filter", () => {
     await user.click(screen.getByRole("button", { name: "Select none" }));
     expect(screen.getByRole("status")).toHaveTextContent("/media/01.mkv,/media/03.mkv");
     expect(screen.getByText(/of 6 selected/)).toHaveTextContent("2 of 6 selected");
+    expect(screen.getByText("2 selected files are hidden by the filter and will be included.")).toBeInTheDocument();
+    expect(screen.getByLabelText("hidden")).toHaveTextContent("2");
 
     await user.clear(screen.getByRole("searchbox", { name: "Filter files by name" }));
     await user.type(screen.getByRole("searchbox", { name: "Filter files by name" }), "05");

@@ -3,7 +3,7 @@ import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 
 import type { MediaFileRow } from "../api";
 import { getTemplateMismatchMessages } from "../lib/templateMatch";
-import type { FileSelection } from "../state/useFileSelection";
+import { matchesFilter, type FileSelection } from "../state/useFileSelection";
 import { fileColumns, type FileColumn, type FileRow } from "./fileColumns";
 import { FileName } from "./FileName";
 import { SortableColumnHeader, type SortDirection } from "./SortableColumnHeader";
@@ -33,7 +33,6 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
 }) {
   const detailsId = useId();
   const [sort, setSort] = useState<{ key: string; direction: SortDirection }>({ key: "file", direction: "asc" });
-  const [filter, setFilter] = useState("");
   const [expandedPath, setExpandedPath] = useState("");
   const shiftOnLabel = useRef(false);
   const rowElements = useRef(new Map<string, HTMLTableRowElement>());
@@ -42,21 +41,22 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
     const multiplier = sort.direction === "asc" ? 1 : -1;
     const column = columns.find((item) => item.key === sort.key);
     const value = (row: FileRow) => column ? column.sortValue(row) : row.file.fileName;
-    const needle = filter.trim().toLowerCase();
     return files.map((file, index) => {
       const differences = getTemplateMismatchMessages(file, templateFile);
       const status = file.path === templateFile?.path ? "Template" : differences.length > 0 ? "Warning" : file.status;
       return { file, index, differences, status };
-    }).filter((row) => !needle || row.file.fileName.toLowerCase().includes(needle)).sort((left, right) => {
+    }).filter((row) => matchesFilter(row.file, selection.filter)).sort((left, right) => {
       const compared = value(left).localeCompare(value(right), undefined, { numeric: true, sensitivity: "base" });
       return compared === 0 ? left.index - right.index : compared * multiplier;
     });
-  }, [files, templateFile, sort, columns, filter]);
+  }, [files, templateFile, sort, columns, selection.filter]);
   const displayedPaths = rows.map((row) => row.file.path);
   const selected = new Set(selection.selectedPaths);
   const matching = new Set(selection.matchingPaths);
   const selectedDiffering = selection.selectedPaths.filter((path) => selection.differingPaths.has(path)).length;
   const unselectedDiffering = selection.differingPaths.size - selectedDiffering;
+  const hiddenSelected = selection.selectedPaths.filter(selection.isHidden).length;
+  const filter = selection.filter;
   // One row is in the tab order: the active one, or the first.
   const focusPath = activePath && displayedPaths.includes(activePath) ? activePath : displayedPaths[0];
 
@@ -84,15 +84,21 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
           <div className="mt-1 text-xs text-muted">{selected.size} of {files.length} selected{filter.trim() ? <span> · {rows.length} shown</span> : null}</div>
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <input type="search" aria-label="Filter files by name" placeholder="Filter by name" value={filter} onChange={(event) => setFilter(event.target.value)} className="h-8 w-40 rounded-md border border-border bg-input px-2.5 text-xs text-text outline-none placeholder:text-subtle focus:border-accent" />
+          <input type="search" aria-label="Filter files by name" placeholder="Filter by name" value={filter} onChange={(event) => selection.setFilter(event.target.value)} className="h-8 w-40 rounded-md border border-border bg-input px-2.5 text-xs text-text outline-none placeholder:text-subtle focus:border-accent" />
           <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, displayedPaths)}>Select all</button>
           <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, [])}>Select none</button>
           <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, displayedPaths.filter((path) => !selected.has(path)))}>Invert</button>
           {matchingAction ? <button type="button" className={toolbarButton} onClick={() => selection.setWithin(displayedPaths, displayedPaths.filter((path) => matching.has(path)))}>Only equal to template</button> : null}
         </div>
       </div>
-      {warnDiffering ? (
-        <div aria-live="polite" className="mt-3 shrink-0 space-y-2 empty:hidden">
+      <div aria-live="polite" className="mt-3 shrink-0 space-y-2 empty:hidden">
+        {hiddenSelected > 0 ? (
+          <p className={notice}>
+            <AlertTriangle size={14} aria-hidden="true" className="shrink-0" />
+            {hiddenSelected === 1 ? "1 selected file is hidden by the filter and will be included." : `${hiddenSelected} selected files are hidden by the filter and will be included.`}
+          </p>
+        ) : null}
+        {warnDiffering ? <>
           {unselectedDiffering > 0 ? (
             <p className={notice}>
               <AlertTriangle size={14} aria-hidden="true" className="shrink-0" />
@@ -105,8 +111,8 @@ export function FileSelectionTable({ title, files, templateFile, selection, colu
               {selectedDiffering === 1 ? "1 selected file differs" : `${selectedDiffering} selected files differ`} from the template. Edits go to the track in the same position, which may be a different track there.
             </p>
           ) : null}
-        </div>
-      ) : null}
+        </> : null}
+      </div>
       <div className="mt-3 min-h-0 flex-1 overflow-auto" aria-label={label}>
         <table className="file-info-table file-selection-table border-collapse text-left text-sm">
           <thead className="sticky top-0 bg-card text-xs text-text">

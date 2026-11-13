@@ -309,6 +309,7 @@ export function TrackPropertiesPage() {
       onPreview={runPreview}
       onApply={runApply}
       selectedText={`${selectedMkvPaths.length} files selected`}
+      hiddenSelected={selectedMkvPaths.filter(selection.isHidden).length}
       initialSplit={50}
       options={<>
             <div className="flex items-center justify-between">

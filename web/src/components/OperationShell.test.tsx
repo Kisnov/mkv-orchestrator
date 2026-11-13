@@ -16,12 +16,12 @@ function job(patch: Partial<OperationJobResponse>): OperationJobResponse {
 
 const idle: OperationRun = { status: "Pick files.", job: undefined, isApplying: false, isBusy: false, isCanceling: false, cancel: () => undefined };
 
-function shell(run: OperationRun, props: Partial<{ canRun: boolean; onPreview: () => void; onApply: () => void }> = {}) {
+function shell(run: OperationRun, props: Partial<{ canRun: boolean; onPreview: () => void; onApply: () => void; hiddenSelected: number }> = {}) {
   return render(
     <OperationShell
       title="Reorder Tracks" description="Reorder tracks." options={<h2>Reorder Options</h2>} run={run}
       canRun={props.canRun ?? true} onPreview={props.onPreview ?? (() => undefined)} onApply={props.onApply ?? (() => undefined)}
-      selectedText="2 files selected" notice={<span>The template is not in the batch.</span>}
+      selectedText="2 files selected" hiddenSelected={props.hiddenSelected} notice={<span>The template is not in the batch.</span>}
       files={<h2>File Info</h2>} details={<h2>Template Track Order</h2>}
       summary={{ title: "Reorder Tracks Preview Summary", emptyText: "Build a preview.", available: false, status: "", summary: "", metrics: [], sections: [] }}
     />
@@ -112,4 +112,9 @@ it("shows the log of a job that completed, and a single file's error as its fail
   await user.click(screen.getByRole("button", { name: "Show the 1 failed file(s) and job log" }));
   expect(within(screen.getByRole("dialog")).getByRole("listitem")).toHaveTextContent("internal error: tool failed");
   expect(within(screen.getByRole("dialog")).getByText("The job wrote no log lines.")).toBeInTheDocument();
+});
+
+it("says how many of the selected files the table's filter hides", () => {
+  shell(idle, { hiddenSelected: 1 });
+  expect(screen.getByText("2 files selected (1 hidden)")).toBeInTheDocument();
 });

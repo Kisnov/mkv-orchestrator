@@ -15,7 +15,22 @@ export type FileSelection = {
   setWithin: (scope: string[], chosen: string[]) => void;
   /** With Shift, every row between the last toggled one and this one takes the new state. */
   toggle: (path: string, shiftKey: boolean, displayedPaths: string[]) => void;
+  /** The table's name filter: kept here so a page can say what the filter hides. */
+  filter: string;
+  setFilter: (filter: string) => void;
+  isHidden: (path: string) => boolean;
 };
+
+export function matchesFilter(file: MediaFileRow, filter: string) {
+  const needle = filter.trim().toLowerCase();
+  return !needle || file.fileName.toLowerCase().includes(needle);
+}
+
+function useFilter(files: MediaFileRow[]) {
+  const [filter, setFilter] = useState("");
+  const hidden = useMemo(() => new Set(files.filter((file) => !matchesFilter(file, filter)).map((file) => file.path)), [files, filter]);
+  return { filter, setFilter, isHidden: (path: string) => hidden.has(path) };
+}
 
 function useTemplateMatch(files: MediaFileRow[], templateFile: MediaFileRow | null) {
   const differingPaths = useMemo(
@@ -67,7 +82,7 @@ export function useFileSelection(files: MediaFileRow[], templateFile: MediaFileR
     return files.filter((file) => chosen.has(file.path)).map((file) => file.path);
   }, [manual, scope, files, matchingPaths]);
   const actions = useSelectionActions(selectedPaths, (paths) => setManual({ scope, paths }));
-  return { selectedPaths, differingPaths, matchingPaths, ...actions };
+  return { selectedPaths, differingPaths, matchingPaths, ...actions, ...useFilter(files) };
 }
 
 /**
@@ -85,5 +100,5 @@ export function useLibrarySelection(files: MediaFileRow[], templateFile: MediaFi
     const own = new Set(files.map((file) => pathKey(file.path)));
     setSelectedPaths([...shared.filter((path) => !own.has(pathKey(path))), ...paths]);
   });
-  return { selectedPaths, differingPaths, matchingPaths, ...actions };
+  return { selectedPaths, differingPaths, matchingPaths, ...actions, ...useFilter(files) };
 }

@@ -164,6 +164,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
       onPreview={runPreview}
       onApply={() => { if (canRun) void run.apply(buildRequest()); }}
       selectedText={`${selectedMkvPaths.length + (convertMp4 ? selectedMp4Paths.length : 0)} files selected`}
+      hiddenSelected={[...selectedMkvPaths, ...(convertMp4 ? selectedMp4Paths : [])].filter(selection.isHidden).length}
       options={<>
           {workflow !== "subtitles" ? <div className="flex items-center justify-between">
             {workflow === "remove" ? <h2 className="text-base font-semibold">Track Options</h2> : <span />}

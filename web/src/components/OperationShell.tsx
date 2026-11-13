@@ -14,7 +14,7 @@ const panel = "flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-
  * the file list above the details on the right, and the preview summary and
  * job log dialogs.
  */
-export function OperationShell({ title, description, options, run, canRun, onPreview, onApply, selectedText, notice, files, details, initialSplit = 56, summary, children }: {
+export function OperationShell({ title, description, options, run, canRun, onPreview, onApply, selectedText, hiddenSelected = 0, notice, files, details, initialSplit = 56, summary, children }: {
   title: string;
   description: string;
   /** The sidebar's operation options. */
@@ -25,6 +25,8 @@ export function OperationShell({ title, description, options, run, canRun, onPre
   onPreview: () => void;
   onApply: () => void;
   selectedText: string;
+  /** Selected files the table's filter hides; they are still sent. */
+  hiddenSelected?: number;
   /** Says why the operation cannot run, under the selected count. */
   notice?: ReactNode;
   files: ReactNode;
@@ -52,7 +54,7 @@ export function OperationShell({ title, description, options, run, canRun, onPre
             {run.isApplying
               ? <button type="button" onClick={run.cancel} disabled={run.isCanceling} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button>
               : <button type="button" onClick={onApply} disabled={run.isBusy || !canRun} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
-            <span className="w-full text-xs text-muted">{selectedText}</span>
+            <span className="w-full text-xs text-muted">{selectedText}{hiddenSelected > 0 ? ` (${hiddenSelected} hidden)` : ""}</span>
             {notice}
             <span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{run.status}</span>
             {finishedJob ? (
