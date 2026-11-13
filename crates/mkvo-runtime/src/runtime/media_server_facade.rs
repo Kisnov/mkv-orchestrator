@@ -135,6 +135,7 @@ impl MkvoRuntime {
     ) -> RuntimeResult<mkvo_application::MediaServerArtwork> {
         if request.item_id.is_empty()
             || request.item_id.len() > 128
+            || request.item_id.bytes().all(|byte| byte == b'.')
             || !request
                 .item_id
                 .bytes()
@@ -863,6 +864,23 @@ mod media_server_credential_tests {
             .await
             .expect("artwork");
         assert_eq!(artwork.content_type, "image/jpeg");
+    }
+
+    /// An item id becomes a path segment on the media server, so dots alone are refused.
+    #[tokio::test]
+    async fn an_item_id_of_only_dots_is_refused() {
+        let host = host();
+        for item_id in [".", "..", "..."] {
+            let error = host
+                .runtime
+                .get_library_artwork_bytes(LibraryArtworkRequest {
+                    server_id: "any".to_owned(),
+                    item_id: item_id.to_owned(),
+                })
+                .await
+                .expect_err("dot-only id");
+            assert_eq!(error.code, ApiErrorCode::InvalidRequest, "{item_id}");
+        }
     }
 
     fn artwork_request(server: &WebMediaServer) -> LibraryArtworkRequest {
