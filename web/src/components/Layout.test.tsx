@@ -60,14 +60,24 @@ it("shows a styled tooltip for collapsed sidebar links on hover and focus", asyn
     getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 })
   });
 
-  const removeTracks = screen.getByRole("link", { name: "Remove Tracks" });
-  expect(removeTracks).not.toHaveAttribute("title");
-  await user.hover(removeTracks);
-  expect(screen.getByRole("tooltip")).toHaveTextContent("Remove Tracks");
-  await user.unhover(removeTracks);
+  const tracks = screen.getByRole("link", { name: "Tracks" });
+  expect(tracks).not.toHaveAttribute("title");
+  await user.hover(tracks);
+  expect(screen.getByRole("tooltip")).toHaveTextContent("Tracks");
+  await user.unhover(tracks);
   expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
-  fireEvent.focus(removeTracks);
-  expect(screen.getByRole("tooltip")).toHaveTextContent("Remove Tracks");
+  fireEvent.focus(tracks);
+  expect(screen.getByRole("tooltip")).toHaveTextContent("Tracks");
+});
+
+it("lists seven destinations, with the track operations under Tracks", () => {
+  renderWithBackend(<MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Dashboard content</div>} /></Route></Routes></MediaLibraryProvider>, {
+    getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 })
+  });
+
+  const menu = screen.getByRole("complementary");
+  expect(within(menu).getAllByRole("link").map((link) => link.textContent)).toEqual(["Dashboard", "Rename Files", "Tracks", "Subtitles", "Library", "Logs", "Settings"]);
+  expect(within(menu).getByRole("link", { name: "Tracks" })).toHaveAttribute("href", "/tracks");
 });
 
 it("mounts the sidebar toggle on the sidebar edge and updates its direction", async () => {
