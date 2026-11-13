@@ -754,7 +754,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 
 fn normalize_resource_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
-    for component in path.components() {
+    for component in mkvo_domain::normalized_path(path).components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -1298,6 +1298,17 @@ mod tests {
         assert!(!waiting.is_finished());
         drop(reader);
         assert!(waiting.await.unwrap().is_ok());
+    }
+
+    /// A scanned path is canonical (`\\?\C:\...`); claimed by its plain
+    /// spelling the same file has to be the same lease.
+    #[test]
+    fn both_spellings_of_a_windows_path_claim_one_resource() {
+        let claims = merge_claims(&[
+            ResourceClaim::write(r"\\?\C:\media\a.mkv"),
+            ResourceClaim::read(r"C:\media\a.mkv"),
+        ]);
+        assert_eq!(claims.len(), 1, "{claims:?}");
     }
 
     #[tokio::test]
