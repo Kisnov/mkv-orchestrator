@@ -304,6 +304,35 @@ describe("Dashboard UI cache reset", () => {
     expect(await screen.findByRole("button", { name: "Rescan" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Rescan Files" })).not.toBeInTheDocument();
   });
+
+  it("closes the confirmation when a scan turns out to be running", async () => {
+    const user = userEvent.setup();
+    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));
+    const now = new Date().toISOString();
+    const job = { id: "job-1", createdUtc: now, startedUtc: now, completedUtc: null, currentSource: "/media/Show", completed: 0, total: 1, files: [], skipped: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 }, error: "" };
+    const clearCurrentScanFiles = vi.fn().mockResolvedValue(emptyScan);
+    let reportRunning: () => void = () => undefined;
+
+    renderDashboard({
+      getStatus: () => Promise.resolve(emptyStatus),
+      getCurrentScanFiles: () => Promise.resolve(emptyScan),
+      getWebSettings: () => Promise.resolve(settings()),
+      clearCurrentScanFiles,
+      startScan: () => Promise.resolve({ ...job, status: "Queued" as const }),
+      // The job status arrives late, which is the window where the button is still enabled.
+      getScanJob: () => new Promise((resolve) => { reportRunning = () => resolve({ ...job, status: "Running" as const }); })
+    });
+
+    await user.click(await screen.findByRole("button", { name: /^scan$/i }));
+    const clearButton = screen.getByRole("button", { name: /clear ui cache/i });
+    await waitFor(() => expect(clearButton).toBeEnabled());
+    await user.click(clearButton);
+    expect(screen.getByRole("dialog", { name: "Clear UI Cache" })).toBeInTheDocument();
+
+    reportRunning();
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(clearCurrentScanFiles).not.toHaveBeenCalled();
+  });
 });
 
 describe("Dashboard ignored folders", () => {

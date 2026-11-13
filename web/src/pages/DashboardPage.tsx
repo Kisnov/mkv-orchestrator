@@ -209,6 +209,8 @@ export function DashboardPage() {
       : `${sources.length} sources selected`;
   const currentScanJob = scanJob.data;
   const isScanning = scanStart.isPending || currentScanJob?.status === "Queued" || currentScanJob?.status === "WaitingForResources" || currentScanJob?.status === "Running" || currentScanJob?.status === "Canceling";
+  // The Clear UI Cache button is disabled while scanning; an already open confirmation must not outlive that.
+  useEffect(() => { if (isScanning) setIsCacheClearConfirmOpen(false); }, [isScanning]);
   const progressText = currentScanJob?.total
     ? `${currentScanJob.completed}/${currentScanJob.total} files`
     : isScanning ? "preparing scan" : "";
