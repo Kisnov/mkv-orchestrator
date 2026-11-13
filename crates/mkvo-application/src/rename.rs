@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use mkvo_domain::{
     EpisodeMetadata, IdempotencyKey, MediaFile, MetadataProvider, OperationKind, OperationPlan,
     PlanConflict, PlanConflictKind, PlanContext, RenamePlan, RenamePlanItem, RenamePlanPayload,
-    RenameTokens, ResourceClaim,
+    RenameSidecar, RenameTokens, ResourceClaim, case_folded_path_key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,11 +96,25 @@ impl RenamePlanner {
         } else {
             request.template.trim().to_owned()
         };
-        let existing: BTreeSet<_> = request
-            .existing_paths
-            .iter()
-            .map(|path| portable_path_key(path))
-            .collect();
+        // Keyed with case folded: a share may ignore case whatever the host does.
+        let mut existing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in &request.existing_paths {
+            existing
+                .entry(case_folded_path_key(path))
+                .or_default()
+                .push(portable_path_key(path));
+        }
+        // Whether a file other than `source` already has the name `target`.
+        let taken = |target: &Path, source: &Path| {
+            request.check_existing_files
+                && existing
+                    .get(&case_folded_path_key(target))
+                    .is_some_and(|holders| {
+                        let source = portable_path_key(source);
+                        holders.iter().any(|holder| *holder != source)
+                    })
+        };
+        let mut sidecars = sidecars_by_video(&request.files, &request.existing_paths);
         let mut items = Vec::with_capacity(request.files.len());
         for file in &request.files {
             let new_file_name = build_file_name(file, &template);
@@ -122,22 +136,43 @@ impl RenamePlanner {
                     Some(target.clone()),
                 ));
             }
-            if portable_path_key(&file.path) == portable_path_key(&target) {
+            // Compared as written: a change of case alone is still a rename.
+            let unchanged = file.path == target;
+            if unchanged {
                 conflicts.push(PlanConflict::informational(
                     PlanConflictKind::NoChange,
                     "Source already has the requested name",
                     Some(target.clone()),
                 ));
             }
-            if request.check_existing_files
-                && existing.contains(&portable_path_key(&target))
-                && portable_path_key(&file.path) != portable_path_key(&target)
-            {
+            if taken(&target, &file.path) {
                 conflicts.push(PlanConflict::blocking(
                     PlanConflictKind::ExistingTarget,
                     "Target file already exists",
                     Some(target.clone()),
                 ));
+            }
+            let new_stem = new_file_name
+                .strip_suffix(&extension_only)
+                .unwrap_or(&new_file_name);
+            let sidecars: Vec<_> = sidecars
+                .remove(&portable_path_key(&file.path))
+                .filter(|_| !unchanged)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(source, suffix)| RenameSidecar {
+                    target: target.with_file_name(format!("{new_stem}{suffix}")),
+                    source,
+                })
+                .collect();
+            for sidecar in &sidecars {
+                if taken(&sidecar.target, &sidecar.source) {
+                    conflicts.push(PlanConflict::blocking(
+                        PlanConflictKind::ExistingTarget,
+                        "A file with the new name of a subtitle, metadata or artwork file already exists",
+                        Some(sidecar.target.clone()),
+                    ));
+                }
             }
             if !request.authorized_roots.is_empty()
                 && !request
@@ -177,21 +212,24 @@ impl RenamePlanner {
                 source_fingerprint: file.fingerprint.clone(),
                 new_file_name,
                 conflicts,
+                sidecars,
             });
         }
 
-        let mut targets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut targets: BTreeMap<String, Vec<(usize, PathBuf)>> = BTreeMap::new();
         for (index, item) in items.iter().enumerate() {
-            if portable_path_key(&item.source) != portable_path_key(&item.target) {
-                targets
-                    .entry(portable_path_key(&item.target))
-                    .or_default()
-                    .push(index);
+            if item.source != item.target {
+                let moved = item.sidecars.iter().map(|sidecar| &sidecar.target);
+                for target in std::iter::once(&item.target).chain(moved) {
+                    targets
+                        .entry(case_folded_path_key(target))
+                        .or_default()
+                        .push((index, target.clone()));
+                }
             }
         }
-        for duplicate_indices in targets.values().filter(|indices| indices.len() > 1) {
-            for &index in duplicate_indices {
-                let target = items[index].target.clone();
+        for duplicates in targets.into_values().filter(|moves| moves.len() > 1) {
+            for (index, target) in duplicates {
                 items[index].conflicts.push(PlanConflict::blocking(
                     PlanConflictKind::DuplicateTarget,
                     "Multiple files render to the same target",
@@ -217,11 +255,13 @@ impl RenamePlanner {
                 .items
                 .iter()
                 .flat_map(|item| {
-                    [
-                        ResourceClaim::write(item.source.clone()),
-                        ResourceClaim::write(item.target.clone()),
-                    ]
+                    let moved = item
+                        .sidecars
+                        .iter()
+                        .flat_map(|sidecar| [&sidecar.source, &sidecar.target]);
+                    [&item.source, &item.target].into_iter().chain(moved)
                 })
+                .map(|path| ResourceClaim::write(path.clone()))
                 .collect(),
             attributes: BTreeMap::new(),
         };
@@ -238,6 +278,73 @@ impl RenamePlanner {
         )
         .map_err(|error| ApplicationError::Internal(error.to_string()))
     }
+}
+
+/// Extensions of the files that are renamed together with a video.
+const SIDECAR_EXTENSIONS: [&str; 14] = [
+    "ass", "idx", "jpeg", "jpg", "nfo", "png", "smi", "srt", "ssa", "sub", "sup", "tbn", "vtt",
+    "webp",
+];
+const SIDECAR_IMAGE_EXTENSIONS: [&str; 5] = ["jpeg", "jpg", "png", "tbn", "webp"];
+
+fn lowercase_extension(path: &Path) -> String {
+    path.extension()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_lowercase())
+}
+
+/// What follows `stem` in `sidecar`'s name when it is named after it:
+/// `.en.srt` or `.nfo`, and for artwork also `-thumb.jpg`.
+fn sidecar_suffix(stem: &str, sidecar: &Path) -> Option<String> {
+    let name = sidecar.file_name()?.to_string_lossy();
+    let suffix = name.get(stem.len()..)?;
+    let named_after = name[..stem.len()].eq_ignore_ascii_case(stem)
+        && (suffix.starts_with('.')
+            || suffix.starts_with('-')
+                && SIDECAR_IMAGE_EXTENSIONS.contains(&lowercase_extension(sidecar).as_str()));
+    named_after.then(|| suffix.to_owned())
+}
+
+/// The sidecars next to each file, by the file's path key, each with the part
+/// of its name to keep. A sidecar goes with the longest stem it starts with,
+/// so `Show - 01.5.srt` stays with `Show - 01.5.mkv`.
+fn sidecars_by_video(
+    files: &[MediaFile],
+    existing: &BTreeSet<PathBuf>,
+) -> BTreeMap<String, Vec<(PathBuf, String)>> {
+    let mut folders: BTreeMap<String, (BTreeMap<String, &Path>, Vec<&Path>)> = BTreeMap::new();
+    let paths = files.iter().map(|file| &file.path).chain(existing);
+    for path in paths {
+        let Some((parent, stem)) = path.parent().zip(path.file_stem()) else {
+            continue;
+        };
+        let (videos, sidecars) = folders.entry(portable_path_key(parent)).or_default();
+        if SIDECAR_EXTENSIONS.contains(&lowercase_extension(path).as_str()) {
+            sidecars.push(path);
+        } else {
+            // The files being renamed come first and keep a stem they share with another file.
+            videos
+                .entry(stem.to_string_lossy().into_owned())
+                .or_insert(path);
+        }
+    }
+    let mut owned: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
+    for (videos, sidecars) in folders.into_values() {
+        for sidecar in sidecars {
+            let owner = videos
+                .iter()
+                .filter_map(|(stem, video)| {
+                    Some((stem.len(), video, sidecar_suffix(stem, sidecar)?))
+                })
+                .max_by_key(|(length, ..)| *length);
+            if let Some((_, video, suffix)) = owner {
+                owned
+                    .entry(portable_path_key(video))
+                    .or_default()
+                    .push((sidecar.to_path_buf(), suffix));
+            }
+        }
+    }
+    owned
 }
 
 #[must_use]
@@ -1117,5 +1224,196 @@ mod access_conflict_tests {
 
         let plan = RenamePlanner.build_plan(plan_request).expect("plan");
         assert!(conflict_kinds(&plan).contains(&PlanConflictKind::Busy));
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use mkvo_domain::{ContainerMetadata, EpisodeIdentity, FileFingerprint, RenameSidecar};
+
+    /// A file that the `{episodeTitle}` template names `title`.
+    fn media(path: &str, title: &str) -> MediaFile {
+        MediaFile {
+            path: PathBuf::from(path),
+            original_file_name: None,
+            watch_root: None,
+            relative_path: None,
+            fingerprint: FileFingerprint {
+                path: PathBuf::from(path),
+                size_bytes: 1,
+                modified_at: Utc::now(),
+                quick_hash: None,
+            },
+            container: ContainerMetadata::default(),
+            tracks: Vec::new(),
+            attachments: Vec::new(),
+            episode: Some(EpisodeIdentity {
+                series_title: None,
+                season: None,
+                episode: None,
+                absolute_episode: None,
+                episode_title: Some(title.to_owned()),
+                year: None,
+                is_movie: false,
+            }),
+            provider_match: None,
+            status: mkvo_domain::MediaStatus::Ready,
+        }
+    }
+
+    fn plan(files: Vec<MediaFile>, existing: &[&str]) -> RenamePlan {
+        RenamePlanner
+            .build_plan(RenamePlanRequest {
+                existing_paths: files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .chain(existing.iter().map(PathBuf::from))
+                    .collect(),
+                files,
+                template: "{episodeTitle}".to_owned(),
+                provider: None,
+                check_existing_files: true,
+                source_access: BTreeMap::new(),
+                existing_parents: BTreeSet::new(),
+                authorized_roots: Vec::new(),
+                settings_fingerprint: "settings".to_owned(),
+                expires_in_seconds: 60,
+                idempotency_key: IdempotencyKey::generate(),
+            })
+            .expect("plan")
+    }
+
+    fn kinds(item: &RenamePlanItem) -> Vec<PlanConflictKind> {
+        item.conflicts
+            .iter()
+            .map(|conflict| conflict.kind)
+            .collect()
+    }
+
+    /// `ep.mkv` to `Ep.mkv` was reported as "no change" and then failed on
+    /// Windows because the target "existed".
+    #[test]
+    fn a_rename_that_only_changes_case_is_a_change() {
+        let plan = plan(vec![media("/media/ep.mkv", "Ep")], &[]);
+        let item = &plan.payload.items[0];
+        assert_eq!(item.target, PathBuf::from("/media").join("Ep.mkv"));
+        assert_eq!(kinds(item), []);
+        assert!(item.can_apply());
+    }
+
+    #[test]
+    fn a_name_that_does_not_change_is_still_no_change() {
+        let plan = plan(vec![media("/media/Ep.mkv", "Ep")], &[]);
+        assert_eq!(kinds(&plan.payload.items[0]), [PlanConflictKind::NoChange]);
+        assert_eq!(plan.payload.rename_count(), 0);
+    }
+
+    /// A share can ignore case whatever the host does, so two targets one
+    /// letter case apart would run into each other half-way through a batch.
+    #[test]
+    fn targets_that_differ_only_by_case_collide() {
+        let plan = plan(
+            vec![
+                media("/media/a.mkv", "Pilot"),
+                media("/media/b.mkv", "pilot"),
+            ],
+            &[],
+        );
+        for item in &plan.payload.items {
+            assert_eq!(kinds(item), [PlanConflictKind::DuplicateTarget]);
+        }
+        assert_eq!(plan.payload.rename_count(), 0);
+    }
+
+    #[test]
+    fn a_target_taken_under_another_case_blocks_the_rename() {
+        let plan = plan(vec![media("/media/a.mkv", "Pilot")], &["/media/PILOT.mkv"]);
+        assert_eq!(
+            kinds(&plan.payload.items[0]),
+            [PlanConflictKind::ExistingTarget]
+        );
+    }
+
+    /// The file that only changes case was left out of the duplicate check.
+    #[test]
+    fn a_case_only_rename_still_collides_with_another_file() {
+        let plan = plan(
+            vec![
+                media("/media/pilot.mkv", "Pilot"),
+                media("/media/b.mkv", "Pilot"),
+            ],
+            &[],
+        );
+        assert!(plan.payload.items.iter().all(|item| !item.can_apply()));
+    }
+
+    #[test]
+    fn subtitles_metadata_and_artwork_follow_their_video() {
+        let plan = plan(
+            vec![media("/media/Show - 01.mkv", "Pilot")],
+            &[
+                "/media/Show - 01.srt",
+                "/media/show - 01.en.forced.ass",
+                "/media/Show - 01.nfo",
+                "/media/Show - 01-thumb.jpg",
+                // Other episodes, and files that only look related.
+                "/media/Show - 010.srt",
+                "/media/Show - 01.5.mkv",
+                "/media/Show - 01.5.srt",
+                "/media/Show - 01-extra.srt",
+                "/media/Show - 01.txt",
+                "/media/Show - 02.srt",
+                "/other/Show - 01.srt",
+            ],
+        );
+        let item = &plan.payload.items[0];
+        let moved = |source: &str, target: &str| RenameSidecar {
+            source: PathBuf::from(source),
+            target: PathBuf::from("/media").join(target),
+        };
+        assert_eq!(kinds(item), []);
+        assert_eq!(
+            item.sidecars,
+            [
+                moved("/media/Show - 01-thumb.jpg", "Pilot-thumb.jpg"),
+                moved("/media/Show - 01.nfo", "Pilot.nfo"),
+                moved("/media/Show - 01.srt", "Pilot.srt"),
+                moved("/media/show - 01.en.forced.ass", "Pilot.en.forced.ass"),
+            ]
+        );
+        for sidecar in &item.sidecars {
+            for path in [&sidecar.source, &sidecar.target] {
+                assert!(
+                    plan.context
+                        .resources
+                        .contains(&ResourceClaim::write(path.clone()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_that_keeps_its_name_moves_no_sidecars() {
+        let plan = plan(
+            vec![media("/media/Pilot.mkv", "Pilot")],
+            &["/media/Pilot.srt"],
+        );
+        assert_eq!(plan.payload.items[0].sidecars, []);
+    }
+
+    #[test]
+    fn a_sidecar_whose_new_name_is_taken_blocks_the_rename() {
+        let plan = plan(
+            vec![media("/media/a.mkv", "Pilot")],
+            &["/media/a.srt", "/media/Pilot.srt"],
+        );
+        let item = &plan.payload.items[0];
+        assert_eq!(kinds(item), [PlanConflictKind::ExistingTarget]);
+        assert_eq!(
+            item.conflicts[0].path,
+            Some(PathBuf::from("/media").join("Pilot.srt"))
+        );
+        assert!(!item.can_apply());
     }
 }

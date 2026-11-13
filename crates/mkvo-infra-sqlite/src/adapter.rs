@@ -1191,6 +1191,7 @@ mod tests {
                 },
                 original_path: original,
                 renamed_fingerprint: None,
+                sidecars: Vec::new(),
             }],
         }
     }

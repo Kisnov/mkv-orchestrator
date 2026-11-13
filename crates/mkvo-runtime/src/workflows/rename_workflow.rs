@@ -268,6 +268,7 @@ impl MkvoRuntime {
                                     renamed_path: item.target.clone(),
                                     original_fingerprint: item.source_fingerprint.clone(),
                                     renamed_fingerprint,
+                                    sidecars: Vec::new(),
                                 });
                                 // Persist after every move. Together with the pre-move journal
                                 // detail this permits deterministic crash reconciliation.

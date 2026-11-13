@@ -317,6 +317,7 @@ mod tests {
                 },
                 new_file_name: "new-name.mkv".to_owned(),
                 conflicts: Vec::new(),
+                sidecars: Vec::new(),
             }],
         };
         let plan = OperationPlan::new(
