@@ -1084,6 +1084,13 @@ mod tests {
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert!(frames[0].lines().any(|line| line == "event: snapshot"));
         assert!(frames[0].contains(&format!(r#""id":"{id}""#)));
+
+        let response = host
+            .router()
+            .oneshot(request("GET", &format!("/api/operations/{id}/events"), &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

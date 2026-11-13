@@ -43,7 +43,7 @@ pub(crate) fn api_router(state: AppState) -> Router {
         .route("/api/scans", post(start_scan))
         .route("/api/scans/{id}", get(get_scan_job))
         .route("/api/scans/{id}/cancel", post(cancel_scan))
-        .route("/api/scans/{id}/events", get(job_events))
+        .route("/api/scans/{id}/events", get(scan_events))
         .route(
             "/api/files/current",
             get(get_current_scan_files).delete(clear_current_scan_files),
@@ -85,7 +85,7 @@ pub(crate) fn api_router(state: AppState) -> Router {
             "/api/operations/{id}/cancel",
             post(cancel_operation_job),
         )
-        .route("/api/operations/{id}/events", get(job_events))
+        .route("/api/operations/{id}/events", get(operation_events))
         .route("/api/library/audit", post(run_library_audit))
         .route("/api/library/catalog", post(get_library_catalog))
         .route("/api/library/artwork", post(get_library_artwork))
@@ -313,19 +313,38 @@ async fn cancel_operation_job(
     Ok(Json(state.runtime.cancel_operation_job(&id).await?))
 }
 
-async fn job_events(
+async fn scan_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpError> {
     // Subscribed before the state is read, so no change falls between the two.
     let receiver = state.runtime.subscribe_job_events(&id).await?;
-    let (snapshot, ended) = match state.runtime.get_scan_job(&id).await {
-        Ok(job) => (Event::default().json_data(&job), job.status.is_terminal()),
-        Err(_) => {
-            let job = state.runtime.get_operation_job(&id).await?;
-            (Event::default().json_data(&job), job.status.is_terminal())
-        }
-    };
+    let job = state.runtime.get_scan_job(&id).await?;
+    job_events(
+        Event::default().json_data(&job),
+        job.status.is_terminal(),
+        receiver,
+    )
+}
+
+async fn operation_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, HttpError> {
+    let receiver = state.runtime.subscribe_job_events(&id).await?;
+    let job = state.runtime.get_operation_job(&id).await?;
+    job_events(
+        Event::default().json_data(&job),
+        job.status.is_terminal(),
+        receiver,
+    )
+}
+
+fn job_events(
+    snapshot: Result<Event, axum::Error>,
+    ended: bool,
+    receiver: broadcast::Receiver<JobEventEnvelope>,
+) -> Result<impl IntoResponse, HttpError> {
     let snapshot = snapshot
         .map_err(|error| RuntimeError::internal(error.to_string()))?
         .event("snapshot");
