@@ -22,6 +22,17 @@ pub struct MediaEnumerationRequest {
     pub supported_extensions: BTreeSet<String>,
 }
 
+/// One result of a streamed enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnumeratedMedia {
+    File(FileFingerprint),
+    /// A folder or file that could not be read.
+    Skipped {
+        path: PathBuf,
+        reason: String,
+    },
+}
+
 #[async_trait]
 pub trait MediaCatalog: Send + Sync {
     async fn enumerate(
@@ -29,6 +40,20 @@ pub trait MediaCatalog: Send + Sync {
         request: &MediaEnumerationRequest,
         cancel: CancellationToken,
     ) -> Result<Vec<FileFingerprint>, PortError>;
+
+    /// Send entries as they are found, and what cannot be read as `Skipped`
+    /// instead of failing.
+    async fn enumerate_streaming(
+        &self,
+        request: &MediaEnumerationRequest,
+        cancel: CancellationToken,
+        entries: tokio::sync::mpsc::UnboundedSender<EnumeratedMedia>,
+    ) -> Result<(), PortError> {
+        for file in self.enumerate(request, cancel).await? {
+            let _ = entries.send(EnumeratedMedia::File(file));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -49,6 +74,21 @@ pub trait MetadataCache: Send + Sync {
     async fn remove_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, PortError>;
     async fn count(&self) -> Result<u64, PortError>;
     async fn list_under(&self, root: &Path) -> Result<Vec<MediaFile>, PortError>;
+    /// Record that these entries were seen at `seen_at`.
+    async fn mark_seen(&self, paths: &[PathBuf], seen_at: DateTime<Utc>) -> Result<(), PortError>;
+    /// Remove the entries under `root` that were last seen before `cutoff`.
+    async fn remove_unseen_under(
+        &self,
+        root: &Path,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, PortError>;
+    /// Store several probe results at once.
+    async fn upsert_many(&self, files: &[MediaFile]) -> Result<(), PortError> {
+        for file in files {
+            self.upsert(file).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

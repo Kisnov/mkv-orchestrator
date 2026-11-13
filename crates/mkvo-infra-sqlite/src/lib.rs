@@ -344,13 +344,6 @@ fn path_text(path: &Path) -> String {
     mkvo_domain::normalized_path_text(path)
 }
 
-fn escape_like(value: &str) -> String {
-    value
-        .replace('^', "^^")
-        .replace('%', "^%")
-        .replace('_', "^_")
-}
-
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

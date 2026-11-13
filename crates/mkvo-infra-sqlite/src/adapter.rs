@@ -14,8 +14,7 @@ use mkvo_domain::{
 use rusqlite::{OptionalExtension, params};
 
 use crate::{
-    CacheFingerprint, CachedMedia, RenameBatch, RenameBatchEntry, SqliteStore, StoreError,
-    StoredJob, StoredPlan,
+    CacheFingerprint, RenameBatch, RenameBatchEntry, SqliteStore, StoreError, StoredJob, StoredPlan,
 };
 
 const SETTINGS_KEY: &str = "app";
@@ -68,23 +67,22 @@ impl MetadataCache for SqliteRepositories {
         fingerprint: &FileFingerprint,
     ) -> Result<Option<MediaFile>, PortError> {
         let fingerprint = to_cache_fingerprint(fingerprint);
-        self.blocking(move |store| {
-            store
-                .get_valid_media(&fingerprint)?
-                .map(|cached| serde_json::from_value(cached.payload).map_err(StoreError::from))
-                .transpose()
-        })
-        .await
+        self.blocking(move |store| Ok(store.get_valid_payload(&fingerprint)?.map(|(_, file)| file)))
+            .await
     }
 
     async fn upsert(&self, file: &MediaFile) -> Result<(), PortError> {
-        let file = file.clone();
+        self.upsert_many(std::slice::from_ref(file)).await
+    }
+
+    async fn upsert_many(&self, files: &[MediaFile]) -> Result<(), PortError> {
+        let files = files.to_vec();
         self.blocking(move |store| {
-            store.upsert_media(&CachedMedia {
-                fingerprint: to_cache_fingerprint(&file.fingerprint),
-                scanned_at_ms: Utc::now().timestamp_millis(),
-                payload: serde_json::to_value(file)?,
-            })
+            let entries: Vec<_> = files
+                .iter()
+                .map(|file| (to_cache_fingerprint(&file.fingerprint), file))
+                .collect();
+            store.upsert_media_batch(&entries, Utc::now().timestamp_millis())
         })
         .await
     }
@@ -117,6 +115,28 @@ impl MetadataCache for SqliteRepositories {
                 .into_iter()
                 .map(|cached| serde_json::from_value(cached.payload).map_err(StoreError::from))
                 .collect()
+        })
+        .await
+    }
+
+    async fn mark_seen(
+        &self,
+        paths: &[std::path::PathBuf],
+        seen_at: DateTime<Utc>,
+    ) -> Result<(), PortError> {
+        let paths = paths.to_vec();
+        self.blocking(move |store| store.mark_media_seen(&paths, seen_at.timestamp_millis()))
+            .await
+    }
+
+    async fn remove_unseen_under(
+        &self,
+        root: &Path,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, PortError> {
+        let root = root.to_path_buf();
+        self.blocking(move |store| {
+            store.remove_media_unseen_under(&root, cutoff.timestamp_millis())
         })
         .await
     }
@@ -611,6 +631,60 @@ fn store_port_error(error: StoreError) -> PortError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The weekly re-probe: an entry older than the retention must still be a
+    /// hit once a scan has seen its file again.
+    #[tokio::test]
+    async fn a_cache_hit_marked_seen_outlives_the_retention_cutoff() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let fingerprint = FileFingerprint {
+            path: std::path::PathBuf::from("/lib/a.mkv"),
+            size_bytes: 10,
+            modified_at: DateTime::from_timestamp(1_000, 0).expect("timestamp"),
+            quick_hash: None,
+        };
+        let file = MediaFile {
+            path: fingerprint.path.clone(),
+            original_file_name: None,
+            watch_root: None,
+            relative_path: None,
+            fingerprint: fingerprint.clone(),
+            container: mkvo_domain::ContainerMetadata::default(),
+            tracks: Vec::new(),
+            attachments: Vec::new(),
+            episode: None,
+            provider_match: None,
+            status: mkvo_domain::MediaStatus::Ready,
+        };
+        let probed_at = DateTime::from_timestamp(0, 0).expect("timestamp");
+        let eight_days_later = probed_at + chrono::TimeDelta::days(8);
+        repositories
+            .store()
+            .upsert_media(&crate::CachedMedia {
+                fingerprint: to_cache_fingerprint(&fingerprint),
+                scanned_at_ms: probed_at.timestamp_millis(),
+                payload: serde_json::to_value(&file).expect("payload"),
+            })
+            .expect("seed");
+
+        let hit = repositories.get_valid(&fingerprint).await.expect("lookup");
+        assert_eq!(hit, Some(file.clone()));
+        repositories
+            .mark_seen(std::slice::from_ref(&fingerprint.path), eight_days_later)
+            .await
+            .expect("mark seen");
+        repositories
+            .remove_unseen_under(
+                Path::new("/lib"),
+                eight_days_later - chrono::TimeDelta::days(7),
+            )
+            .await
+            .expect("prune");
+
+        let hit = repositories.get_valid(&fingerprint).await.expect("lookup");
+        assert_eq!(hit, Some(file));
+    }
 
     #[tokio::test]
     async fn settings_repository_enforces_revisions() {
