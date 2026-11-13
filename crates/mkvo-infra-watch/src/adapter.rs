@@ -85,7 +85,7 @@ impl MediaCatalog for LocalMediaCatalog {
                 &ignored,
                 &extensions,
                 quick_hash,
-                &cancel,
+                || cancel.is_cancelled() || entries.is_closed(),
                 |entry| entries.send(entry).is_ok(),
             )
         })
@@ -105,7 +105,8 @@ fn enumerate_files(
 ) -> Result<Vec<FileFingerprint>, PortError> {
     let mut files = Vec::new();
     let mut failure = None;
-    walk_media(roots, ignored, extensions, quick_hash, cancel, |entry| {
+    let canceled = || cancel.is_cancelled();
+    walk_media(roots, ignored, extensions, quick_hash, canceled, |entry| {
         match entry {
             EnumeratedMedia::File(file) => files.push(file),
             EnumeratedMedia::Skipped { path, reason } => {
@@ -127,7 +128,7 @@ fn walk_media(
     ignored: &BTreeSet<String>,
     extensions: &BTreeSet<String>,
     quick_hash: bool,
-    cancel: &CancellationToken,
+    canceled: impl Fn() -> bool,
     mut found: impl FnMut(EnumeratedMedia) -> bool,
 ) -> Result<(), PortError> {
     let ignored: BTreeSet<_> = ignored
@@ -146,7 +147,7 @@ fn walk_media(
             .into_iter()
             .filter_entry(|entry| !is_ignored_directory(entry, &ignored));
         for entry in walker {
-            if cancel.is_cancelled() {
+            if canceled() {
                 return Err(PortError::Canceled);
             }
             let entry = match entry {
@@ -570,7 +571,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::from(["mkv".to_owned()]),
             false,
-            &CancellationToken::new(),
+            || false,
             |entry| {
                 entries.push(entry);
                 true
@@ -676,6 +677,28 @@ mod tests {
                 .iter()
                 .any(|entry| is_file(entry, &root.join("open").join("a.mkv")))
         );
+    }
+
+    /// Nothing here is ever sent, so only the closed channel can end the walk.
+    #[tokio::test]
+    async fn the_walk_stops_once_nobody_receives_its_entries() {
+        let tree = temp_tree("abandoned");
+        std::fs::write(tree.join("notes.txt"), b"text").expect("file");
+        let roots = AuthorizedRoots::new([crate::AuthorizedRoot::new(&tree, false).expect("root")])
+            .expect("roots");
+        let request = MediaEnumerationRequest {
+            roots: vec![tree.clone()],
+            ignored_folder_names: BTreeSet::new(),
+            supported_extensions: BTreeSet::from(["mkv".to_owned()]),
+        };
+        let (entries, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+
+        let walked = LocalMediaCatalog::new(roots, false)
+            .enumerate_streaming(&request, CancellationToken::new(), entries)
+            .await;
+        let _ = std::fs::remove_dir_all(&tree);
+        assert!(matches!(walked, Err(PortError::Canceled)), "{walked:?}");
     }
 
     #[test]
