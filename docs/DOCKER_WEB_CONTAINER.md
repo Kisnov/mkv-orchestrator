@@ -8,15 +8,26 @@ The Docker web build runs MKV Orchestrator as one container:
 
 ## Run
 
+CI publishes the image as `ghcr.io/kisnov/mkv-orchestrator:latest` (and
+`:sha-<short commit>`); `docker-compose.yml` uses it. Pull and start it:
+
 ```powershell
-docker compose up --build
+docker compose pull
+docker compose up -d
 ```
+
+Or build it from this checkout with `docker compose up --build`.
 
 Open:
 
 ```text
 http://localhost:8886
 ```
+
+Sign in as `admin`. Unless `MKVO_PASSWORD` is set, the password is generated on
+first start; read it with `docker exec mkvo cat /config/admin-password.txt`.
+See [authentication notes](AUTHENTICATION.md), including the upgrade steps for
+an install that ran without login.
 
 ## Volumes
 
@@ -47,12 +58,15 @@ MKVO_SOURCE_ROOTS=downloads=/downloads
 | `MKVO_SOURCE_ROOTS` | `downloads=/downloads` | Additional named source roots (`name=/path`, comma separated). |
 | `MKVO_SCAN_WORKERS` | `6` | Maximum concurrent metadata scans (clamped 1-8). |
 | `MKVO_EDIT_WORKERS` | `2` | Maximum concurrent mkvpropedit edits (clamped 1-6). |
-| `PUID` / `PGID` | `0` / `0` | Run the app as this user/group so files written to shares are not root-owned. Unraid users typically want `99` / `100`. |
+| `PUID` / `PGID` | `1000` / `1000` | Run the app as this user/group so files written to shares are not root-owned. Unraid users typically want `99` / `100`. `0` / `0` runs as root (see Security Notes). |
 | `UMASK` | unset | File creation mask applied at startup. |
-| `MKVO_AUTH_ENABLED` | false in supplied container definitions; true in standalone server | False gives everyone who can reach MKVO full access, including reverse-proxy visitors. True enables the in-app administrator login. |
-| `MKVO_USERNAME` / `MKVO_PASSWORD` | admin / generated | Blank password creates and preserves `/config/admin-password.txt`. Never publish that file. |
-| `MKVO_SECURE_COOKIES` | false | Enable for HTTPS; leave false for plain HTTP. |
-| `MKVO_AUTH_MODE`, `MKVO_AUTH_USERNAME`, `MKVO_AUTH_PASSWORD` | legacy | Existing settings are honored unless their new equivalents are explicitly set. Compose retains disabled as its legacy fallback for compatibility. |
+| `MKVO_AUTH_ENABLED` | true | In-app administrator login. False gives everyone who can reach MKVO full access, including reverse-proxy visitors, and needs `MKVO_ALLOW_NO_LOGIN=true` as well. |
+| `MKVO_ALLOW_NO_LOGIN` | false | Confirms running without login on a non-loopback address; otherwise the server refuses to start. |
+| `MKVO_USERNAME` / `MKVO_PASSWORD` | admin / generated | Use a password of at least 12 characters. Blank generates one in `/config/admin-password.txt`, replaced by `admin-password.hash` after the first sign-in. Never publish either file. |
+| `MKVO_ALLOWED_HOSTS` | unset | Extra host names (comma separated) accepted without login and as request origins; IP addresses and `localhost` always work. Needed for a host name with login off, or behind a proxy that rewrites `Host`. |
+| `MKVO_TOOL_DIRECTORIES` | unset | Directories the Settings page may choose for MKVToolNix/FFmpeg. The image finds its bundled tools on its own, so leave the Settings fields blank; any other directory is refused. |
+| `MKVO_SECURE_COOKIES` | false | Enable for HTTPS; leave false for plain HTTP. A proxy sending `X-Forwarded-Proto: https` gets a Secure cookie anyway. |
+| `MKVO_AUTH_MODE`, `MKVO_AUTH_USERNAME`, `MKVO_AUTH_PASSWORD` | legacy | Existing settings are honored unless their new equivalents are explicitly set; blank values count as unset. |
 | `MKVO_TVDB_API_KEY`, `MKVO_TVDB_PIN`, `MKVO_TMDB_API_KEY` | unset | Optional provider credentials; Settings-page values take effect otherwise. |
 
 Container-provided provider credentials appear as configured in the Settings
@@ -66,9 +80,18 @@ a value entered through the web UI.
 - Filesystem browsing through the web UI is limited to the configured source
   roots, watch folders, and enabled media-server library paths. Arbitrary
   container paths are rejected.
-- The supplied Docker and Unraid configurations default to login disabled.
-  Enable `MKVO_AUTH_ENABLED=true` and use HTTPS and network restrictions before
-  exposing MKVO beyond a trusted network. See [authentication notes](AUTHENTICATION.md).
+- Login is on by default. The port is published on every host interface so
+  the LAN can reach it; use `127.0.0.1:8886:8080` for local-only access, and
+  HTTPS plus network restrictions before exposing MKVO beyond a trusted network.
+  See [authentication notes](AUTHENTICATION.md).
+- The compose file and Unraid template drop every Linux capability except
+  `CHOWN`, `SETUID` and `SETGID` (the entrypoint fixes `/config` ownership and
+  switches to `PUID`/`PGID`) and set `no-new-privileges`. With `PUID=0` the app
+  runs as root without `DAC_OVERRIDE`/`FOWNER`, so it cannot write files owned
+  by other users; add those two capabilities or use a real PUID/PGID.
+- Media-server URLs must be HTTP(S) and cannot use link-local addresses
+  (`169.254.0.0/16`, `fe80::/10`). LAN addresses and container names work.
+- Manual subtitle files for muxing must be inside the source roots.
 
 ## Long-Running Operations
 
@@ -144,9 +167,10 @@ Adjust those host paths in Unraid before starting the container. Existing users
 can keep an earlier `/mnt/user/appdata/mkvo` mapping to retain their data. The
 template does not include API keys, SMB credentials, or server-specific paths.
 TVDB/TMDB keys can be entered in Settings after first launch, or through the
-masked optional environment variables. Set Authentication Mode to `disabled`
-for no login on a trusted LAN, `basic` with both credential fields filled in,
-or `auto` to enforce credentials whenever the server accepts remote connections.
+masked optional environment variables. Require Login defaults to true; read the
+generated password from `admin-password.txt` in the appdata folder, or fill in
+Administrator Password. Setting Require Login to false also needs the advanced
+Allow No Login set to true.
 
 Before submitting or updating the template, run the Community Applications
 **Validate** and **Scan** checks after every meaningful XML change.

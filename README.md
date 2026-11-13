@@ -358,8 +358,9 @@ Keep `.env` local. Do not commit API keys, SMB usernames, SMB passwords, or serv
 Optional container settings (see `docs/DOCKER_WEB_CONTAINER.md` for the full list):
 
 - `PUID` / `PGID` / `UMASK` run the app as a specific user so files written to shares are not root-owned.
-- `MKVO_AUTH_ENABLED` selects the in-app administrator login. Supplied container definitions default to false: anyone who can reach MKVO, including reverse-proxy visitors, has full access.
-- `MKVO_USERNAME` defaults to `admin`; a blank `MKVO_PASSWORD` generates a persistent password in `/config/admin-password.txt`. Existing legacy authentication variables remain supported.
+- Login is on by default. Sign in as `MKVO_USERNAME` (default `admin`) with `MKVO_PASSWORD`, or, when it is blank, with the generated password: `docker exec mkvo cat /config/admin-password.txt`. After the first sign-in only a hash is kept. Existing legacy authentication variables remain supported.
+- `MKVO_AUTH_ENABLED=false` gives anyone who can reach MKVO, including reverse-proxy visitors, full access; the server refuses to start that way on a network address unless `MKVO_ALLOW_NO_LOGIN=true` is set too. Upgrading from a container that ran without login: see `docs/AUTHENTICATION.md`.
+- `MKVO_ALLOWED_HOSTS` lists extra host names for reverse proxies or login-free access by name; `MKVO_TOOL_DIRECTORIES` lists the only tool directories the Settings page may choose.
 - `MKVO_SCAN_WORKERS` and `MKVO_EDIT_WORKERS` tune scan and mkvpropedit concurrency.
 
 The container wires Dashboard, Rename, Mux / Remux, Track Properties, Library, Settings, and Logs through the single Rust host, from the same React sources the desktop app embeds.
