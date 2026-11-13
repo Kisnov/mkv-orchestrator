@@ -1,10 +1,7 @@
-import { MobileOptions } from "../components/MobileOptions";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import {
   buildPropEditPreview,
-  cancelOperationJob,
   getCurrentScanFiles,
   getWebSettings,
   PropEditPreviewRequest,
@@ -15,15 +12,13 @@ import {
 } from "../api";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { FileSelectionTable } from "../components/FileSelectionTable";
-import { PanelDivider } from "../components/PanelDivider";
-import { SectionHeader } from "../components/SectionHeader";
-import { PreviewSummaryModal, type PreviewSummaryRow } from "../components/PreviewSummaryModal";
+import { OperationShell } from "../components/OperationShell";
+import type { PreviewSummaryRow } from "../components/PreviewSummaryModal";
 import { describeTrackTargets } from "../lib/templateMatch";
 import { useFileSelection } from "../state/useFileSelection";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { usePropEditTemplate } from "../state/propEditTemplate";
-import { useOperationJob } from "../state/OperationJobContext";
-import { createLocalId } from "../lib/localId";
+import { useOperationRun } from "../state/useOperationRun";
 
 type TitleMode = "keep" | "remove" | "file" | "episode_title" | "custom";
 type TrackType = "audio" | "subtitle";
@@ -68,18 +63,18 @@ function readStoredConfiguration(): StoredTrackPropertiesConfiguration | null {
 
 export function TrackPropertiesPage() {
   const { files, templateFilePath, setTemplateFilePath, syncFromBackend } = useMediaLibrary();
-  const operation = useOperationJob();
   const currentScan = useQuery({ queryKey: ["current-scan-files"], queryFn: getCurrentScanFiles });
   const settings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
-  const storedConfiguration = useRef(readStoredConfiguration());
-  const [templatePath, setTemplatePath] = useState(storedConfiguration.current?.templatePath ?? "");
-  const [containerMode, setContainerMode] = useState<TitleMode>(storedConfiguration.current?.containerMode ?? "keep");
-  const [customContainerTitle, setCustomContainerTitle] = useState(storedConfiguration.current?.customContainerTitle ?? "");
-  const [videoMode, setVideoMode] = useState<TitleMode>(storedConfiguration.current?.videoMode ?? "keep");
-  const [customVideoTitle, setCustomVideoTitle] = useState(storedConfiguration.current?.customVideoTitle ?? "");
-  const [videoLanguageEnabled, setVideoLanguageEnabled] = useState(storedConfiguration.current?.videoLanguageEnabled ?? false);
-  const [videoLanguage, setVideoLanguage] = useState(storedConfiguration.current?.videoLanguage ?? "und");
-  const [defaultVideo, setDefaultVideo] = useState(storedConfiguration.current?.defaultVideo ?? "Keep existing");
+  const [initialConfiguration] = useState(readStoredConfiguration);
+  const storedConfiguration = useRef(initialConfiguration);
+  const [templatePath, setTemplatePath] = useState(initialConfiguration?.templatePath ?? "");
+  const [containerMode, setContainerMode] = useState<TitleMode>(initialConfiguration?.containerMode ?? "keep");
+  const [customContainerTitle, setCustomContainerTitle] = useState(initialConfiguration?.customContainerTitle ?? "");
+  const [videoMode, setVideoMode] = useState<TitleMode>(initialConfiguration?.videoMode ?? "keep");
+  const [customVideoTitle, setCustomVideoTitle] = useState(initialConfiguration?.customVideoTitle ?? "");
+  const [videoLanguageEnabled, setVideoLanguageEnabled] = useState(initialConfiguration?.videoLanguageEnabled ?? false);
+  const [videoLanguage, setVideoLanguage] = useState(initialConfiguration?.videoLanguage ?? "und");
+  const [defaultVideo, setDefaultVideo] = useState(initialConfiguration?.defaultVideo ?? "Keep existing");
   const [template, setTemplate] = useState<PropEditTemplateResponse | null>(null);
   const [audioTracks, setAudioTracks] = useState<PropEditTrackConfigRow[]>([]);
   const [subtitleTracks, setSubtitleTracks] = useState<PropEditTrackConfigRow[]>([]);
@@ -88,15 +83,21 @@ export function TrackPropertiesPage() {
   const [defaultSubtitle, setDefaultSubtitle] = useState("Keep existing");
   const [forcedSubtitle, setForcedSubtitle] = useState("None");
   const [customTrackKeys, setCustomTrackKeys] = useState<Set<string>>(new Set());
-  const [previewResult, setPreviewResult] = useState<PropEditPreviewResponse | null>(null);
-  const [statusText, setStatusText] = useState("Load scanned files from Dashboard, then select a template.");
-  const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
   const [configurationReady, setConfigurationReady] = useState(false);
   // Holds the request, its plan and the differing files as they were when Apply was pressed.
   const [pendingApply, setPendingApply] = useState<{ request: PropEditPreviewRequest; plan: PropEditPreviewResponse; rows: PreviewSummaryRow[] } | null>(null);
-  const [filePanelPercent, setFilePanelPercent] = useState(50);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const lastPreview = useRef<{ request: string; plan: PropEditPreviewResponse } | null>(null);
+  const run = useOperationRun<PropEditPreviewRequest, PropEditPreviewResponse>({
+    label: "Edit Tracks",
+    initialStatus: "Load scanned files from Dashboard, then select a template.",
+    preview: buildPropEditPreview,
+    apply: startPropEditApply,
+    resultOf: (job) => job.propEditResult,
+    startedText: (total) => `Applying ${total} track property edit(s)...`,
+    noChangesText: "No changes are needed for the selected files.",
+    cancelingText: "Canceling property edit job...",
+    reusePreview: true
+  });
+  const { setStatus: setStatusText, setPreviewResult, previewResult } = run;
 
   useEffect(() => {
     if (!currentScan.data) return;
@@ -161,6 +162,7 @@ export function TrackPropertiesPage() {
     setPreviewResult(null);
     setConfigurationReady(true);
     setStatusText(`Template loaded: ${loadedTemplate.templateFileName}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadedTemplate, currentScan.data?.updatedUtc]);
 
   useEffect(() => {
@@ -212,52 +214,7 @@ export function TrackPropertiesPage() {
     setStatusText(
       templateLoad.error instanceof Error ? templateLoad.error.message : "Template load failed."
     );
-  }, [templateLoad.error]);
-
-  const preview = useMutation({
-    mutationFn: buildPropEditPreview,
-    onSuccess: (response, request) => {
-      lastPreview.current = { request: JSON.stringify(request), plan: response };
-      setPreviewResult(response);
-      setStatusText(response.status);
-    },
-    onError: (error) => setStatusText(error instanceof Error ? error.message : "Preview failed.")
-  });
-
-  const apply = useMutation({
-    mutationFn: startPropEditApply,
-    onSuccess: (job) => {
-      operation.trackJob(job.id, "Edit Tracks");
-      setStatusText(`Applying ${job.total} track property edit(s)...`);
-    },
-    onError: (error) => setStatusText(error instanceof Error ? error.message : "Apply failed.")
-  });
-
-  const cancelApply = useMutation({ mutationFn: cancelOperationJob });
-  const runningJob = operation.activeOperation?.label === "Edit Tracks" ? operation.job : undefined;
-  const isApplying = apply.isPending || (operation.activeOperation?.label === "Edit Tracks" && operation.isRunning);
-
-  useEffect(() => {
-    if (!runningJob) return;
-
-    if (runningJob.status === "Running" || runningJob.status === "Queued" || runningJob.status === "WaitingForResources" || runningJob.status === "Canceling") {
-      const progress = runningJob.currentFile ? ` (${runningJob.currentFile})` : "";
-      setStatusText(`Applying ${runningJob.completed + runningJob.failed + runningJob.skipped}/${runningJob.total}${progress}`);
-      return;
-    }
-
-    if (runningJob.propEditResult) {
-      setPreviewResult(runningJob.propEditResult);
-      setStatusText(runningJob.propEditResult.status);
-    } else if (runningJob.status === "Failed") {
-      setStatusText(runningJob.error || "Apply failed.");
-    }
-
-    currentScan.refetch().then((result) => {
-      if (result.data) syncFromBackend(result.data);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runningJob?.status, runningJob?.completed, runningJob?.currentFile]);
+  }, [templateLoad.error, setStatusText]);
 
   function buildRequest(): PropEditPreviewRequest {
     return {
@@ -307,34 +264,19 @@ export function TrackPropertiesPage() {
 
     // The backend reads an empty selection as every file.
     if (selectedMkvPaths.length === 0) return;
-    preview.mutate(buildRequest());
+    run.preview(buildRequest());
   }
 
-  async function runApply() {
+  function runApply() {
     if (selectedMkvPaths.length === 0 || !templateReady) return;
     const request = buildRequest();
-    try {
-      // Apply the plan that was previewed unless the request has changed since.
-      const previewed = lastPreview.current?.request === JSON.stringify(request) ? lastPreview.current.plan : null;
-      const plan = previewed ?? await preview.mutateAsync(request);
-      if (!plan.actions.length) { setStatusText("No changes are needed for the selected files."); return; }
-      if (differingRows.length > 0) { setPendingApply({ request, plan, rows: differingRows }); return; }
-      await applyPlan(request, plan);
-    } catch { /* Mutation handlers display the error. */ }
+    const rows = differingRows;
+    void run.apply(request, (plan) => {
+      if (rows.length === 0) return true;
+      setPendingApply({ request, plan, rows });
+      return false;
+    });
   }
-
-  async function applyPlan(request: PropEditPreviewRequest, plan: PropEditPreviewResponse) {
-    // A plan runs once: applying it again would only replay the finished job.
-    lastPreview.current = null;
-    await apply.mutateAsync({ ...request, planId: plan.planId, planFingerprint: plan.planFingerprint, idempotencyKey: plan.idempotencyKey ?? createLocalId() });
-  }
-
-  function cancelRunningApply() {
-    if (!operation.activeOperation || operation.activeOperation.label !== "Edit Tracks") return;
-    cancelApply.mutate(operation.activeOperation.id);
-    setStatusText("Canceling property edit job...");
-  }
-
 
   function updateTrack(type: TrackType, trackNumber: number, patch: Partial<PropEditTrackConfigRow>) {
     const setter = type === "audio" ? setAudioTracks : setSubtitleTracks;
@@ -359,12 +301,16 @@ export function TrackPropertiesPage() {
   const languagePresetOptions = settings.data?.languagePresets?.length ? settings.data.languagePresets : languagePresets;
 
   return (
-    <div className="workspace-page flex h-full min-h-0 flex-col">
-      <SectionHeader title="Edit Tracks" description="Edit container, track title, language, default, and forced flags." />
-
-      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[18.75rem_minmax(0,1fr)] gap-3">
-        <section className="operation-sidebar flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
-          <MobileOptions>
+    <OperationShell
+      title="Edit Tracks"
+      description="Edit container, track title, language, default, and forced flags."
+      run={run}
+      canRun={selectedMkvPaths.length > 0 && templateReady}
+      onPreview={runPreview}
+      onApply={runApply}
+      selectedText={`${selectedMkvPaths.length} files selected`}
+      initialSplit={50}
+      options={<>
             <div className="flex items-center justify-between">
               <h2 className="text-base font-semibold">Track Options</h2>
             </div>
@@ -433,24 +379,9 @@ export function TrackPropertiesPage() {
                 <option key={language} value={language}>{language}</option>
               ))}
             </select>
-
-
-          </MobileOptions>
-      <div className="mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3" aria-label="Operation actions">
-        <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={isApplying || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
-        {isApplying ? <button type="button" onClick={cancelRunningApply} disabled={cancelApply.isPending} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning">Cancel</button> : <button type="button" onClick={runApply} disabled={apply.isPending || preview.isPending || (selectedMkvPaths.length === 0 || !templateReady)} className="h-9 min-w-0 flex-1 whitespace-nowrap rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>}
-        <span className="w-full text-xs text-muted">{selectedMkvPaths.length} files selected</span>
-        <span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
-      </div>
-        </section>
-
-        <div ref={panelRef} className="grid min-h-0 min-w-0" style={{ gridTemplateRows: `minmax(0,${filePanelPercent}fr) 12px minmax(0,${100 - filePanelPercent}fr)` }}>
-          <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
-            <FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} warnDiffering />
-          </section>
-
-          <PanelDivider containerRef={panelRef} value={filePanelPercent} onChange={setFilePanelPercent} />
-          <section className="flex min-h-0 min-w-0 flex-col rounded-lg border border-border bg-card p-4 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
+      </>}
+      files={<FileSelectionTable title="Files" files={mkvFiles} templateFile={templateFile} selection={selection} warnDiffering />}
+      details={<>
             <div className="flex shrink-0 items-center justify-between gap-3">
               <h2 className="text-base font-semibold">Edit Tracks</h2>
             </div>
@@ -486,49 +417,45 @@ export function TrackPropertiesPage() {
                   onChange={updateTrack}
                 />
             </div>
-          </section>
-        </div>
-      </div>
-      {isSummaryExpanded ? (
-        <PreviewSummaryModal
-          title="Edit Tracks Preview Summary"
-          emptyText="Build a preview to see planned property edits."
-          available={previewResult !== null}
-          status={previewResult?.status ?? ""}
-          summary={previewResult?.summary ?? ""}
-          metrics={[
-            { label: "Files changing", value: new Set(previewResult?.actions.map((action) => action.filePath) ?? []).size, tone: "text-success" },
-            { label: "Planned edits", value: previewResult?.actions.length ?? 0, tone: "text-accent" },
-            { label: "No change", value: previewResult?.noChange.length ?? 0, tone: "text-muted" },
-            { label: "Skipped", value: previewResult?.skipped.length ?? 0, tone: "text-warning" }
-          ]}
-          sections={[
-            ...(differingRows.length > 0 ? [{ title: "Differs from template: tracks that receive the edits", emptyText: "", rows: differingRows }] : []),
-            {
-              title: "Planned changes",
-              emptyText: "No property changes are needed.",
-              rows: previewResult?.actions.map((action) => ({ key: `${action.filePath}-${action.index}`, title: action.fileName, detail: action.description })) ?? []
-            },
-            {
-              title: "No change",
-              emptyText: "Every selected file requires a change.",
-              rows: previewResult?.noChange.map((row) => ({ key: row.filePath, title: row.fileName, detail: row.reason })) ?? []
-            },
-            {
-              title: "Skipped",
-              emptyText: "No files were skipped.",
-              rows: previewResult?.skipped.map((row) => ({ key: row.filePath, title: row.fileName, detail: row.reason })) ?? []
-            }
-          ]}
-          onClose={() => setIsSummaryExpanded(false)}
-        />
-      ) : null}
+      </>}
+      summary={{
+        title: "Edit Tracks Preview Summary",
+        emptyText: "Build a preview to see planned property edits.",
+        available: previewResult !== null,
+        status: previewResult?.status ?? "",
+        summary: previewResult?.summary ?? "",
+        metrics: [
+          { label: "Files changing", value: new Set(previewResult?.actions.map((action) => action.filePath) ?? []).size, tone: "text-success" },
+          { label: "Planned edits", value: previewResult?.actions.length ?? 0, tone: "text-accent" },
+          { label: "No change", value: previewResult?.noChange.length ?? 0, tone: "text-muted" },
+          { label: "Skipped", value: previewResult?.skipped.length ?? 0, tone: "text-warning" }
+        ],
+        sections: [
+          ...(differingRows.length > 0 ? [{ title: "Differs from template: tracks that receive the edits", emptyText: "", rows: differingRows }] : []),
+          {
+            title: "Planned changes",
+            emptyText: "No property changes are needed.",
+            rows: previewResult?.actions.map((action) => ({ key: `${action.filePath}-${action.index}`, title: action.fileName, detail: action.description })) ?? []
+          },
+          {
+            title: "No change",
+            emptyText: "Every selected file requires a change.",
+            rows: previewResult?.noChange.map((row) => ({ key: row.filePath, title: row.fileName, detail: row.reason })) ?? []
+          },
+          {
+            title: "Skipped",
+            emptyText: "No files were skipped.",
+            rows: previewResult?.skipped.map((row) => ({ key: row.filePath, title: row.fileName, detail: row.reason })) ?? []
+          }
+        ]
+      }}
+    >
       {pendingApply ? (
         <ConfirmModal
           title="Apply to files that differ from the template?"
           message={`${pendingApply.rows.length === 1 ? "1 selected file differs" : `${pendingApply.rows.length} selected files differ`} from the template. Each edit goes to the track in the same position within its type, so check that these are the tracks you mean to change.`}
           confirmLabel={`Apply to ${pendingApply.request.selectedPaths.length} file(s)`}
-          onConfirm={() => { setPendingApply(null); applyPlan(pendingApply.request, pendingApply.plan).catch(() => { /* Mutation handlers display the error. */ }); }}
+          onConfirm={() => { setPendingApply(null); run.applyPlan(pendingApply.request, pendingApply.plan).catch(() => { /* Mutation handlers display the error. */ }); }}
           onClose={() => setPendingApply(null)}
         >
           <div className="mt-4 overflow-hidden rounded-md border border-warning bg-input">
@@ -541,7 +468,7 @@ export function TrackPropertiesPage() {
           </div>
         </ConfirmModal>
       ) : null}
-    </div>
+    </OperationShell>
   );
 }
 
