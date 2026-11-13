@@ -356,7 +356,7 @@ impl MkvoRuntime {
     pub async fn set_file_selection(
         &self,
         request: mkvo_contracts::FileSelectionRequest,
-    ) -> RuntimeResult<CurrentScanResponse> {
+    ) -> RuntimeResult<mkvo_contracts::FileSelectionResponse> {
         let mut state = self.inner.current_scan.write().await;
         let available: BTreeSet<String> = state
             .files
@@ -383,7 +383,9 @@ impl MkvoRuntime {
         }
 
         state.selected = selected;
-        Ok(current_scan_response(&state))
+        Ok(mkvo_contracts::FileSelectionResponse {
+            selected_paths: state.selected_display_paths(),
+        })
     }
 
     /// Move the working set with files a rename just moved on disk.
@@ -662,6 +664,23 @@ mod tests {
             large_row < small_row + 256,
             "the job row grew from {small_row} to {large_row} bytes"
         );
+    }
+
+    /// Every checkbox click is one of these, so it must not carry the library.
+    #[tokio::test]
+    async fn a_selection_update_answers_with_the_selection_only() {
+        let mut sizes = Vec::new();
+        for files in [3, 300] {
+            let host = host(files);
+            let first = scan(&host).await.files.swap_remove(0).path;
+            let request = mkvo_contracts::FileSelectionRequest {
+                paths: vec![first.clone()],
+            };
+            let response = host.runtime.set_file_selection(request).await.unwrap();
+            assert_eq!(response.selected_paths, [first]);
+            sizes.push(serde_json::to_string(&response).unwrap().len());
+        }
+        assert!(sizes[1] < sizes[0] + 64, "{sizes:?}");
     }
 
     #[tokio::test]

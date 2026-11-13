@@ -2,6 +2,7 @@ import type { LogExport } from "./client";
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemResponse,
   LibraryArtworkRequest,
   LibraryArtworkResponse,
@@ -211,8 +212,8 @@ export class HttpBackendClient implements BackendClient {
     return this.json<CurrentScanResponse>("/api/files/current", "DELETE", undefined, "CurrentScanResponse");
   }
 
-  setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-    return this.json<CurrentScanResponse>("/api/files/selection", "PUT", { paths }, "CurrentScanResponse");
+  setFileSelection(paths: string[]): Promise<FileSelectionResponse> {
+    return this.json<FileSelectionResponse>("/api/files/selection", "PUT", { paths }, "FileSelectionResponse");
   }
 
   // The server only ever lists inside its configured roots, so anything the

@@ -2,6 +2,7 @@ import type { LogExport } from "./client";
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemResponse,
   LibraryArtworkRequest,
   LibraryArtworkResponse,
@@ -116,8 +117,8 @@ export class TauriBackendClient implements BackendClient {
     return this.invoke<CurrentScanResponse>("clear_current_scan_files", undefined, "CurrentScanResponse");
   }
 
-  setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-    return this.invoke<CurrentScanResponse>("set_file_selection", { request: { paths } }, "CurrentScanResponse");
+  setFileSelection(paths: string[]): Promise<FileSelectionResponse> {
+    return this.invoke<FileSelectionResponse>("set_file_selection", { request: { paths } }, "FileSelectionResponse");
   }
 
   async authorizeBrowsedRoot(path: string): Promise<void> {

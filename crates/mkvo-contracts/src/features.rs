@@ -190,6 +190,14 @@ pub struct FileSelectionRequest {
     pub paths: Vec<String>,
 }
 
+/// The selection as stored. The files are not repeated: every checkbox click
+/// gets one of these.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSelectionResponse {
+    pub selected_paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResponse {
