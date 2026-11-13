@@ -5,7 +5,7 @@ import { useLocation } from "react-router-dom";
 
 import { SettingsPage } from "./SettingsPage";
 import { renderWithBackend } from "../test/render";
-import type { WebSettings } from "../generated/contracts";
+import type { WebMediaServer, WebSettings } from "../generated/contracts";
 
 function settings(overrides: Partial<WebSettings> = {}): WebSettings {
   return {
@@ -598,6 +598,92 @@ describe("Settings appearance", () => {
 
     expect(document.documentElement.style.getPropertyValue("--color-border")).toBe("#12AB34");
     expect((screen.getByLabelText(/theme json/i) as HTMLTextAreaElement).value).toContain('"Border": "#12AB34"');
+  });
+});
+
+function mediaServer(overrides: Partial<WebMediaServer> = {}): WebMediaServer {
+  return {
+    id: "0198c1d2-0000-7000-8000-000000000001",
+    name: "Home",
+    type: "jellyfin",
+    serverUrl: "http://jellyfin.local:8096",
+    hasApiKey: true,
+    isDefault: true,
+    lastSyncedUtc: null,
+    libraries: [],
+    ...overrides
+  };
+}
+
+describe("Settings media servers", () => {
+  /// A saved key is never returned, so the field reloads blank. Sending that
+  /// blank string made the backend test with no credential at all.
+  it("tests a saved server without sending a blank key", async () => {
+    const user = userEvent.setup();
+    const testMediaServerConnection = vi.fn().mockResolvedValue({ success: true, status: "Connection succeeded.", libraryCount: 0 });
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      testMediaServerConnection
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    await user.click(screen.getByRole("button", { name: "Test Home" }));
+
+    await waitFor(() => expect(testMediaServerConnection).toHaveBeenCalled());
+    const request = testMediaServerConnection.mock.calls[0][0];
+    expect(request.id).toBe(mediaServer().id);
+    expect(request.apiKey).toBeUndefined();
+  });
+
+  it("tests with a key that was just typed", async () => {
+    const user = userEvent.setup();
+    const testMediaServerConnection = vi.fn().mockResolvedValue({ success: true, status: "Connection succeeded.", libraryCount: 0 });
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      saveWebSettings: vi.fn().mockResolvedValue(settings({ mediaServers: [mediaServer()] })),
+      testMediaServerConnection
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "new-key" } });
+    await user.click(screen.getByRole("button", { name: "Test Home" }));
+
+    await waitFor(() => expect(testMediaServerConnection).toHaveBeenCalled());
+    expect(testMediaServerConnection.mock.calls[0][0].apiKey).toBe("new-key");
+  });
+
+  /// The backend reports the type in lower case. With capitalised option
+  /// values nothing matched and the browser showed the first option, Emby.
+  it("shows the saved server type instead of the first option", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] }))
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+
+    expect(screen.getByLabelText("Type")).toHaveDisplayValue("Jellyfin");
+  });
+
+  it("makes the first remaining server the default when the default is deleted", async () => {
+    const user = userEvent.setup();
+    const other = mediaServer({ id: "0198c1d2-0000-7000-8000-000000000002", name: "Attic", isDefault: false });
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [{ ...other, isDefault: true }] }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer(), other] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Delete Home" }));
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalled());
+    expect(saveWebSettings.mock.calls[0][0].mediaServers).toEqual([
+      expect.objectContaining({ id: other.id, isDefault: true })
+    ]);
   });
 });
 

@@ -113,10 +113,11 @@ pub enum MediaServerError {
         kind: MediaServerKind,
         message: String,
     },
-    #[error("{kind} returned HTTP {status}")]
+    #[error("{kind} returned HTTP {status} for {path}")]
     Status {
         kind: MediaServerKind,
         status: StatusCode,
+        path: String,
     },
     #[error("{kind} returned an invalid response: {message}")]
     InvalidResponse {
@@ -199,7 +200,9 @@ impl MediaServerDiscoveryClient {
                 if response.status().is_success() {
                     Ok(response)
                 } else {
-                    Err(MediaServerError::Status { kind: server.kind, status: response.status() })
+                    // The query is dropped: the path alone says which endpoint refused.
+                    let path = relative_path.split('?').next().unwrap_or_default().to_owned();
+                    Err(MediaServerError::Status { kind: server.kind, status: response.status(), path })
                 }
             }
         }

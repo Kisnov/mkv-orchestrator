@@ -80,6 +80,8 @@ pub enum ApiErrorCode {
     PlanTampered,
     ToolUnavailable,
     ProviderUnavailable,
+    CredentialRejected,
+    CredentialInsufficient,
     CacheUnavailable,
     JobCanceled,
     JobFailed,

@@ -71,6 +71,8 @@ struct RuntimeInner {
     legacy_rename_history: Vec<LegacyRenameBatchRecord>,
     providers: ProviderClients,
     media_server_http: MediaServerDiscoveryClient,
+    media_server_rejections:
+        RwLock<HashMap<MediaServerId, media_server_facade::CredentialRejection>>,
 }
 
 /// HTTP clients for the metadata providers, built once per runtime.
@@ -242,6 +244,7 @@ impl MkvoRuntime {
                 current_scan: Arc::new(RwLock::new(CurrentScanState::default())),
                 legacy_rename_history,
                 media_server_http: MediaServerDiscoveryClient::new(),
+                media_server_rejections: RwLock::new(HashMap::new()),
             }),
         }
     }

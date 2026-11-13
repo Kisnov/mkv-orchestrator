@@ -5,7 +5,7 @@ use axum::{
 };
 use mkvo_contracts::ApiErrorCode;
 use mkvo_runtime::RuntimeError;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::request_id::{CORRELATION_ID_HEADER, REQUEST_CORRELATION_ID};
 
@@ -34,6 +34,13 @@ impl IntoResponse for HttpError {
                 retryable = error.retryable,
                 message = %error.message,
                 "runtime request failed"
+            );
+        } else if error.code == ApiErrorCode::CredentialRejected {
+            // The runtime logs a refused key once, naming the server; not per poster.
+            debug!(
+                correlation_id = %error.correlation_id,
+                message = %error.message,
+                "media server credential rejected"
             );
         } else {
             warn!(
@@ -64,6 +71,10 @@ const fn status_for_code(code: ApiErrorCode) -> StatusCode {
         | ApiErrorCode::PlanTampered
         | ApiErrorCode::JobCanceled => StatusCode::CONFLICT,
         ApiErrorCode::PlanExpired => StatusCode::GONE,
+        // Not 401 (that is this app's own login) and not 5xx (nothing is down).
+        ApiErrorCode::CredentialRejected | ApiErrorCode::CredentialInsufficient => {
+            StatusCode::FAILED_DEPENDENCY
+        }
         ApiErrorCode::ToolUnavailable
         | ApiErrorCode::ProviderUnavailable
         | ApiErrorCode::CacheUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -98,6 +109,14 @@ mod tests {
         assert_eq!(
             status_for_code(ApiErrorCode::ToolUnavailable),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_for_code(ApiErrorCode::CredentialRejected),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(
+            status_for_code(ApiErrorCode::CredentialInsufficient),
+            StatusCode::FAILED_DEPENDENCY
         );
         assert_eq!(
             status_for_code(ApiErrorCode::RateLimited),
