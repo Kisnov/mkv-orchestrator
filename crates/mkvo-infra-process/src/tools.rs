@@ -563,7 +563,10 @@ mod version_cache_tests {
         let found = |registry: &ToolRegistry| registry.resolve(ToolKind::MkvMerge).unwrap().path;
         assert!(found(&registry).starts_with(std::fs::canonicalize(&old).unwrap()));
 
+        #[cfg(windows)]
         std::fs::remove_dir(&current).expect("remove link");
+        #[cfg(unix)]
+        std::fs::remove_file(&current).expect("remove link");
         link_directory(&new, &current);
         assert!(found(&registry).starts_with(std::fs::canonicalize(&new).unwrap()));
     }
