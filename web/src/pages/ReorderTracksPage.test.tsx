@@ -136,3 +136,22 @@ it("says why it cannot run when the template is not in the batch", async () => {
   await waitFor(() => expect(applyButton).toBeEnabled());
   expect(screen.queryByText(explanation)).not.toBeInTheDocument();
 });
+
+it("takes the backend's selection when a later scan leaves none of the old batch", async () => {
+  localStorage.clear(); sessionStorage.clear();
+  const summary = { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 };
+  let scan = { updatedUtc: "2026-11-12T10:00:00Z", files: [file("01.mkv")], selectedPaths: ["/media/01.mkv"], summary };
+  const user = userEvent.setup();
+  renderWithBackend(
+    <MediaLibraryProvider><Rescan/><ReorderTracksPage/></MediaLibraryProvider>,
+    { getCurrentScanFiles: () => Promise.resolve(scan), setFileSelection: (paths) => Promise.resolve({ ...scan, selectedPaths: paths, updatedUtc: null }) }
+  );
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select 01.mkv" })).toBeChecked());
+
+  scan = { updatedUtc: "2026-11-12T10:00:01Z", files: [file("02.mkv"), file("03.mkv")], selectedPaths: ["/media/02.mkv"], summary };
+  await user.click(screen.getByRole("button", { name: "Rescan" }));
+  await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select 02.mkv" })).toBeChecked());
+  await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+
+  expect(screen.getByRole("checkbox", { name: "Select 03.mkv" })).not.toBeChecked();
+});

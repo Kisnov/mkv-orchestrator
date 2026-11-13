@@ -17,6 +17,8 @@ export function useFileSelection(files: MediaFileRow[], templateFile: MediaFileR
   // A manual selection lasts only while the template and the files equal to it stay the same.
   const scope = [templateFile?.path ?? "", ...defaultPaths].join("\u0000");
   const [manual, setManual] = useState<{ scope: string; paths: string[] } | null>(null);
+  // Dropped on the first change, so returning to an earlier scope does not bring it back.
+  if (manual && manual.scope !== scope) setManual(null);
   const selectedPaths = useMemo(() => {
     if (manual?.scope !== scope) return defaultPaths;
     const chosen = new Set(manual.paths);

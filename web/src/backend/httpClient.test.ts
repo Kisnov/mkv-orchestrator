@@ -41,6 +41,14 @@ describe("HttpBackendClient timeouts", () => {
     expect(timeout).toHaveBeenCalledWith(60_000);
   });
 
+  it("reports a body cut off by the timeout as a timeout in browsers that call it AbortError", async () => {
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(timedOutSignal());
+    const response = { text: () => Promise.reject(new DOMException("aborted", "AbortError")) } as Response;
+    const client = new HttpBackendClient({ fetch: vi.fn().mockResolvedValue(response) });
+
+    await expect(client.getStatus()).rejects.toMatchObject({ name: "ApiError", code: "TIMEOUT" });
+  });
+
   it("gives calls that do their work inline a much longer limit", async () => {
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timedOutSignal());
     const client = new HttpBackendClient({ fetch: vi.fn().mockRejectedValue(new Error("offline")) });

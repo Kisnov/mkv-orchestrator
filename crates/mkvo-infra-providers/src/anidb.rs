@@ -166,11 +166,12 @@ impl AniDbClient {
         })
         .await?;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| ProviderError::network(KIND, error))?
-        {
+        loop {
+            let chunk = tokio::select! {
+                () = cancellation.cancelled() => return Err(ProviderError::Cancelled { provider: KIND }),
+                chunk = response.chunk() => chunk.map_err(|error| ProviderError::network(KIND, error))?,
+            };
+            let Some(chunk) = chunk else { break };
             if bytes.len() + chunk.len() > MAX_TITLES_BYTES {
                 return Err(ProviderError::invalid(KIND, "title dump is too large"));
             }
@@ -730,6 +731,38 @@ mod tests {
                 .expect("episodes");
         }
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn a_search_canceled_mid_download_stops_reading_the_dump() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection");
+            let _ = stream.read(&mut [0_u8; 1024]).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n<animetitles>")
+                .await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let client = AniDbClient::with_endpoints(format!("{base}/titles"), base);
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let credentials = ProviderCredentials::api_key("");
+        let search = client.search(&credentials, "bebop", "eng", cancellation);
+        let error = tokio::time::timeout(Duration::from_secs(5), search)
+            .await
+            .expect("stops on cancellation")
+            .expect_err("canceled");
+        assert!(matches!(error, ProviderError::Cancelled { .. }), "{error}");
     }
 
     #[test]

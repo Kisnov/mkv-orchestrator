@@ -30,6 +30,7 @@ function Harness({ initialFiles = files, initialTemplatePath = initialFiles[0].p
   return (
     <>
       <button type="button" onClick={() => setTemplatePath("/media/04.mkv")}>Use 04 as template</button>
+      <button type="button" onClick={() => setTemplatePath("/media/01.mkv")}>Use 01 as template</button>
       <button type="button" onClick={() => setScanned((current) => current.map((item) => ({ ...item })))}>Refresh files</button>
       <button type="button" onClick={() => setScanned((current) => [...current, file("07.mkv", "jpn")])}>Add a differing file</button>
       <output>{selection.selectedPaths.join(",")}</output>
@@ -151,6 +152,16 @@ describe("FileSelectionTable", () => {
     await user.click(screen.getByRole("button", { name: "Use 04 as template" }));
     expect(checkedNames()).toEqual(["Select 04.mkv", "Select 05.mkv", "Select 06.mkv"]);
     expect(screen.getByText("3 files differ from the template and are not selected.")).toBeInTheDocument();
+  });
+
+  it("does not bring old manual choices back when the template changes back", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(box("06.mkv"));
+    await user.click(screen.getByRole("button", { name: "Use 04 as template" }));
+    await user.click(screen.getByRole("button", { name: "Use 01 as template" }));
+    expect(checkedNames()).toEqual(["Select 01.mkv", "Select 02.mkv", "Select 03.mkv"]);
   });
 
   it("keeps a manual selection when a rescan leaves the matching files unchanged", async () => {

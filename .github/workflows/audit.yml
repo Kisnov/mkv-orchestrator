@@ -12,12 +12,15 @@ on:
     paths: [Cargo.lock, web/package-lock.json, .github/workflows/audit.yml]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_AUDIT_VERSION: "0.23.0"
 
 jobs:
   audit:
-    name: Dependency audit
+    name: Rust dependency audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +42,12 @@ jobs:
       # permanently red job is one people learn to ignore.
       - name: Audit Rust dependencies
         run: cargo audit
+
+  npm-audit:
+    name: npm dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22

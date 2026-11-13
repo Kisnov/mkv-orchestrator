@@ -198,13 +198,10 @@ impl MkvoRuntime {
             })
             .buffer_unordered(workers);
         let mut failures = Vec::new();
-        let mut recorded = Ok(());
+        let mut first_error = None;
         while let Some((key, result)) = executions.next().await {
             // Returning here would drop, and so kill, the edits still writing: they are drained.
-            if recorded.is_err() {
-                continue;
-            }
-            recorded = async {
+            let recorded = async {
                 match result {
                     Ok(()) => {
                         journal.step = journal.step.saturating_add(1);
@@ -228,9 +225,14 @@ impl MkvoRuntime {
                 Ok::<_, ApplicationError>(())
             }
             .await;
-            halted.store(recorded.is_err(), std::sync::atomic::Ordering::Relaxed);
+            if let Err(error) = recorded {
+                halted.store(true, std::sync::atomic::Ordering::Relaxed);
+                first_error.get_or_insert(error);
+            }
         }
-        recorded?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         if !failures.is_empty() {
             let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
@@ -280,6 +282,7 @@ impl MkvoRuntime {
             )
             .await?;
         let invocation = self.propedit_invocation(item).await?;
+        context.ensure_not_canceled()?;
         // mkvpropedit rewrites the file in place; a cancel waits for it rather than kill it mid-write.
         let execution = self
             .dependencies()
@@ -446,6 +449,7 @@ mod execution_tests {
         inner: Arc<dyn OperationJournal>,
         updates: AtomicUsize,
         broke: Arc<Notify>,
+        last_rejected: Arc<std::sync::Mutex<Option<JournalRecord>>>,
     }
 
     #[async_trait]
@@ -459,6 +463,7 @@ mod execution_tests {
             if self.updates.fetch_add(1, Ordering::SeqCst) == 0 {
                 return self.inner.advance(record).await;
             }
+            *self.last_rejected.lock().expect("record") = Some(record.clone());
             self.broke.notify_one();
             Err(PortError::Other("the journal is unavailable".to_owned()))
         }
@@ -497,11 +502,13 @@ mod execution_tests {
             finished: Arc::default(),
         };
         let broke = Arc::new(Notify::new());
+        let last_rejected = Arc::default();
         let library = library_with(tools.clone(), |dependencies| {
             dependencies.journal = Arc::new(BrokenJournal {
                 inner: dependencies.journal.clone(),
                 updates: AtomicUsize::new(0),
                 broke: broke.clone(),
+                last_rejected: Arc::clone(&last_rejected),
             });
         });
         let files = vec![
@@ -517,6 +524,14 @@ mod execution_tests {
         assert_eq!(job.status, JobStatus::Failed);
         assert!(job.error.expect("error").contains("journal is unavailable"));
         assert_eq!(tools.finished.load(Ordering::SeqCst), 2);
+        // The edit that landed after the error is still recorded.
+        let record = last_rejected
+            .lock()
+            .expect("record")
+            .clone()
+            .expect("journal update");
+        let completed = mkvo_application::JournalItemStatus::Completed;
+        assert!(record.items.iter().all(|item| item.status == completed));
     }
 
     #[tokio::test]
