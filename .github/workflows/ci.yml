@@ -39,6 +39,8 @@ jobs:
           toolchain: "1.88"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
       - name: Verify generated TypeScript contracts
         run: cargo run --locked --package mkvo-contract-gen -- --check
       - name: Check formatting
