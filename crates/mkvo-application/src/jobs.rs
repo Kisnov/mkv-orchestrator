@@ -372,10 +372,11 @@ impl LiveJob {
             if status == JobStatus::Running && snapshot.started_utc.is_none() {
                 snapshot.started_utc = Some(now);
             }
+            // Announced under the lock, so events keep the order of the changes.
+            self.publish(JobEvent::StatusChanged { status });
             Ok(())
         })
         .await?;
-        self.publish(JobEvent::StatusChanged { status });
         Ok(())
     }
 
@@ -447,12 +448,11 @@ impl LiveJob {
             self.cancel.cancel();
             snapshot.status = JobStatus::Canceling;
             snapshot.revision = snapshot.revision.saturating_add(1);
+            self.publish(JobEvent::StatusChanged {
+                status: JobStatus::Canceling,
+            });
         }
-        let snapshot = self.persist().await?;
-        self.publish(JobEvent::StatusChanged {
-            status: JobStatus::Canceling,
-        });
-        Ok(snapshot)
+        self.persist().await
     }
 
     /// Reach a terminal state. Subscribers are told even when the repository
