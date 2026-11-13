@@ -4,7 +4,7 @@ import type { MuxActionRow, MuxPreviewRequest, MuxPreviewResponse } from "../api
 import type { useMuxRequest } from "./useMuxRequest";
 
 type Files = Array<{ path: string; name: string }>;
-export type OriginalsAtRisk = { replaced: Files; deletedMp4: Files; deletedSubtitlesOf: Files };
+export type OriginalsAtRisk = { replaced: Files; deletedMp4: Files; deletedSubtitlesOf: Files; overwrittenExtracts: Files };
 
 /** The original files a plan overwrites or deletes; null when it keeps them all. */
 export function originalsAtRisk(request: MuxPreviewRequest, plan: MuxPreviewResponse): OriginalsAtRisk | null {
@@ -12,9 +12,11 @@ export function originalsAtRisk(request: MuxPreviewRequest, plan: MuxPreviewResp
   const risk = {
     replaced: request.preserveOriginal ? [] : files((action) => action.operation === "Remux" || action.operation === "Mux subtitles"),
     deletedMp4: request.deleteMp4AfterConvert ? files((action) => action.operation === "Convert to MKV") : [],
-    deletedSubtitlesOf: request.preserveExternalSubtitleFiles ? [] : files((action) => action.operation === "Mux subtitles")
+    deletedSubtitlesOf: request.preserveExternalSubtitleFiles ? [] : files((action) => action.operation === "Mux subtitles"),
+    // The plan cannot say which outputs exist yet, only which files are extracted.
+    overwrittenExtracts: request.extractOverwriteExistingFiles ? files((action) => action.operation === "Extract subtitles") : []
   };
-  return risk.replaced.length || risk.deletedMp4.length || risk.deletedSubtitlesOf.length ? risk : null;
+  return Object.values(risk).some((group) => group.length) ? risk : null;
 }
 
 /** Applies a plan at once, or holds it for `OriginalsConfirm` when it would replace or delete originals. */
