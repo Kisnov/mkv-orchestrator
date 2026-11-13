@@ -1,6 +1,6 @@
 import { useMediaLibrary, MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, OperationJobResponse, PropEditPreviewRequest, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
+import type { MediaFileRow, OperationJobResponse, PropEditPreviewRequest, PropEditPreviewResponse, PropEditTemplateRequest, PropEditTemplateResponse, WebSettings } from "../generated/contracts";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
@@ -188,12 +188,12 @@ describe("Track Properties template synchronization", () => {
   it("applies the plan that was previewed while the request is unchanged", async () => {
     const user = userEvent.setup();
     const scannedFile = file("Episode 01.mkv");
-    const buildPropEditPreview = vi.fn((_request: PropEditPreviewRequest) => Promise.resolve({
+    const buildPropEditPreview = vi.fn<(request: PropEditPreviewRequest) => Promise<PropEditPreviewResponse>>((): Promise<PropEditPreviewResponse> => Promise.resolve({
       actions: [{ index: 0, filePath: scannedFile.path, fileName: scannedFile.fileName, description: "Apply 1 property mutation(s)", command: "" }],
       skipped: [], noChange: [], summary: "ready", status: "ready",
       planId: `plan-${buildPropEditPreview.mock.calls.length}`, planFingerprint: "fingerprint", idempotencyKey: `key-${buildPropEditPreview.mock.calls.length}`
     }));
-    const startPropEditApply = vi.fn((_request: PropEditPreviewRequest) => Promise.reject(new Error("Test stops before tracking a job")));
+    const startPropEditApply = vi.fn<(request: PropEditPreviewRequest) => Promise<never>>(() => Promise.reject(new Error("Test stops before tracking a job")));
 
     renderWithBackend(
       <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
@@ -347,7 +347,7 @@ describe("Edit Tracks file selection", () => {
       skipped: [], noChange: [], summary: "ready", status: "Track-properties preview ready",
       planId: `plan-${plan.mock.calls.length}`, planFingerprint: "fingerprint", idempotencyKey: `key-${plan.mock.calls.length}`
     }));
-    const apply = vi.fn((_request: PropEditPreviewRequest) => Promise.reject(new Error("Test stops before tracking a job")));
+    const apply = vi.fn<(request: PropEditPreviewRequest) => Promise<never>>(() => Promise.reject(new Error("Test stops before tracking a job")));
     renderWithBackend(
       <MediaLibraryProvider><TrackPropertiesPage /></MediaLibraryProvider>,
       {
