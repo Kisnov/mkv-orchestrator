@@ -301,14 +301,25 @@ export function SettingsPage() {
     save: saveWebSettings,
     onPending: () => setSettingsStatus("Changes pending..."),
     onSaving: () => setSettingsStatus("Saving settings…"),
-    onSaved: (saved, latest) => {
+    onSaved: (saved, latest, sent) => {
       const previous = queryClient.getQueryData<WebSettings>(["web-settings"]);
       queryClient.setQueryData(["web-settings"], saved);
       queryClient.setQueryData(["settings"], saved);
-      // Only what the server owns; the fields keep what is typed in them.
+      // Only what the server owns, plus each key it now stores: a key left in its
+      // field would be sent again with every save, also to a URL changed later.
+      // A field edited since the request went out is left alone.
+      const clearIfStored = (isStored: boolean, sentValue: string | null | undefined) =>
+        (current: string) => isStored && sentValue && current === sentValue ? "" : current;
+      setTvdbApiKey(clearIfStored(saved.hasTvdbApiKey, sent.tvdbApiKey));
+      setTvdbPin(clearIfStored(saved.hasTvdbPin, sent.tvdbPin));
+      setTmdbApiKey(clearIfStored(saved.hasTmdbApiKey, sent.tmdbApiKey));
+      setAnidbClient(clearIfStored(saved.hasAnidbClient, sent.anidbClient));
       setMediaServers((current) => current.map((server) => {
         const match = saved.mediaServers.find((item) => item.id === server.id);
-        return match ? { ...server, hasApiKey: match.hasApiKey } : server;
+        const sentKey = sent.mediaServers?.find((item) => item.id === server.id)?.apiKey;
+        return match
+          ? { ...server, hasApiKey: match.hasApiKey, apiKey: clearIfStored(match.hasApiKey, sentKey)(server.apiKey ?? "") }
+          : server;
       }));
       const droppedKeys = saved.mediaServers.filter((server) =>
         !server.hasApiKey && previous?.mediaServers.some((item) => item.id === server.id && item.hasApiKey));

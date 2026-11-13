@@ -808,11 +808,13 @@ describe("Settings media server saves", () => {
     expect(screen.queryByText(/encrypted before/i)).not.toBeInTheDocument();
   });
 
-  /// The reload after a save blanked the key field, so a key still being
-  /// typed was cut off at whatever the first save had sent.
-  it("keeps a typed API key in its field after the save", async () => {
+  /// A typed key used to stay in the form and ride along with every later
+  /// save, so changing the URL afterwards stored it for the new URL too.
+  it("clears a key from its field once it is stored, so a new URL does not get it", async () => {
     const user = userEvent.setup();
-    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [mediaServer()] }));
+    const saveWebSettings = vi.fn().mockImplementation((request) => Promise.resolve(settings({
+      mediaServers: [mediaServer({ serverUrl: request.mediaServers[0].serverUrl, hasApiKey: true })]
+    })));
     renderWithBackend(<SettingsPage />, {
       getStatus: () => Promise.resolve(status),
       getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: false })] })),
@@ -823,29 +825,56 @@ describe("Settings media server saves", () => {
     const key = screen.getByLabelText("API key / token");
 
     fireEvent.change(key, { target: { value: "new-key" } });
-    await waitFor(() => expect(saveWebSettings).toHaveBeenCalled(), { timeout: 2500 });
-    await screen.findByText("Settings saved automatically.");
-
-    expect(key).toHaveValue("new-key");
+    await waitFor(() => expect(key).toHaveValue(""), { timeout: 2500 });
+    expect(key).toHaveAttribute("placeholder", "••••••••••••");
     expect(saveWebSettings.mock.calls[0][0].mediaServers[0].apiKey).toBe("new-key");
+
+    const url = screen.getByLabelText("Server URL");
+    fireEvent.focus(url);
+    fireEvent.change(url, { target: { value: "http://other.local:8096" } });
+    fireEvent.blur(url);
+    await waitFor(() => expect(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].serverUrl).toBe("http://other.local:8096"), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].apiKey).toBeUndefined();
   });
 
-  it("never sends a blank key", async () => {
+  it("keeps a key that was edited while its save was in flight", async () => {
     const user = userEvent.setup();
-    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [mediaServer()] }));
+    const first = deferred<WebSettings>();
+    const saveWebSettings = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(settings({ mediaServers: [mediaServer()] }));
     renderWithBackend(<SettingsPage />, {
       getStatus: () => Promise.resolve(status),
-      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: false })] })),
       saveWebSettings
     });
     await user.click(await screen.findByRole("button", { name: /^library$/i }));
     await user.click(screen.getByRole("button", { name: "Edit Home" }));
-    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "abc" } });
+    const key = screen.getByLabelText("API key / token");
+
+    fireEvent.change(key, { target: { value: "new" } });
     await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
-    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "" } });
+    fireEvent.change(key, { target: { value: "new-key" } });
+    first.resolve(settings({ mediaServers: [mediaServer()] }));
 
     await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
-    expect(saveWebSettings.mock.calls[1][0].mediaServers[0]).not.toHaveProperty("apiKey", "");
+    expect(saveWebSettings.mock.calls[1][0].mediaServers[0].apiKey).toBe("new-key");
+  });
+
+  it("clears a provider key from its field once it is stored", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings: vi.fn().mockResolvedValue(settings({ hasTvdbApiKey: true }))
+    });
+    await openProvidersTab(user);
+    const key = screen.getByLabelText("TVDB API Key");
+
+    fireEvent.change(key, { target: { value: "tvdb-key" } });
+
+    await waitFor(() => expect(key).toHaveValue(""), { timeout: 2500 });
+    expect(key).toHaveAttribute("placeholder", "••••••••••••");
   });
 
   /// The backend drops a stored key when the URL changes, so the form says so
