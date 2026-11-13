@@ -15,6 +15,7 @@ export function OriginalsConfirm({ risk, onConfirm, onClose }: { risk: Originals
 
   return (
     <ConfirmModal
+      danger
       title={only === risk.replaced ? `Replace ${count} original ${noun}?` : only === risk.deletedMp4 ? `Delete ${count} original MP4 ${noun}?` : only === risk.overwrittenExtracts ? `Overwrite subtitles extracted earlier from ${count} ${noun}?` : `Replace or delete originals for ${count} ${noun}?`}
       message={`${groups.map((group) => group.text).join(" ")} This can't be undone.`}
       confirmLabel={only === risk.replaced ? `Replace ${count} ${noun}` : only === risk.deletedMp4 ? `Delete ${count} MP4 ${noun}` : only === risk.overwrittenExtracts ? `Extract and overwrite` : `Apply to ${count} ${noun}`}

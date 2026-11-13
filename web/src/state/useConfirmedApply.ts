@@ -43,7 +43,7 @@ export function useConfirmedApply(run: ReturnType<typeof useMuxRequest>) {
     dialog: pending && {
       risk: pending.risk,
       onConfirm: () => { setPending(null); run.applyPlan(pending.request, pending.plan).catch(() => { /* Mutation handlers display the error. */ }); },
-      onClose: () => setPending(null)
+      onClose: () => { setPending(null); run.setStatus("Apply cancelled. No files were changed."); }
     }
   };
 }

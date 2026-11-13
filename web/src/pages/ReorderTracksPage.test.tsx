@@ -230,6 +230,7 @@ it("asks before replacing the originals and sends nothing when cancelled", async
   expect(within(dialog).getByText("02.mkv")).toBeInTheDocument();
   expect(within(dialog).getByText(/can't be undone/)).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("status")).toHaveTextContent("Apply cancelled. No files were changed.");
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(startMuxApply).not.toHaveBeenCalled();
 

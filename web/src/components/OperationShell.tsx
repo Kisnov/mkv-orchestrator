@@ -75,8 +75,8 @@ export function OperationShell({ title, description, options, run, canRun, onPre
       {optionsHidden ? toggle : null}
       <button type="button" onClick={() => { setSummaryOpen(true); onPreview(); }} disabled={run.isBusy || !canRun} className={`h-9 min-w-0 whitespace-nowrap rounded-md border border-border bg-button text-xs font-semibold disabled:text-disabled ${optionsHidden ? "px-4" : "flex-1 px-1.5"}`}>Preview Summary</button>
       {run.isApplying
-        ? <button type="button" onClick={run.cancel} disabled={run.isCanceling} className={`h-9 min-w-0 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning ${optionsHidden ? "" : "flex-1"}`}>Cancel</button>
-        : <button type="button" onClick={onApply} disabled={run.isBusy || !canRun} className={`h-9 min-w-0 whitespace-nowrap rounded-md bg-accent text-xs font-semibold disabled:bg-button disabled:text-disabled ${optionsHidden ? "px-4" : "flex-1 px-1.5"}`}>Apply Changes</button>}
+        ? <button type="button" data-dialog-return onClick={run.cancel} disabled={run.isCanceling} className={`h-9 min-w-0 whitespace-nowrap rounded-md border border-warning bg-button px-3 text-sm text-warning ${optionsHidden ? "" : "flex-1"}`}>Cancel</button>
+        : <button type="button" data-dialog-return onClick={onApply} disabled={run.isBusy || !canRun} className={`h-9 min-w-0 whitespace-nowrap rounded-md bg-accent text-xs font-semibold disabled:bg-button disabled:text-disabled ${optionsHidden ? "px-4" : "flex-1 px-1.5"}`}>Apply Changes</button>}
       <span className={`text-xs text-muted ${optionsHidden ? "" : "w-full"}`}>{selectedText}{hiddenSelected > 0 ? ` (${hiddenSelected} hidden)` : ""}</span>
       {notice}
       <span role="status" className={`min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere] ${optionsHidden ? "flex-1" : "w-full"}`}>{run.status}</span>
