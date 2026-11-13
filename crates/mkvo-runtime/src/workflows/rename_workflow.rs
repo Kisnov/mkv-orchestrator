@@ -878,7 +878,7 @@ mod tests {
         }
 
         async fn working_set(&self) -> Vec<PathBuf> {
-            let files = self.runtime.current_domain_files().await;
+            let files = self.runtime.working_set_files().await;
             for file in &files {
                 assert_eq!(file.fingerprint.path, file.path);
             }
@@ -887,7 +887,7 @@ mod tests {
 
         /// Plan the rename of each scanned file to the name given for it.
         async fn plan(&self, new_names: &[(&str, &str)]) -> RenameApplyRequest {
-            let mut files = self.runtime.current_domain_files().await;
+            let mut files = self.runtime.working_set_files().await;
             files.retain_mut(|file| {
                 let new_name = new_names
                     .iter()
@@ -1000,7 +1000,7 @@ mod tests {
         let renamed = ["Pilot.mkv", "Second.mkv", "c.mkv"].map(|name| library.root.join(name));
         assert_eq!(library.working_set().await, renamed);
         let cache = &library.runtime.dependencies().cache;
-        for file in library.runtime.current_domain_files().await {
+        for file in library.runtime.working_set_files().await {
             assert!(cache.get_valid(&file.fingerprint).await.unwrap().is_some());
         }
         assert_eq!(cache.count().await.unwrap(), 3);
@@ -1068,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn a_folder_that_cannot_be_listed_is_reported_to_the_planner() {
         let library = Library::with(&["a.mkv"]).await;
-        let mut files = library.runtime.current_domain_files().await;
+        let mut files = library.runtime.working_set_files().await;
         files[0].path = library.root.join("gone").join("b.mkv");
 
         let (existing, unlisted) = library.runtime.existing_paths_around(&files).await;

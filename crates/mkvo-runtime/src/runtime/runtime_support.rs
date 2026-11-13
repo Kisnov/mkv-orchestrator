@@ -105,6 +105,11 @@ impl MkvoRuntime {
         state.files.iter().find(|file| is_it(file)).cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn working_set_files(&self) -> Vec<MediaFile> {
+        self.inner.current_scan.read().await.files.clone()
+    }
+
     pub(crate) async fn working_set_paths(&self) -> BTreeSet<PathBuf> {
         let state = self.inner.current_scan.read().await;
         state.files.iter().map(|file| file.path.clone()).collect()
