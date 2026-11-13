@@ -25,6 +25,7 @@ pub struct ServerConfig {
     pub auth_enabled: bool,
     pub auth_username: String,
     pub secure_cookies: bool,
+    pub tool_directories: Vec<PathBuf>,
     pub provider_secret_overrides: BTreeMap<String, String>,
     pub request_body_limit_bytes: usize,
     pub graceful_shutdown_seconds: u64,
@@ -114,6 +115,10 @@ impl ServerConfig {
                 config_dir.display()
             );
         }
+        let tool_directories = list(get("MKVO_TOOL_DIRECTORIES"))
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         let provider_secret_overrides = [
             ("MKVO_TVDB_API_KEY", "provider.tvdb.api_key"),
             ("MKVO_TVDB_PIN", "provider.tvdb.pin"),
@@ -137,6 +142,7 @@ impl ServerConfig {
             auth_enabled,
             auth_username,
             secure_cookies,
+            tool_directories,
             provider_secret_overrides,
             request_body_limit_bytes,
             graceful_shutdown_seconds,
@@ -155,6 +161,16 @@ fn parse_bool(name: &str, value: Option<String>) -> Result<Option<bool>> {
         Some("false") => Ok(Some(false)),
         _ => bail!("{name} must be true or false"),
     }
+}
+
+fn list(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split([';', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_positive<T>(name: &str, value: Option<String>, default: T) -> Result<T>
@@ -336,10 +352,27 @@ mod tests {
             ("MKVO_BIND", "0.0.0.0:8080"),
             ("MKVO_AUTH_MODE", ""),
             ("MKVO_AUTH_ENABLED", ""),
+            ("MKVO_TOOL_DIRECTORIES", ""),
         ]);
         let config =
             ServerConfig::from_lookup(|key| values.get(key).map(ToString::to_string)).unwrap();
         assert!(config.auth_enabled);
+        assert!(config.tool_directories.is_empty());
+    }
+
+    #[test]
+    fn parses_tool_directories() {
+        let config = ServerConfig::from_lookup(|key| {
+            (key == "MKVO_TOOL_DIRECTORIES").then(|| "/opt/mkvtoolnix; /opt/ffmpeg/bin".to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            config.tool_directories,
+            [
+                PathBuf::from("/opt/mkvtoolnix"),
+                PathBuf::from("/opt/ffmpeg/bin")
+            ]
+        );
     }
 
     #[test]

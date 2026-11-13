@@ -39,6 +39,9 @@ pub fn build_runtime(config: &ServerConfig) -> RuntimeResult<MkvoRuntime> {
         }
         builder = builder.authorized_root(&source.path, true);
     }
+    for directory in &config.tool_directories {
+        builder = builder.tool_directory(directory);
+    }
     builder.build()
 }
 
@@ -165,6 +168,7 @@ mod tests {
                     .map_or("admin", |auth| auth.username.as_str())
                     .to_owned(),
                 secure_cookies: false,
+                tool_directories: Vec::new(),
                 auth,
                 provider_secret_overrides,
                 request_body_limit_bytes: 1024,
