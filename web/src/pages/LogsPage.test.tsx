@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { LogsPage } from "./LogsPage";
@@ -68,6 +68,101 @@ describe("Logs page", () => {
     });
 
     // The page must not claim there are simply no logs when the query failed.
-    await waitFor(() => expect(screen.queryAllByText("Scan completed")).toHaveLength(0));
+    expect(await screen.findByRole("alert")).toHaveTextContent("log store unavailable");
+    expect(screen.queryByText("No operation logs yet.")).not.toBeInTheDocument();
+  });
+
+  it("shows a loading state until the first response arrives", async () => {
+    let resolve: (value: { entries: OperationLogEntry[] }) => void = () => undefined;
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => new Promise((done) => { resolve = done; })
+    });
+
+    expect(await screen.findByText("Loading logs...")).toBeInTheDocument();
+    expect(screen.queryByText("No operation logs yet.")).not.toBeInTheDocument();
+    resolve({ entries: [] });
+    expect(await screen.findByText("No operation logs yet.")).toBeInTheDocument();
+  });
+
+  it("asks for confirmation before clearing the logs", async () => {
+    const user = userEvent.setup();
+    const clearOperationLogs = vi.fn().mockResolvedValue({ entries: [] });
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] }),
+      clearOperationLogs
+    });
+    await screen.findAllByText("Scan completed");
+
+    await user.click(screen.getByTitle("Clear"));
+    const dialog = screen.getByRole("dialog", { name: "Clear Logs" });
+    expect(clearOperationLogs).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(clearOperationLogs).not.toHaveBeenCalled();
+
+    await user.click(screen.getByTitle("Clear"));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear Logs" }));
+    await waitFor(() => expect(clearOperationLogs).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(await screen.findByText(/logs cleared/i)).toBeInTheDocument();
+  });
+
+  it("reports a failed export", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] }),
+      exportOperationLogs: () => Promise.reject(new Error("export failed on the server"))
+    });
+
+    await user.click(await screen.findByTitle(/export all logs/i));
+    expect(await screen.findByRole("alert")).toHaveTextContent("export failed on the server");
+  });
+
+  it("reports a failed clear", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] }),
+      clearOperationLogs: () => Promise.reject(new Error("log store is read-only"))
+    });
+    await screen.findAllByText("Scan completed");
+
+    await user.click(screen.getByTitle("Clear"));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear Logs" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("log store is read-only");
+  });
+
+  it("keeps a later failure visible while the list still cannot be loaded", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.reject(new Error("log store unavailable")),
+      clearOperationLogs: () => Promise.reject(new Error("log store is read-only"))
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("log store unavailable");
+
+    await user.click(screen.getByTitle("Clear"));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Clear Logs" }));
+    expect(await screen.findByText("log store is read-only")).toBeInTheDocument();
+    expect(screen.getByText("log store unavailable")).toBeInTheDocument();
+  });
+
+  it("describes a failure that is not an Error", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] }),
+      exportOperationLogs: () => Promise.reject("boom")
+    });
+
+    await user.click(await screen.findByTitle(/export all logs/i));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Logs could not be exported.");
+  });
+
+  it("names the icon-only buttons for assistive technology", async () => {
+    renderWithBackend(<LogsPage />, {
+      getOperationLogs: () => Promise.resolve({ entries: [entry] })
+    });
+
+    expect(await screen.findByTitle("Refresh")).toHaveAttribute("aria-label", "Refresh logs");
+    expect(screen.getByTitle("Export all logs")).toHaveAttribute("aria-label", "Export all logs");
+    expect(screen.getByTitle("Clear")).toHaveAttribute("aria-label", "Clear logs");
   });
 });

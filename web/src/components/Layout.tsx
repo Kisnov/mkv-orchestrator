@@ -1,5 +1,5 @@
 import { useOverlayAccessibility } from "./useOverlayAccessibility";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Activity, Captions, Database, FileCog, FolderOpen, ListRestart, ListVideo, Logs, RefreshCw, Settings, TextCursorInput, Trash2 } from "lucide-react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -23,6 +23,19 @@ const navItems = [
   { to: "/settings", label: "Settings", icon: Settings }
 ];
 
+// The mobile breakpoint of index.css, the only layout that uses the table labels.
+const mobileLayoutQuery = "(max-width: 767px), (max-width: 1023px) and (pointer: coarse)";
+
+// The mobile layout turns tables into blocks, which drops their semantics and their header row.
+function labelTable(table: HTMLTableElement) {
+  const headers = [...(table.tHead?.rows[0]?.cells ?? [])].map((cell) => cell.textContent?.trim() ?? "");
+  table.classList.add("mobile-data-table");
+  table.setAttribute("role", "table");
+  for (const body of table.tBodies) for (const row of body.rows) {
+    [...row.cells].forEach((cell, index) => { if (cell.colSpan === 1) cell.dataset.label = headers[index] ?? ""; });
+  }
+}
+
 export function Layout() {
   useOverlayAccessibility();
   const [sidebarTooltip, setSidebarTooltip] = useState<{ label: string; top: number } | null>(null);
@@ -30,21 +43,33 @@ export function Layout() {
   const location = useLocation();
   useEffect(() => { setMobileMenuOpen(false); }, [location.pathname]);
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("mkvo.sidebar.collapsed") === null ? window.innerWidth < 1100 : localStorage.getItem("mkvo.sidebar.collapsed") === "true");
+  const pageContentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const labelTables = () => {
-      document.querySelectorAll<HTMLTableElement>(".page-content table, [role=dialog] table").forEach((table) => {
-        const headers = [...(table.tHead?.rows[0]?.cells ?? [])].map((cell) => cell.textContent?.trim() ?? "");
-        table.classList.add("mobile-data-table");
-        table.setAttribute("role", "table");
-        for (const body of table.tBodies) for (const row of body.rows) {
-          [...row.cells].forEach((cell, index) => { if (cell.colSpan === 1) cell.dataset.label = headers[index] ?? ""; });
+    const content = pageContentRef.current;
+    if (!content || !window.matchMedia) return;
+    const media = window.matchMedia(mobileLayoutQuery);
+    // Relabels only the tables a mutation touched.
+    const observer = new MutationObserver((records) => {
+      const tables = new Set<HTMLTableElement>();
+      for (const record of records) {
+        const table = (record.target as Element).closest("table");
+        if (table) tables.add(table);
+        else for (const node of record.addedNodes) {
+          if (node instanceof HTMLTableElement) tables.add(node);
+          else if (node instanceof Element) node.querySelectorAll("table").forEach((added) => tables.add(added));
         }
-      });
+      }
+      tables.forEach(labelTable);
+    });
+    const sync = () => {
+      observer.disconnect();
+      if (!media.matches) return;
+      content.querySelectorAll("table").forEach(labelTable);
+      observer.observe(content, { childList: true, subtree: true });
     };
-    labelTables();
-    const observer = new MutationObserver(labelTables);
-    observer.observe(document.body, { childList: true, subtree: true });
-    return () => observer.disconnect();
+    sync();
+    media.addEventListener("change", sync);
+    return () => { observer.disconnect(); media.removeEventListener("change", sync); };
   }, []);
   const isSettingsPage = useLocation().pathname === "/settings";
   const status = useQuery({ queryKey: ["status"], queryFn: getStatus });
@@ -60,14 +85,7 @@ export function Layout() {
   return (
     <div className="app-shell h-screen overflow-hidden bg-window text-text">
       <div className={`app-shell-grid grid h-screen ${collapsed ? "grid-cols-[4.5rem_minmax(0,1fr)]" : "grid-cols-[14.75rem_minmax(0,1fr)]"}`}>
-        <aside
-          className="desktop-navigation relative flex h-screen min-h-0 flex-col border-r border-border bg-sidebar px-3 py-5"
-          onClickCapture={(event) => {
-            if ((event.target as HTMLElement).closest(".sidebar-collapse-button")) return;
-            const edge = event.currentTarget.getBoundingClientRect().right;
-            if (event.clientX >= edge - 12) toggleSidebar();
-          }}
-        >
+        <aside className="desktop-navigation relative flex h-screen min-h-0 flex-col border-r border-border bg-sidebar px-3 py-5">
           <button type="button" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} data-tooltip={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} onClick={toggleSidebar} className="sidebar-collapse-button">
             <span>{collapsed ? <ChevronRight size={12} /> : <ChevronLeft size={12} />}</span>
           </button>
@@ -163,7 +181,7 @@ export function Layout() {
               Selection sync failed: {selectionError}
             </div>
           ) : null}
-          <div className="page-content min-h-0 min-w-0 flex-1 overflow-auto">
+          <div ref={pageContentRef} className="page-content min-h-0 min-w-0 flex-1 overflow-auto">
             <Outlet />
           </div>
         </main>

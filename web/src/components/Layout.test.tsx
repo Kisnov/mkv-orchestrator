@@ -84,8 +84,17 @@ it("mounts the sidebar toggle on the sidebar edge and updates its direction", as
   const expand = screen.getByRole("button", { name: "Expand sidebar" });
   expect(expand).toHaveAttribute("data-tooltip", "Expand sidebar");
   expect(window.localStorage.getItem("mkvo.sidebar.collapsed")).toBe("true");
+});
+
+it("does not toggle the sidebar when its edge is clicked outside the toggle", () => {
+  window.localStorage.setItem("mkvo.sidebar.collapsed", "false");
+  renderWithBackend(<MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Dashboard content</div>} /></Route></Routes></MediaLibraryProvider>, {
+    getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 })
+  });
+
   const sidebar = screen.getByRole("complementary");
-  vi.spyOn(sidebar, "getBoundingClientRect").mockReturnValue({ x: 0, y: 0, width: 72, height: 900, top: 0, right: 72, bottom: 900, left: 0, toJSON: () => ({}) });
-  fireEvent.click(sidebar, { clientX: 70 });
+  vi.spyOn(sidebar, "getBoundingClientRect").mockReturnValue({ x: 0, y: 0, width: 236, height: 900, top: 0, right: 236, bottom: 900, left: 0, toJSON: () => ({}) });
+  fireEvent.click(sidebar, { clientX: 234 });
   expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+  expect(window.localStorage.getItem("mkvo.sidebar.collapsed")).toBe("false");
 });
