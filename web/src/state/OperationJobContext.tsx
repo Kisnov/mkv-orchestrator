@@ -6,8 +6,8 @@ import { ApiError } from "../backend/error";
 const storageKey = "mkvo.web.activeOperationJob";
 const terminalStatuses = new Set(["Completed", "Failed", "Skipped", "Canceled"]);
 
-// A restarted server has forgotten the job this tab remembers.
-const isUnknownJob = (error: unknown) => error instanceof ApiError && (error.status === 404 || error.code === "not_found");
+// A restarted server has forgotten the job this tab remembers; a proxy's bare 404 does not say so.
+const isUnknownJob = (error: unknown) => error instanceof ApiError && error.code === "not_found";
 
 type ActiveOperation = { id: string; label: string };
 

@@ -1,5 +1,5 @@
 import userEvent from "@testing-library/user-event";
-import { act, fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Layout } from "./Layout";
@@ -142,4 +142,24 @@ it("lets go of a remembered job the server no longer knows", async () => {
   expect(screen.queryByText(/checking job/)).not.toBeInTheDocument();
   expect(window.sessionStorage.getItem("mkvo.web.activeOperationJob")).toBeNull();
   expect(getOperationJob).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  ["a proxy's bare 404", new ApiError("404 Not Found", { code: "HTTP_404", status: 404 })],
+  ["a server error", new ApiError("Internal error", { code: "internal", status: 500 })]
+])("keeps a remembered job through %s", async (_, error) => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "live-job", label: "Reorder Tracks" }));
+  const getOperationJob = vi.fn(() => Promise.reject(error));
+  renderWithBackend(<MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Dashboard content</div>} /></Route></Routes></MediaLibraryProvider>, {
+    getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 }),
+    getOperationJob
+  });
+
+  await waitFor(() => expect(getOperationJob).toHaveBeenCalledTimes(1));
+  await act(() => vi.advanceTimersByTimeAsync(1100));
+  expect(getOperationJob).toHaveBeenCalledTimes(2);
+  expect(screen.getAllByText(/Reorder Tracks: checking job/).length).toBeGreaterThan(0);
+  expect(window.sessionStorage.getItem("mkvo.web.activeOperationJob")).not.toBeNull();
+  vi.useRealTimers();
 });
