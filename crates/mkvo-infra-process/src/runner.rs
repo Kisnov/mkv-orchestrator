@@ -15,6 +15,7 @@ use tokio::{
     process::Command,
     sync::mpsc,
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -312,13 +313,22 @@ where
     let interval = timeout / 6;
     // Per output: its last known size and the probe still running for it, if any.
     let mut watched = outputs.iter().map(|_| (0, None)).collect::<Vec<_>>();
-    let mut quiet_since = tokio::time::Instant::now();
-    let mut seen = progress(printed, outputs, &mut watched, interval, &probe).await;
-    while quiet_since.elapsed() < timeout {
-        tokio::time::sleep(interval).await;
-        let now = progress(printed, outputs, &mut watched, interval, &probe).await;
+    let mut deadline = Instant::now() + timeout;
+    let mut seen = progress(
+        printed,
+        outputs,
+        &mut watched,
+        Instant::now() + interval,
+        &probe,
+    )
+    .await;
+    while Instant::now() < deadline {
+        tokio::time::sleep_until(deadline.min(Instant::now() + interval)).await;
+        // A sample that hangs must not carry the wait past the deadline.
+        let until = deadline.min(Instant::now() + interval);
+        let now = progress(printed, outputs, &mut watched, until, &probe).await;
         if now != seen {
-            quiet_since = tokio::time::Instant::now();
+            deadline = Instant::now() + timeout;
             seen = now;
         }
     }
@@ -330,7 +340,7 @@ async fn progress<F>(
     printed: &AtomicU64,
     outputs: &[PathBuf],
     watched: &mut [Watched],
-    patience: Duration,
+    until: Instant,
     probe: &F,
 ) -> (u64, u64)
 where
@@ -343,7 +353,7 @@ where
             let (probe, output) = (probe.clone(), output.clone());
             tokio::task::spawn_blocking(move || probe(output))
         });
-        if let Ok(probed) = tokio::time::timeout(patience, running).await {
+        if let Ok(probed) = tokio::time::timeout_at(until, running).await {
             *pending = None;
             *size = probed.ok().and_then(Result::ok).unwrap_or(0);
         }
@@ -544,6 +554,29 @@ mod tests {
 
         release.store(true, Ordering::Relaxed);
         assert_eq!(started.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hung_output_does_not_extend_the_inactivity_timeout() {
+        let (probe, _, release) = stalled_probe();
+        let timeout = Duration::from_millis(1200);
+        let started = std::time::Instant::now();
+
+        quiet_for(
+            timeout,
+            &AtomicU64::new(0),
+            &[PathBuf::from("hung.tmp")],
+            probe,
+        )
+        .await;
+
+        release.store(true, Ordering::Relaxed);
+        // Without the bound the last sample waits a full interval past the deadline.
+        assert!(
+            started.elapsed() < timeout + timeout / 12,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
