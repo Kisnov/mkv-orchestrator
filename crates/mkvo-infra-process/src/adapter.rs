@@ -197,6 +197,21 @@ fn tool_kind(value: &str) -> Option<ToolKind> {
 // A remux can run for hours, so only a long silence counts as a dead share or a hung tool.
 const TOOL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+fn tool_spec(invocation: &ToolInvocation) -> ProcessSpec {
+    let mut spec = ProcessSpec::new(&invocation.executable).args(&invocation.arguments);
+    // Without outputs the tool edits a file in place: killing it mid-write is worse than waiting.
+    if !invocation.expected_outputs.is_empty() {
+        spec = spec.inactivity_timeout(
+            TOOL_INACTIVITY_TIMEOUT,
+            invocation.expected_outputs.iter().cloned(),
+        );
+    }
+    if let Some(directory) = &invocation.working_directory {
+        spec = spec.current_dir(directory);
+    }
+    spec
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProcessToolExecutor {
     runner: ProcessRunner,
@@ -220,18 +235,9 @@ impl ToolExecutor for ProcessToolExecutor {
                 "tool executable is blank".to_owned(),
             ));
         }
-        let mut spec = ProcessSpec::new(&invocation.executable)
-            .args(&invocation.arguments)
-            .inactivity_timeout(
-                TOOL_INACTIVITY_TIMEOUT,
-                invocation.expected_outputs.iter().cloned(),
-            );
-        if let Some(directory) = &invocation.working_directory {
-            spec = spec.current_dir(directory);
-        }
         let output = self
             .runner
-            .run(spec, cancel)
+            .run(tool_spec(invocation), cancel)
             .await
             .map_err(|error| match error {
                 crate::ProcessError::Cancelled => PortError::Canceled,
@@ -269,6 +275,24 @@ impl ToolExecutor for ProcessToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_that_edits_in_place_is_never_stopped_for_inactivity() {
+        let mut invocation = ToolInvocation {
+            tool: "mkvpropedit".to_owned(),
+            executable: "mkvpropedit".into(),
+            arguments: Vec::new(),
+            working_directory: None,
+            expected_outputs: Vec::new(),
+        };
+        assert_eq!(tool_spec(&invocation).inactivity_timeout, None);
+
+        invocation.expected_outputs.push("output.tmp".into());
+        assert_eq!(
+            tool_spec(&invocation).inactivity_timeout,
+            Some(TOOL_INACTIVITY_TIMEOUT)
+        );
+    }
 
     #[test]
     fn logical_tool_names_are_case_insensitive() {
