@@ -9,35 +9,40 @@ const CREDENTIAL_REJECTION_MEMORY: Duration = Duration::from_secs(5 * 60);
 
 /// A credential a media server refused, kept so it is not retried per poster.
 pub(super) struct CredentialRejection {
-    connection: MediaServerConnection,
+    fingerprint: String,
     message: String,
     at: Instant,
 }
 
 impl CredentialRejection {
     /// A new key or URL is a different connection, so saving one needs no reset.
-    fn covers(&self, connection: &MediaServerConnection) -> bool {
-        self.connection == *connection && self.at.elapsed() < CREDENTIAL_REJECTION_MEMORY
+    fn covers(&self, fingerprint: &str) -> bool {
+        self.fingerprint == fingerprint && self.at.elapsed() < CREDENTIAL_REJECTION_MEMORY
     }
+}
+
+/// Hash of kind, URL and key: what the memory keeps in place of the key.
+fn connection_fingerprint(connection: &MediaServerConnection) -> RuntimeResult<String> {
+    stable_fingerprint(connection).map_err(|error| RuntimeError::internal(error.to_string()))
 }
 
 /// Records a refusal. False when this credential's refusal was already known.
 fn remember_rejection(
     rejections: &mut HashMap<MediaServerId, CredentialRejection>,
     id: MediaServerId,
-    connection: &MediaServerConnection,
+    fingerprint: &str,
     message: &str,
 ) -> bool {
     if rejections
         .get(&id)
-        .is_some_and(|rejection| rejection.covers(connection))
+        .is_some_and(|rejection| rejection.covers(fingerprint))
     {
         return false;
     }
     rejections.insert(
         id,
         CredentialRejection {
-            connection: connection.clone(),
+            fingerprint: fingerprint.to_owned(),
             message: message.to_owned(),
             at: Instant::now(),
         },
@@ -252,6 +257,7 @@ impl MkvoRuntime {
         server: &MediaServerSettings,
         connection: &MediaServerConnection,
     ) -> RuntimeResult<()> {
+        let fingerprint = connection_fingerprint(connection)?;
         match self
             .inner
             .media_server_rejections
@@ -259,7 +265,7 @@ impl MkvoRuntime {
             .await
             .get(&server.id)
         {
-            Some(rejection) if rejection.covers(connection) => Err(RuntimeError::new(
+            Some(rejection) if rejection.covers(&fingerprint) => Err(RuntimeError::new(
                 ApiErrorCode::CredentialRejected,
                 rejection.message.clone(),
             )),
@@ -295,7 +301,7 @@ impl MkvoRuntime {
                 if remember_rejection(
                     &mut *self.inner.media_server_rejections.write().await,
                     server.id,
-                    connection,
+                    &connection_fingerprint(connection)?,
                     &message,
                 ) {
                     tracing::warn!(
@@ -930,24 +936,28 @@ mod media_server_credential_tests {
             base_url: "http://media.local".to_owned(),
             credential: credential.to_owned(),
         };
+        let fingerprint =
+            |credential: &str| connection_fingerprint(&connection(credential)).expect("hash");
         let mut rejections = HashMap::new();
 
         assert!(remember_rejection(
             &mut rejections,
             id,
-            &connection("wrong"),
+            &fingerprint("wrong"),
             "refused"
         ));
         assert!(!remember_rejection(
             &mut rejections,
             id,
-            &connection("wrong"),
+            &fingerprint("wrong"),
             "refused"
         ));
+        // The memory outlives the request, so it must not hold the key itself.
+        assert!(!rejections[&id].fingerprint.contains("wrong"));
         assert!(remember_rejection(
             &mut rejections,
             id,
-            &connection("other"),
+            &fingerprint("other"),
             "refused"
         ));
     }
