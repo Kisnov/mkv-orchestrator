@@ -24,7 +24,7 @@ pub use legacy::{
     read_legacy_rename_history,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -198,6 +198,12 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
     if current < 2 {
         let transaction = connection.transaction()?;
         migration_v2(&transaction)?;
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+    }
+    if current < 3 {
+        let transaction = connection.transaction()?;
+        migration_v3(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     }
@@ -315,6 +321,15 @@ fn migration_v2(transaction: &Transaction<'_>) -> StoreResult<()> {
          CREATE INDEX IF NOT EXISTS idx_operation_logs_time ON operation_logs(timestamp_ms DESC);
 
          ALTER TABLE rename_batches ADD COLUMN payload_json TEXT
+            CHECK(payload_json IS NULL OR json_valid(payload_json));",
+    )?;
+    Ok(())
+}
+
+/// A payload per rename entry, so a move adds a row instead of rewriting its batch.
+fn migration_v3(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        "ALTER TABLE rename_entries ADD COLUMN payload_json TEXT
             CHECK(payload_json IS NULL OR json_valid(payload_json));",
     )?;
     Ok(())

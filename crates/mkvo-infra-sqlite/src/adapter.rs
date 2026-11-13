@@ -15,9 +15,7 @@ use mkvo_domain::{
 };
 use rusqlite::{OptionalExtension, params};
 
-use crate::{
-    CacheFingerprint, RenameBatch, RenameBatchEntry, SqliteStore, StoreError, StoredJob, StoredPlan,
-};
+use crate::{CacheFingerprint, SqliteStore, StoreError, StoredJob, StoredPlan};
 
 const SETTINGS_KEY: &str = "app";
 /// Rows deleted per transaction while pruning.
@@ -384,59 +382,28 @@ fn decode_job(job: Option<StoredJob>) -> Result<Option<JobSnapshot>, StoreError>
 impl RenameHistoryRepository for SqliteRepositories {
     async fn add(&self, record: &RenameBatchRecord) -> Result<(), PortError> {
         let record = record.clone();
-        self.blocking(move |store| {
-            let local = RenameBatch {
-                id: record.id.to_string(),
-                created_at_ms: record.created_at.timestamp_millis(),
-                undone_at_ms: record.undone_at.map(|value| value.timestamp_millis()),
-                provider: record
-                    .provider
-                    .map(|provider| serde_json::to_string(&provider))
-                    .transpose()?
-                    .unwrap_or_default(),
-                template: record.template.clone(),
-                entries: record
-                    .entries
-                    .iter()
-                    .map(|entry| RenameBatchEntry {
-                        original_path: entry.original_path.clone(),
-                        renamed_path: entry.renamed_path.clone(),
-                    })
-                    .collect(),
-            };
-            store.record_rename_batch(&local)?;
-            let payload = serde_json::to_string(&record)?;
-            let connection = store.connection()?;
-            connection.execute(
-                "UPDATE rename_batches SET payload_json = ?2 WHERE id = ?1",
-                params![record.id.to_string(), payload],
-            )?;
-            Ok(())
-        })
-        .await
+        self.blocking(move |store| store.save_rename_record(&record))
+            .await
+    }
+
+    async fn append(
+        &self,
+        id: RenameBatchId,
+        entry: &mkvo_domain::RenameBatchEntry,
+    ) -> Result<(), PortError> {
+        let entry = entry.clone();
+        self.blocking(move |store| store.append_rename_record_entry(&id.to_string(), &entry))
+            .await
     }
 
     async fn get(&self, id: RenameBatchId) -> Result<Option<RenameBatchRecord>, PortError> {
-        self.blocking(move |store| load_rename_payload(&store, &id.to_string()))
+        self.blocking(move |store| store.rename_record(&id.to_string()))
             .await
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<RenameBatchRecord>, PortError> {
-        self.blocking(move |store| {
-            let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
-            let connection = store.connection()?;
-            let mut statement = connection.prepare(
-                "SELECT payload_json FROM rename_batches WHERE payload_json IS NOT NULL
-                 ORDER BY created_at_ms DESC LIMIT ?1",
-            )?;
-            let rows = statement.query_map([limit], |row| row.get::<_, String>(0))?;
-            rows.map(|row| {
-                let payload = row?;
-                serde_json::from_str(&payload).map_err(StoreError::from)
-            })
-            .collect()
-        })
-        .await
+        self.blocking(move |store| store.recent_rename_records(limit))
+            .await
     }
 
     async fn mark_undone(&self, id: RenameBatchId, at: DateTime<Utc>) -> Result<(), PortError> {
@@ -455,24 +422,6 @@ impl RenameHistoryRepository for SqliteRepositories {
     async fn clear(&self) -> Result<u64, PortError> {
         self.blocking(|store| store.clear_rename_batches()).await
     }
-}
-
-fn load_rename_payload(
-    store: &SqliteStore,
-    id: &str,
-) -> Result<Option<RenameBatchRecord>, StoreError> {
-    let connection = store.connection()?;
-    let payload = connection
-        .query_row(
-            "SELECT payload_json FROM rename_batches WHERE id = ?1",
-            [id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    payload
-        .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
-        .transpose()
 }
 
 #[async_trait]
