@@ -176,6 +176,8 @@ export interface LibraryClient {
   buildLibraryAudit(files: MediaFileRow[]): Promise<LibraryAuditResponse>;
   getLibraryCatalog(request: LibraryCatalogRequest): Promise<LibraryCatalogResponse>;
   getLibraryArtwork(request: LibraryArtworkRequest): Promise<LibraryArtworkResponse>;
+  /** An image URL for the poster, or undefined when the transport cannot serve one. */
+  libraryArtworkUrl(request: LibraryArtworkRequest, version: number): string | undefined;
   getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse>;
 }
 

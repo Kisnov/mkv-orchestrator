@@ -7,7 +7,7 @@ import { ApiError } from "./error";
  * with a descriptive error instead of reaching the network.
  */
 export function createMockBackendClient(overrides: Partial<BackendClient> = {}): BackendClient {
-  const target = { transport: "mock", ...overrides } as Partial<BackendClient>;
+  const target = { transport: "mock", libraryArtworkUrl: () => undefined, ...overrides } as Partial<BackendClient>;
 
   return new Proxy(target as BackendClient, {
     get(client, property, receiver) {

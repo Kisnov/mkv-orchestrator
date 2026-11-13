@@ -339,6 +339,10 @@ export function getLibraryArtwork(request: LibraryArtworkRequest): Promise<Libra
   return getBackendClient().getLibraryArtwork(request);
 }
 
+export function libraryArtworkUrl(request: LibraryArtworkRequest, version: number): string | undefined {
+  return getBackendClient().libraryArtworkUrl(request, version);
+}
+
 export function getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse> {
   return getBackendClient().getLibraryLocalArtwork(request);
 }

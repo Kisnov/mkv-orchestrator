@@ -7,7 +7,9 @@ import { buildLibraryTitles, LibraryPage, resetLibraryViewCacheForTests } from "
 import { DashboardPage } from "./DashboardPage";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
+import { ApiError } from "../api";
 import type { LibraryAuditRow, MediaFileRow, ScanJobResponse, WebSettings } from "../api";
+import type { BackendClient } from "../backend/client";
 
 function auditRow(season: number, hasIssues: boolean): LibraryAuditRow {
   const root = `/media/tv/Example Show/Season ${season}`;
@@ -373,6 +375,79 @@ describe("Library poster workflow", () => {
     });
     await waitFor(() => expect(buildLibraryAudit).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/example show rebuilt: 4 files/i)).toBeInTheDocument();
+  });
+
+  function posterBackend(overrides: Partial<BackendClient> = {}): Partial<BackendClient> {
+    const rows = [auditRow(1, false)];
+    const files = rows.flatMap((row) => row.allFilePaths.map(media));
+    const job = {
+      id: "poster-scan",
+      status: "Completed",
+      completed: files.length,
+      total: files.length,
+      files,
+      summary: { total: files.length, mkv: files.length, mp4: 0, failed: 0, cached: 0 },
+      skipped: [],
+      error: ""
+    } as ScanJobResponse;
+    return {
+      getWebSettings: () => Promise.resolve(settings()),
+      getLibraryCatalog: () => Promise.resolve({ items: [{ id: "series-1", title: "Example Show", year: 2024, mediaType: "series", hasPoster: true }] }),
+      libraryArtworkUrl: ({ serverId, itemId }, version) => `/api/library/artwork/${serverId}/${itemId}?v=${version}`,
+      startScan: () => Promise.resolve({ ...job, status: "Queued", files: [] }),
+      getScanJob: () => Promise.resolve(job),
+      buildLibraryAudit: () => Promise.resolve({ summary: { groups: 1, files: files.length, issueGroups: 0, standardGroups: 1 }, items: rows }),
+      ...overrides
+    };
+  }
+
+  it("loads a media-server poster as an image URL instead of inline data", async () => {
+    const getLibraryArtwork = vi.fn();
+    const getLibraryLocalArtwork = vi.fn();
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({ getLibraryArtwork, getLibraryLocalArtwork })
+    );
+
+    const poster = await screen.findByRole("img", { name: "Example Show poster" });
+    expect(poster).toHaveAttribute("src", "/api/library/artwork/server-1/series-1?v=1");
+    expect(poster).toHaveAttribute("loading", "lazy");
+    expect(getLibraryArtwork).not.toHaveBeenCalled();
+    expect(getLibraryLocalArtwork).not.toHaveBeenCalled();
+  });
+
+  it("asks once why a poster failed and points a rejected key at Settings", async () => {
+    const rejected = new ApiError("Jellyfin rejected the stored API key (HTTP 401). Enter the key again in Settings.", { code: "credential_rejected", status: 424 });
+    const getLibraryArtwork = vi.fn().mockRejectedValue(rejected);
+    const getLibraryLocalArtwork = vi.fn().mockRejectedValue(new Error("No local poster"));
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({ getLibraryArtwork, getLibraryLocalArtwork })
+    );
+
+    fireEvent.error(await screen.findByRole("img", { name: "Example Show poster" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
+    expect(screen.getByRole("link", { name: /open settings/i })).toHaveAttribute("href", "/settings");
+    await waitFor(() => expect(getLibraryLocalArtwork).toHaveBeenCalledTimes(1));
+    expect(getLibraryArtwork).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("img", { name: "Example Show poster" })).not.toBeInTheDocument();
+  });
+
+  it("requests no media-server posters while the catalog says the key is rejected", async () => {
+    const libraryArtworkUrl = vi.fn(() => "/poster");
+    renderWithBackend(
+      <MediaLibraryProvider><LibraryPage /></MediaLibraryProvider>,
+      posterBackend({
+        libraryArtworkUrl,
+        getLibraryCatalog: () => Promise.reject(new ApiError("Jellyfin rejected the stored API key.", { code: "credential_rejected", status: 424 })),
+        getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster"))
+      })
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rejected the stored API key/i);
+    expect(await screen.findByText(/no poster found/i)).toBeInTheDocument();
+    expect(libraryArtworkUrl).not.toHaveBeenCalled();
   });
 
   it("does not save an empty library when the scan's files are no longer held", async () => {

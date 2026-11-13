@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { AlertTriangle, CheckCircle2, Film, RefreshCw, Search, X } from "lucide-react";
 import {
+  ApiError,
   buildLibraryAudit,
   cancelScan,
   getLibraryArtwork,
@@ -10,6 +11,7 @@ import {
   getLibraryLocalArtwork,
   getScanJob,
   getWebSettings,
+  libraryArtworkUrl,
   LibraryAuditResponse,
   LibraryAuditRow,
   LibraryCatalogItem,
@@ -68,6 +70,8 @@ export function LibraryPage() {
   const [artworkGeneration, setArtworkGeneration] = useState(0);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; titleId: string } | null>(null);
   const [pendingTitleRebuild, setPendingTitleRebuild] = useState<PendingTitleRebuild | null>(null);
+  const [rejectedPosterServers, setRejectedPosterServers] = useState<Record<string, string>>({});
+  const probedPosterServers = useRef(new Set<string>());
   const selectedSourceRef = useRef(selectedSource);
   const buildSourcesRef = useRef<LibrarySourceOption[]>([]);
   const automaticBuildKey = useRef("");
@@ -303,6 +307,24 @@ export function LibraryPage() {
     });
   }, [filter, searchText, titles]);
   const selectedTitle = titles.find((title) => title.id === selectedTitleId) ?? null;
+  const selectedServerId = selectedSourceOption?.serverId;
+  const credentialMessage = (isCredentialError(catalog.error) ? catalog.error.message : undefined)
+    ?? (selectedServerId ? rejectedPosterServers[selectedServerId] : undefined);
+
+  // An <img> cannot say why it failed, so the first failure per server asks once.
+  const reportServerPosterError = useCallback((serverId: string, itemId: string, error?: unknown) => {
+    const remember = (reason: unknown) => {
+      if (!isCredentialError(reason)) return;
+      setRejectedPosterServers((current) => current[serverId] ? current : { ...current, [serverId]: reason.message });
+    };
+    if (error !== undefined) {
+      remember(error);
+      return;
+    }
+    if (probedPosterServers.current.has(serverId)) return;
+    probedPosterServers.current.add(serverId);
+    getLibraryArtwork({ serverId, itemId }).catch(remember);
+  }, []);
 
   function selectSource(id: string) {
     activateSource(id);
@@ -460,16 +482,26 @@ export function LibraryPage() {
           </div>
           <div className={`truncate text-xs ${isBusy ? "text-accent" : "text-subtle"}`} title={statusText}>{statusText}</div>
         </div>
+        {credentialMessage ? (
+          <div role="alert" className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-warning/10 px-5 py-2 text-xs text-warning">
+            <span className="min-w-0">{credentialMessage} Media-server posters are paused.</span>
+            <Link to="/settings" className="shrink-0 font-semibold underline">Open Settings</Link>
+          </div>
+        ) : null}
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {isBusy && !auditResult ? (
             <div className="grid h-full min-h-72 place-items-center text-sm text-muted"><div className="text-center"><RefreshCw size={28} className="mx-auto mb-3 animate-spin text-accent" />Scanning {progressText}</div></div>
           ) : displayedTitles.length > 0 ? (
             <div className="grid gap-x-5 gap-y-6 [grid-template-columns:repeat(auto-fill,minmax(9.375rem,1fr))]">
-              {displayedTitles.map((title) => <LibraryPosterCard key={title.id} title={title} serverId={selectedSourceOption?.serverId} artworkGeneration={artworkGeneration} onOpen={() => setSelectedTitleId(title.id)} onContextMenu={(event) => {
-                event.preventDefault();
-                setContextMenu({ x: event.clientX, y: event.clientY, titleId: title.id });
-              }} />)}
+              {displayedTitles.map((title) => {
+                const serverPoster = Boolean(selectedServerId && title.catalogItem?.hasPoster && !credentialMessage);
+                const posterUrl = serverPoster ? libraryArtworkUrl({ serverId: selectedServerId!, itemId: title.catalogItem!.id }, artworkGeneration) : undefined;
+                return <LibraryPosterCard key={title.id} title={title} serverId={selectedServerId} posterUrl={posterUrl} inlineServerPoster={serverPoster && posterUrl === undefined} artworkGeneration={artworkGeneration} onServerPosterError={reportServerPosterError} onOpen={() => setSelectedTitleId(title.id)} onContextMenu={(event) => {
+                  event.preventDefault();
+                  setContextMenu({ x: event.clientX, y: event.clientY, titleId: title.id });
+                }} />;
+              })}
             </div>
           ) : (
             <div className="grid h-full min-h-72 place-items-center rounded-lg border border-dashed border-border bg-panel/40 px-6 text-center text-sm text-subtle">
@@ -485,29 +517,69 @@ export function LibraryPage() {
   );
 }
 
-function LibraryPosterCard({ title, serverId, artworkGeneration, onOpen, onContextMenu }: { title: LibraryTitle; serverId?: string; artworkGeneration: number; onOpen: () => void; onContextMenu: (event: React.MouseEvent<HTMLButtonElement>) => void }) {
+function isCredentialError(error: unknown): error is ApiError {
+  return error instanceof ApiError && (error.code === "credential_rejected" || error.code === "credential_insufficient");
+}
+
+/** True once the element has been on screen; without IntersectionObserver, at once. */
+function useSeenOnScreen<T extends Element>() {
+  const ref = useRef<T>(null);
+  const [seen, setSeen] = useState(typeof IntersectionObserver === "undefined");
+  useEffect(() => {
+    if (seen || !ref.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setSeen(true);
+    });
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [seen]);
+  return [ref, seen] as const;
+}
+
+type PosterCardProps = {
+  title: LibraryTitle;
+  serverId?: string;
+  /** The media-server poster as an image URL (web). */
+  posterUrl?: string;
+  /** Ask for the media-server poster inline, where there is no image URL (desktop). */
+  inlineServerPoster: boolean;
+  artworkGeneration: number;
+  onOpen: () => void;
+  onContextMenu: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  onServerPosterError: (serverId: string, itemId: string, error?: unknown) => void;
+};
+
+function LibraryPosterCard({ title, serverId, posterUrl, inlineServerPoster, artworkGeneration, onOpen, onContextMenu, onServerPosterError }: PosterCardProps) {
+  const [card, seen] = useSeenOnScreen<HTMLButtonElement>();
+  const [posterFailed, setPosterFailed] = useState(false);
+  const serverPoster = posterUrl && !posterFailed ? posterUrl : "";
   const artwork = useQuery({
-    queryKey: ["library-artwork", serverId, title.catalogItem?.id, title.id, artworkGeneration],
+    queryKey: ["library-artwork", serverId, title.catalogItem?.id, title.id, artworkGeneration, inlineServerPoster],
     queryFn: async () => {
-      if (serverId && title.catalogItem?.hasPoster) {
+      if (inlineServerPoster && serverId && title.catalogItem) {
         try {
           return await getLibraryArtwork({ serverId, itemId: title.catalogItem.id });
-        } catch {
-          // The media-server catalog can advertise a stale or inaccessible
-          // primary image. Fall through to local poster discovery.
+        } catch (error) {
+          // A stale or inaccessible primary image falls through to a local poster.
+          onServerPosterError(serverId, title.catalogItem.id, error);
         }
       }
       return getLibraryLocalArtwork({ folderPaths: title.seasons.map((season) => season.folderPath) });
     },
-    enabled: title.seasons.length > 0,
-    staleTime: Number.POSITIVE_INFINITY,
-    gcTime: Number.POSITIVE_INFINITY
+    enabled: !serverPoster && seen && title.seasons.length > 0,
+    staleTime: Number.POSITIVE_INFINITY
   });
-  const imageUrl = artwork.data ? `data:${artwork.data.contentType};base64,${artwork.data.dataBase64}` : "";
+  const imageUrl = serverPoster || (artwork.data ? `data:${artwork.data.contentType};base64,${artwork.data.dataBase64}` : "");
+  const onImageError = serverPoster && serverId && title.catalogItem
+    ? () => {
+      setPosterFailed(true);
+      onServerPosterError(serverId, title.catalogItem!.id);
+    }
+    : undefined;
   return (
-    <button type="button" onClick={onOpen} onContextMenu={onContextMenu} className="group min-w-0 select-none text-left" title={title.title} aria-label={`Open ${title.title} library details`}>
+    <button ref={card} type="button" onClick={onOpen} onContextMenu={onContextMenu} className="group min-w-0 select-none text-left" title={title.title} aria-label={`Open ${title.title} library details`}>
       <div className="relative aspect-[2/3] overflow-hidden rounded-xl bg-[#64748B] ring-1 ring-border transition duration-150 group-hover:-translate-y-1 group-hover:ring-2 group-hover:ring-accent group-focus-visible:ring-2 group-focus-visible:ring-accent">
-        {imageUrl ? <img src={imageUrl} alt={`${title.title} poster`} loading="lazy" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center bg-[#64748B] px-4 text-center text-xs font-bold uppercase tracking-wider text-white"><div><Film size={34} className="mx-auto mb-3 opacity-80" />No poster found</div></div>}
+        {imageUrl ? <img src={imageUrl} alt={`${title.title} poster`} loading="lazy" onError={onImageError} className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center bg-[#64748B] px-4 text-center text-xs font-bold uppercase tracking-wider text-white"><div><Film size={34} className="mx-auto mb-3 opacity-80" />No poster found</div></div>}
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-2 pb-2 pt-10">
           <span className={`inline-flex rounded-md px-2 py-1 text-[0.6875rem] font-semibold uppercase tracking-wide ${title.hasIssues ? "bg-warning/20 text-warning" : "bg-success/20 text-success"}`}>{title.hasIssues ? `Mismatch · ${title.mismatchFileCount}` : "Match"}</span>
         </div>
