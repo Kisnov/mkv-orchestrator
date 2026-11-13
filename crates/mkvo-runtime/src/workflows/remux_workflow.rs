@@ -363,19 +363,6 @@ impl MkvoRuntime {
             if item.mode == RemuxMode::ExtractSubtitles {
                 continue;
             }
-            let old = item.temporary_output.clone();
-            let stem = item
-                .source
-                .file_stem()
-                .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
-            item.temporary_output = item
-                .source
-                .with_file_name(format!("{stem}.mkvo-remux.tmp.mkv"));
-            for resource in &mut context.resources {
-                if same_path(&resource.path, &old) {
-                    resource.path.clone_from(&item.temporary_output);
-                }
-            }
             if !same_path(&item.source, &item.final_output)
                 && self
                     .dependencies()
@@ -559,7 +546,7 @@ impl MkvoRuntime {
                 (key, result)
             })
             .buffer_unordered(workers);
-        let mut first_error = None;
+        let mut failures = Vec::new();
         while let Some((key, result)) = executions.next().await {
             match result {
                 Ok(()) => {
@@ -568,17 +555,22 @@ impl MkvoRuntime {
                     context.record_completed().await?;
                 }
                 Err(error) => {
-                    journal.fail_item(&key, error.to_string());
-                    context.record_failed().await?;
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                    // A canceled file was not changed: it stays pending rather than failed.
+                    if !matches!(error, ApplicationError::Canceled) {
+                        journal.fail_item(&key, error.to_string());
+                        context.record_failed().await?;
+                        context
+                            .log(JobLogLevel::Error, format!("{key}: {error}"))
+                            .await?;
                     }
+                    failures.push((key, error));
                 }
             }
             journal.updated_utc = Utc::now();
             self.dependencies().journal.advance(&journal).await?;
         }
-        if let Some(error) = first_error {
+        if !failures.is_empty() {
+            let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
             journal.detail = Some(error.to_string());
             journal.updated_utc = Utc::now();
@@ -626,69 +618,23 @@ impl MkvoRuntime {
                 0,
             )
             .await?;
-        let replaced_font_names = if item.subtitle_transforms.is_empty() {
-            BTreeSet::new()
-        } else {
-            self.prepare_subtitle_transforms(item, attributes, context)
-                .await?
-        };
-        let invocation = self
-            .remux_invocation(item, attributes, &replaced_font_names)
-            .await?;
-        context
-            .log(
-                JobLogLevel::Information,
-                format!("{} {}", remux_mode_label(item.mode), item.source.display()),
-            )
-            .await?;
-        let execution = self
-            .dependencies()
-            .tool_executor
-            .execute(&invocation, context.cancellation_token())
-            .await?;
-        if execution.exit_code != Some(0) {
-            return Err(ApplicationError::Internal(format!(
-                "{} exited with {:?}: {}",
-                invocation.tool,
-                execution.exit_code,
-                execution.stderr.trim()
-            )));
+        let outputs = self.remux_outputs(item).await;
+        let produced = self.produce_remux_output(item, attributes, context).await;
+        // Temporaries never outlive the item; one that cannot be removed is only a warning.
+        let (kept, warnings) = self
+            .remove_remux_temporaries(item, attributes, outputs)
+            .await;
+        for warning in warnings {
+            let _ = context.log(JobLogLevel::Warning, warning).await;
         }
-        for expected in &invocation.expected_outputs {
-            if !execution
-                .validated_outputs
-                .iter()
-                .any(|path| same_path(path, expected))
-            {
+        match produced {
+            Err(error) if !kept.is_empty() => {
                 return Err(ApplicationError::Internal(format!(
-                    "{} did not create expected output {}",
-                    invocation.tool,
-                    expected.display()
+                    "{error}; the file being replaced is gone, so the new file was kept at {}",
+                    kept.join(", ")
                 )));
             }
-        }
-        if item.mode == RemuxMode::ExtractSubtitles {
-            self.promote_extractions(item, attributes).await?;
-        } else {
-            self.promote_remux_output(item).await?;
-        }
-        for transform in &item.subtitle_transforms {
-            if self
-                .dependencies()
-                .file_system
-                .exists(&transform.temporary_path)
-                .await?
-            {
-                self.dependencies()
-                    .file_system
-                    .remove_file(&transform.temporary_path)
-                    .await?;
-            }
-        }
-        if let Some(path) = imported_font_path(item, attributes) {
-            if self.dependencies().file_system.exists(&path).await? {
-                self.dependencies().file_system.remove_file(&path).await?;
-            }
+            produced => produced?,
         }
         if item.delete_external_subtitles_after_success {
             for subtitle in &item.external_subtitles {
@@ -711,6 +657,117 @@ impl MkvoRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn produce_remux_output(
+        &self,
+        item: &mkvo_domain::RemuxPlanItem,
+        attributes: &BTreeMap<String, String>,
+        context: &mkvo_application::JobContext,
+    ) -> Result<(), ApplicationError> {
+        let replaced_font_names = if item.subtitle_transforms.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.prepare_subtitle_transforms(item, attributes, context)
+                .await?
+        };
+        let invocation = self
+            .remux_invocation(item, attributes, &replaced_font_names)
+            .await?;
+        context
+            .log(
+                JobLogLevel::Information,
+                format!("{} {}", remux_mode_label(item.mode), item.source.display()),
+            )
+            .await?;
+        let execution = self
+            .dependencies()
+            .tool_executor
+            .execute(&invocation, context.cancellation_token())
+            .await?;
+        if let Some(warning) = tool_warning(&invocation.tool, &execution)? {
+            context
+                .log(
+                    JobLogLevel::Warning,
+                    format!("{}: {warning}", item.source.display()),
+                )
+                .await?;
+        }
+        for expected in &invocation.expected_outputs {
+            if !execution
+                .validated_outputs
+                .iter()
+                .any(|path| same_path(path, expected))
+            {
+                return Err(ApplicationError::Internal(format!(
+                    "{} did not create expected output {}",
+                    invocation.tool,
+                    expected.display()
+                )));
+            }
+        }
+        if item.mode == RemuxMode::ExtractSubtitles {
+            self.promote_extractions(item, attributes).await
+        } else {
+            self.promote_remux_output(item).await
+        }
+    }
+
+    /// Each temporary the tool writes, with the existing file it is about to replace.
+    async fn remux_outputs(
+        &self,
+        item: &mkvo_domain::RemuxPlanItem,
+    ) -> Vec<(PathBuf, Option<PathBuf>)> {
+        if item.mode != RemuxMode::ExtractSubtitles {
+            let replaced =
+                same_path(&item.source, &item.final_output).then(|| item.final_output.clone());
+            return vec![(item.temporary_output.clone(), replaced)];
+        }
+        let file_system = &self.dependencies().file_system;
+        let mut outputs = Vec::new();
+        for track in &item.extract_tracks {
+            let exists = file_system.exists(&track.output).await.unwrap_or(false);
+            outputs.push((
+                extraction_temp_path(&track.output, track.track_id),
+                exists.then(|| track.output.clone()),
+            ));
+        }
+        outputs
+    }
+
+    /// Removes what the item left behind; returns the outputs kept and what could not be removed.
+    async fn remove_remux_temporaries(
+        &self,
+        item: &mkvo_domain::RemuxPlanItem,
+        attributes: &BTreeMap<String, String>,
+        outputs: Vec<(PathBuf, Option<PathBuf>)>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut temporaries: Vec<(PathBuf, Option<PathBuf>)> = item
+            .subtitle_transforms
+            .iter()
+            .map(|transform| (transform.temporary_path.clone(), None))
+            .collect();
+        temporaries.extend(imported_font_path(item, attributes).map(|font| (font, None)));
+        temporaries.extend(outputs);
+        let file_system = &self.dependencies().file_system;
+        let mut kept = Vec::new();
+        let mut failures = Vec::new();
+        for (temporary, replaced) in temporaries {
+            if !file_system.exists(&temporary).await.unwrap_or(false) {
+                continue;
+            }
+            // A failed replace may already have taken the old file: then this is the only copy.
+            if let Some(replaced) = replaced {
+                if !file_system.exists(&replaced).await.unwrap_or(false) {
+                    kept.push(temporary.display().to_string());
+                    continue;
+                }
+            }
+            if let Err(error) = file_system.remove_file(&temporary).await {
+                failures.push(format!("temporary file was left behind: {error}"));
+            }
+        }
+        (kept, failures)
     }
 
     async fn prepare_subtitle_transforms(
@@ -781,12 +838,13 @@ impl MkvoRuntime {
             .tool_executor
             .execute(&invocation, context.cancellation_token())
             .await?;
-        if execution.exit_code != Some(0) {
-            return Err(ApplicationError::Internal(format!(
-                "mkvextract exited with {:?}: {}",
-                execution.exit_code,
-                execution.stderr.trim()
-            )));
+        if let Some(warning) = tool_warning(&invocation.tool, &execution)? {
+            context
+                .log(
+                    JobLogLevel::Warning,
+                    format!("{}: {warning}", item.source.display()),
+                )
+                .await?;
         }
         let font = attributes
             .get("subtitleFontFamily")
@@ -1005,31 +1063,11 @@ impl MkvoRuntime {
         item: &mkvo_domain::RemuxPlanItem,
     ) -> Result<(), ApplicationError> {
         if same_path(&item.source, &item.final_output) {
-            let backup = backup_path(&item.source);
-            if self.dependencies().file_system.exists(&backup).await? {
-                return Err(ApplicationError::Conflict(format!(
-                    "stale remux backup exists: {}",
-                    backup.display()
-                )));
-            }
+            // One rename: there is no moment without a complete file at this path.
             self.dependencies()
                 .file_system
-                .move_file(&item.source, &backup)
+                .replace_file(&item.temporary_output, &item.final_output)
                 .await?;
-            if let Err(error) = self
-                .dependencies()
-                .file_system
-                .move_file(&item.temporary_output, &item.final_output)
-                .await
-            {
-                let _ = self
-                    .dependencies()
-                    .file_system
-                    .move_file(&backup, &item.source)
-                    .await;
-                return Err(error.into());
-            }
-            self.dependencies().file_system.remove_file(&backup).await?;
         } else {
             self.dependencies()
                 .file_system
@@ -1067,31 +1105,10 @@ impl MkvoRuntime {
                         track.output.display()
                     )));
                 }
-                let backup = backup_path(&track.output);
-                if self.dependencies().file_system.exists(&backup).await? {
-                    return Err(ApplicationError::Conflict(format!(
-                        "stale extraction backup exists: {}",
-                        backup.display()
-                    )));
-                }
                 self.dependencies()
                     .file_system
-                    .move_file(&track.output, &backup)
+                    .replace_file(&temporary, &track.output)
                     .await?;
-                if let Err(error) = self
-                    .dependencies()
-                    .file_system
-                    .move_file(&temporary, &track.output)
-                    .await
-                {
-                    let _ = self
-                        .dependencies()
-                        .file_system
-                        .move_file(&backup, &track.output)
-                        .await;
-                    return Err(error.into());
-                }
-                self.dependencies().file_system.remove_file(&backup).await?;
             } else {
                 self.dependencies()
                     .file_system
@@ -1101,6 +1118,107 @@ impl MkvoRuntime {
         }
         Ok(())
     }
+}
+
+/// One error for a whole batch, naming the files that failed rather than only the first.
+pub(super) fn batch_failure(
+    failures: Vec<(String, ApplicationError)>,
+    total: u64,
+) -> ApplicationError {
+    const LISTED: usize = 5;
+    let mut failed: Vec<_> = failures
+        .into_iter()
+        .filter(|(_, error)| !matches!(error, ApplicationError::Canceled))
+        .collect();
+    if failed.is_empty() {
+        return ApplicationError::Canceled;
+    }
+    if total == 1 {
+        return failed.remove(0).1;
+    }
+    let mut message = format!("{} of {total} files failed: ", failed.len());
+    message += &failed
+        .iter()
+        .take(LISTED)
+        .map(|(key, error)| {
+            let reason = match error {
+                ApplicationError::Internal(reason) => reason.clone(),
+                error => error.to_string(),
+            };
+            format!("{}: {reason}", file_name(Path::new(key)))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failed.len() > LISTED {
+        message += &format!(
+            "; and {} more, listed in the job log",
+            failed.len() - LISTED
+        );
+    }
+    ApplicationError::Internal(message)
+}
+
+/// MKVToolNix exits with 1 when it finished with warnings and with 2 when it failed.
+pub(super) fn tool_warning(
+    tool: &str,
+    execution: &mkvo_application::ToolExecutionResult,
+) -> Result<Option<String>, ApplicationError> {
+    match execution.exit_code {
+        Some(0) => Ok(None),
+        Some(1) if finished(tool, &execution.stdout) => Ok(Some(format!(
+            "{tool} finished with warnings: {}",
+            tool_message(execution, "Warning:")
+        ))),
+        code => Err(ApplicationError::Internal(format!(
+            "{tool} {} ({}): {}",
+            if code == Some(1) {
+                "did not finish"
+            } else {
+                "failed"
+            },
+            code.map_or_else(
+                || "no exit code".to_owned(),
+                |code| format!("exit code {code}")
+            ),
+            tool_message(execution, "Error:")
+        ))),
+    }
+}
+
+// A tool killed on Windows also exits with 1; only its last line (English is forced) proves it ended.
+fn finished(tool: &str, stdout: &str) -> bool {
+    let last = stdout
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    match tool {
+        "mkvmerge" => last.starts_with("Multiplexing took"),
+        "mkvpropedit" => last == "Done." || last == "No changes were made.",
+        // mkvextract prints nothing after its last progress line.
+        _ => false,
+    }
+}
+
+// MKVToolNix prints its messages to stdout, among the progress lines.
+fn tool_message(execution: &mkvo_application::ToolExecutionResult, prefix: &str) -> String {
+    let output = if execution.stderr.trim().is_empty() {
+        &execution.stdout
+    } else {
+        &execution.stderr
+    };
+    let lines: Vec<&str> = output
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let flagged: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with(prefix))
+        .collect();
+    let shown = if flagged.is_empty() { lines } else { flagged };
+    shown[shown.len().saturating_sub(5)..].join(" | ")
 }
 
 fn ordered_template_tracks<'a>(
@@ -1575,6 +1693,11 @@ fn validate_imported_font(file_name: &str, data: &str) -> RuntimeResult<()> {
             "Imported font name and data must both be provided.",
         ));
     }
+    if file_name.trim().starts_with('@') {
+        return Err(RuntimeError::invalid(
+            "Imported font name must not start with @.",
+        ));
+    }
     let path = Path::new(file_name.trim());
     if path.file_name().and_then(|value| value.to_str()) != Some(file_name.trim()) {
         return Err(RuntimeError::invalid(
@@ -1606,7 +1729,10 @@ fn imported_font_path(
     attributes: &BTreeMap<String, String>,
 ) -> Option<PathBuf> {
     let name = attributes.get("subtitleFontFileName")?.trim();
-    if name.is_empty() || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+    // mkvmerge would load `--attachment-name @x` as a file of further options.
+    if name.is_empty()
+        || name.starts_with('@')
+        || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
     {
         return None;
     }
@@ -1966,5 +2092,697 @@ mod subtitle_match_tests {
         assert!(validate_imported_font("../Papernotes.ttf", "AA==").is_err());
         assert!(validate_imported_font("Papernotes.exe", "AA==").is_err());
         assert!(validate_imported_font("Papernotes.ttf", "not base64").is_err());
+    }
+}
+
+#[cfg(test)]
+pub(super) mod execution_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use mkvo_application::{
+        FileSystem, MediaCatalog, MediaEnumerationRequest, MediaProbe, PortError,
+        ToolExecutionResult, ToolExecutor, ToolRegistry,
+    };
+    use mkvo_contracts::{JobSnapshot, JobStatus, ToolStatus};
+    use mkvo_infra_sqlite::{SqliteRepositories, SqliteStore};
+    use mkvo_infra_watch::{AuthorizedRoot, AuthorizedRoots, LocalFileSystem};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::{MemorySecretStore, RuntimeConfig, RuntimeDependencies};
+
+    struct NoScan;
+
+    #[async_trait]
+    impl MediaCatalog for NoScan {
+        async fn enumerate(
+            &self,
+            _request: &MediaEnumerationRequest,
+            _cancel: CancellationToken,
+        ) -> Result<Vec<FileFingerprint>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl MediaProbe for NoScan {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            Err(PortError::NotFound(path.display().to_string()))
+        }
+    }
+
+    struct InstalledTools;
+
+    #[async_trait]
+    impl ToolRegistry for InstalledTools {
+        async fn status(&self, logical_name: &str) -> Result<ToolStatus, PortError> {
+            Ok(ToolStatus {
+                name: logical_name.to_owned(),
+                command: logical_name.to_owned(),
+                resolved_path: format!("/tools/{logical_name}"),
+                available: true,
+                version: "test".to_owned(),
+                error: None,
+            })
+        }
+
+        async fn all_statuses(&self) -> Result<Vec<ToolStatus>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Stands in for MKVToolNix: every invocation runs the closure instead.
+    pub struct ScriptedTools<F>(pub F);
+
+    #[async_trait]
+    impl<F> ToolExecutor for ScriptedTools<F>
+    where
+        F: Fn(&ToolInvocation) -> ToolExecutionResult + Send + Sync,
+    {
+        async fn execute(
+            &self,
+            invocation: &ToolInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<ToolExecutionResult, PortError> {
+            Ok((self.0)(invocation))
+        }
+    }
+
+    /// What the process adapter reports for a tool that printed `stdout` and exited.
+    pub fn exited(
+        invocation: &ToolInvocation,
+        exit_code: i32,
+        stdout: &str,
+    ) -> ToolExecutionResult {
+        ToolExecutionResult {
+            exit_code: Some(exit_code),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            validated_outputs: invocation
+                .expected_outputs
+                .iter()
+                .filter(|path| path.is_file())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// A runtime over a real temporary folder, with only the external tools faked.
+    pub struct Library {
+        pub runtime: MkvoRuntime,
+        directory: tempfile::TempDir,
+    }
+
+    pub fn library(tools: impl ToolExecutor + 'static) -> Library {
+        library_with(tools, |_| {})
+    }
+
+    /// Like `library`, after `adjust` swapped in whatever the test needs to misbehave.
+    pub fn library_with(
+        tools: impl ToolExecutor + 'static,
+        adjust: impl FnOnce(&mut RuntimeDependencies),
+    ) -> Library {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let roots =
+            AuthorizedRoots::new([AuthorizedRoot::new(directory.path(), true).expect("root")])
+                .expect("roots");
+        let repositories = Arc::new(SqliteRepositories::from_store(
+            SqliteStore::open_in_memory().expect("SQLite"),
+        ));
+        let mut dependencies = RuntimeDependencies {
+            catalog: Arc::new(NoScan),
+            probe: Arc::new(NoScan),
+            cache: repositories.clone(),
+            paths: Arc::new(roots.clone()),
+            file_system: Arc::new(LocalFileSystem::new(roots.clone(), false)),
+            tools: Arc::new(InstalledTools),
+            tool_executor: Arc::new(tools),
+            settings: repositories.clone(),
+            secrets: Arc::new(MemorySecretStore::new()),
+            plans: repositories.clone(),
+            jobs: repositories.clone(),
+            rename_history: repositories.clone(),
+            journal: repositories.clone(),
+            logs: repositories,
+            watcher: None,
+            process_tools: None,
+            authorized_roots: Some(roots),
+        };
+        adjust(&mut dependencies);
+        let config = RuntimeConfig::new(directory.path(), directory.path());
+        Library {
+            runtime: MkvoRuntime::from_parts(config, dependencies),
+            directory,
+        }
+    }
+
+    impl Library {
+        /// Writes a file and describes it as a scanned video with one removable audio track.
+        pub async fn media(&self, name: &str) -> MediaFile {
+            std::fs::write(self.directory.path().join(name), "original").expect("media");
+            let fingerprint = self
+                .runtime
+                .dependencies()
+                .file_system
+                .fingerprint(&self.directory.path().join(name))
+                .await
+                .expect("fingerprint");
+            let video = MediaTrack {
+                mkvmerge_id: 0,
+                propedit_track_number: 1,
+                kind: TrackKind::Video,
+                codec: "AVC".to_owned(),
+                codec_id: None,
+                language: None,
+                name: None,
+                resolution: None,
+                bit_depth: None,
+                hdr: None,
+                channels: None,
+                sampling_frequency_hz: None,
+                default: true,
+                forced: false,
+                enabled: true,
+            };
+            let audio = MediaTrack {
+                mkvmerge_id: 1,
+                propedit_track_number: 2,
+                kind: TrackKind::Audio,
+                ..video.clone()
+            };
+            MediaFile {
+                path: fingerprint.path.clone(),
+                original_file_name: None,
+                watch_root: None,
+                relative_path: None,
+                fingerprint,
+                container: ContainerMetadata::default(),
+                tracks: vec![video, audio],
+                attachments: Vec::new(),
+                episode: None,
+                provider_match: None,
+                status: MediaStatus::Ready,
+            }
+        }
+
+        pub fn file_names(&self) -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(self.directory.path())
+                .expect("directory")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+
+        pub async fn start_job<F, Fut>(&self, kind: JobKind, task: F) -> mkvo_domain::JobId
+        where
+            F: FnOnce(MkvoRuntime, mkvo_application::JobContext) -> Fut + Send + 'static,
+            Fut: Future<Output = Result<JobCompletion, ApplicationError>> + Send + 'static,
+        {
+            let runtime = self.runtime.clone();
+            self.runtime
+                .jobs()
+                .start(
+                    JobSpec {
+                        kind,
+                        idempotency_key: IdempotencyKey::generate(),
+                        request_fingerprint: "test".to_owned(),
+                        plan_id: None,
+                        total: 0,
+                        resources: Vec::new(),
+                    },
+                    move |context| task(runtime, context),
+                )
+                .await
+                .expect("job")
+                .id
+        }
+
+        pub async fn finished_job(&self, id: mkvo_domain::JobId) -> JobSnapshot {
+            loop {
+                let snapshot = self
+                    .runtime
+                    .jobs()
+                    .get(id)
+                    .await
+                    .expect("job")
+                    .expect("snapshot");
+                if snapshot.status.is_terminal() {
+                    return snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        pub async fn run_remux(&self, plan: RemuxPlan) -> JobSnapshot {
+            self.runtime.persist_plan(&plan).await.expect("persist");
+            let id = self
+                .start_job(JobKind::Remux, |runtime, context| async move {
+                    runtime.execute_remux_plan(&plan, &context).await
+                })
+                .await;
+            self.finished_job(id).await
+        }
+    }
+
+    /// An in-place remux that drops the audio track of each file.
+    fn remux_request(files: Vec<MediaFile>) -> RemuxPlanRequest {
+        RemuxPlanRequest {
+            mode: RemuxMode::Remux,
+            files,
+            options: RemuxOptions {
+                remove_track_ids: BTreeSet::from([1]),
+                ..RemuxOptions::default()
+            },
+            external_subtitles: BTreeMap::new(),
+            extractions: BTreeMap::new(),
+            existing_paths: BTreeSet::new(),
+            source_access: BTreeMap::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            tool_fingerprints: BTreeMap::new(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        }
+    }
+
+    fn remux_plan(files: Vec<MediaFile>) -> RemuxPlan {
+        RemuxPlanner
+            .build_plan(remux_request(files))
+            .expect("remux plan")
+    }
+
+    fn writes_output(invocation: &ToolInvocation) -> ToolExecutionResult {
+        for output in &invocation.expected_outputs {
+            std::fs::write(output, "new").expect("output");
+        }
+        exited(invocation, 0, "")
+    }
+
+    const WARNED: &str = "mkvmerge v102.0 ('Little Houses') 64-bit\n'a.srt': Using the demultiplexer for the format 'SRT subtitles'.\nWarning: 'a.srt' track 0: The start timestamp is smaller than that of the previous entry.\nThe file has been opened for writing.\nProgress: 96%\rProgress: 100%\rThe cue entries (the index) are being written...\nMultiplexing took 0 seconds.\n";
+    const FAILED: &str = "mkvmerge v102.0 ('Little Houses') 64-bit\nError: The file 'Episode 01.mkv' could not be opened for reading: open file error.\n";
+
+    #[tokio::test]
+    async fn output_written_with_warnings_replaces_the_original() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            std::fs::write(&invocation.expected_outputs[0], "remuxed").expect("output");
+            exited(invocation, 1, WARNED)
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "remuxed"
+        );
+        assert_eq!(library.file_names(), ["Episode 01.mkv"]);
+        assert!(job.lines.iter().any(|line| {
+            line.contains("Warning: 'a.srt' track 0") && !line.contains("Progress")
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_remux_keeps_the_original_and_removes_the_partial_output() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            std::fs::write(&invocation.expected_outputs[0], "partial").expect("output");
+            exited(invocation, 2, FAILED)
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "original"
+        );
+        assert_eq!(library.file_names(), ["Episode 01.mkv"]);
+        let error = job.error.expect("error");
+        assert!(error.contains("mkvmerge failed (exit code 2)"), "{error}");
+        assert!(error.contains("could not be opened for reading"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_temporary_that_cannot_be_removed_is_only_a_warning() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            let output = &invocation.expected_outputs[0];
+            std::fs::write(output, "remuxed").expect("output");
+            // A folder with content stands in for a file the platform refuses to delete.
+            let font = output.with_file_name(".Episode 01.mkvo-font-font.ttf");
+            std::fs::create_dir(&font).expect("font");
+            std::fs::write(font.join("held"), "").expect("held");
+            exited(invocation, 0, "")
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+        let mut plan = remux_plan(vec![episode.clone()]);
+        plan.context
+            .attributes
+            .insert("subtitleFontFileName".to_owned(), "font.ttf".to_owned());
+
+        let job = library.run_remux(plan).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "remuxed"
+        );
+        assert!(
+            job.lines
+                .iter()
+                .any(|line| line.contains("temporary file was left behind"))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_argument_can_be_read_by_mkvmerge_as_an_options_file() {
+        assert!(validate_imported_font("@fonts.ttf", "AA==").is_err());
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            // mkvmerge loads any argument that starts with `@` as a file of further options.
+            if invocation
+                .arguments
+                .iter()
+                .any(|argument| argument.starts_with('@'))
+            {
+                exited(invocation, 2, "Error: an options file was read\n")
+            } else {
+                writes_output(invocation)
+            }
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+        let mut plan = remux_plan(vec![episode]);
+        plan.context
+            .attributes
+            .insert("subtitleFontFileName".to_owned(), "@fonts.ttf".to_owned());
+
+        let job = library.run_remux(plan).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+    }
+
+    #[tokio::test]
+    async fn a_backup_left_by_an_older_version_does_not_block_the_remux() {
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        let backup = episode.path.with_file_name(".Episode 01.mkv.mkvo-backup");
+        std::fs::write(&backup, "older").expect("backup");
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "new"
+        );
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), "older");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_original_that_cannot_be_replaced_is_left_untouched() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        // A media server playing the file: others may read it, nobody may replace it.
+        let playing = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&episode.path)
+            .expect("open");
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+        drop(playing);
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.error.expect("error").contains("could not replace"));
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "original"
+        );
+        assert_eq!(library.file_names(), ["Episode 01.mkv"]);
+    }
+
+    /// Extraction of one track over the subtitle that is already there.
+    fn overwriting_extraction_plan(episode: MediaFile, subtitle: &Path) -> RemuxPlan {
+        std::fs::write(subtitle, "older").expect("subtitle");
+        let mut plan = RemuxPlanner
+            .build_plan(RemuxPlanRequest {
+                mode: RemuxMode::ExtractSubtitles,
+                extractions: BTreeMap::from([(
+                    episode.path.clone(),
+                    vec![TrackExtraction {
+                        track_id: 2,
+                        kind: TrackKind::Subtitle,
+                        output: subtitle.to_path_buf(),
+                    }],
+                )]),
+                ..remux_request(vec![episode])
+            })
+            .expect("extraction plan");
+        plan.context.attributes.insert(
+            "extractOverwriteExistingFiles".to_owned(),
+            "true".to_owned(),
+        );
+        plan
+    }
+
+    /// A share where replacing a file removes the old one and then fails.
+    struct LosesReplacedFile(Arc<dyn FileSystem>);
+
+    #[async_trait]
+    impl FileSystem for LosesReplacedFile {
+        async fn exists(&self, path: &Path) -> Result<bool, PortError> {
+            self.0.exists(path).await
+        }
+
+        async fn is_directory(&self, path: &Path) -> Result<bool, PortError> {
+            self.0.is_directory(path).await
+        }
+
+        async fn fingerprint(&self, path: &Path) -> Result<FileFingerprint, PortError> {
+            self.0.fingerprint(path).await
+        }
+
+        async fn move_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            self.0.move_file(source, target).await
+        }
+
+        async fn remove_file(&self, path: &Path) -> Result<(), PortError> {
+            self.0.remove_file(path).await
+        }
+
+        async fn probe_access(
+            &self,
+            path: &Path,
+            access: RequiredAccess,
+        ) -> Result<FileAccessState, PortError> {
+            self.0.probe_access(path, access).await
+        }
+
+        async fn replace_file(&self, _source: &Path, target: &Path) -> Result<(), PortError> {
+            self.0.remove_file(target).await?;
+            Err(PortError::Other("the share went away".to_owned()))
+        }
+    }
+
+    fn losing_replaced_files(dependencies: &mut RuntimeDependencies) {
+        dependencies.file_system = Arc::new(LosesReplacedFile(dependencies.file_system.clone()));
+    }
+
+    #[tokio::test]
+    async fn a_replace_that_loses_the_original_keeps_the_new_file() {
+        let library = library_with(ScriptedTools(writes_output), losing_replaced_files);
+        let episode = library.media("Episode 01.mkv").await;
+        let kept = episode
+            .path
+            .with_file_name(".Episode 01.mkv.mkvo-remux.tmp");
+
+        let job = library.run_remux(remux_plan(vec![episode])).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(std::fs::read_to_string(&kept).expect("kept"), "new");
+        let error = job.error.expect("error");
+        assert!(error.contains("the share went away"), "{error}");
+        assert!(
+            error.contains("was kept at") && error.contains(".Episode 01.mkv.mkvo-remux.tmp"),
+            "{error}"
+        );
+        assert!(job.lines.iter().any(|line| line.contains("was kept at")));
+    }
+
+    #[tokio::test]
+    async fn an_extraction_that_loses_the_old_subtitle_keeps_the_new_one() {
+        let library = library_with(ScriptedTools(writes_output), losing_replaced_files);
+        let episode = library.media("Episode 01.mkv").await;
+        let subtitle = episode.path.with_file_name("Episode 01.eng.srt");
+        let kept = subtitle.with_file_name(".Episode 01.eng.srt.mkvo-extract-2.tmp");
+
+        let job = library
+            .run_remux(overwriting_extraction_plan(episode, &subtitle))
+            .await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(std::fs::read_to_string(&kept).expect("kept"), "new");
+        assert!(job.error.expect("error").contains("was kept at"));
+    }
+
+    #[tokio::test]
+    async fn extraction_replaces_an_existing_subtitle_without_a_backup() {
+        let library = library(ScriptedTools(writes_output));
+        let episode = library.media("Episode 01.mkv").await;
+        let subtitle = episode.path.with_file_name("Episode 01.eng.srt");
+
+        let job = library
+            .run_remux(overwriting_extraction_plan(episode, &subtitle))
+            .await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert_eq!(std::fs::read_to_string(&subtitle).expect("subtitle"), "new");
+        assert_eq!(
+            library.file_names(),
+            ["Episode 01.eng.srt", "Episode 01.mkv"]
+        );
+    }
+
+    #[test]
+    fn a_batch_failure_names_the_failed_files_and_ignores_canceled_ones() {
+        let failed = |name: &str| {
+            (
+                format!("/media/{name}"),
+                ApplicationError::Internal("tool failed".to_owned()),
+            )
+        };
+        let canceled = || ("/media/c.mkv".to_owned(), ApplicationError::Canceled);
+
+        let only = batch_failure(vec![failed("a.mkv")], 1);
+        assert_eq!(only.to_string(), "internal error: tool failed");
+        let mixed = batch_failure(vec![canceled(), failed("a.mkv"), failed("b.mkv")], 4);
+        assert_eq!(
+            mixed.to_string(),
+            "internal error: 2 of 4 files failed: a.mkv: tool failed; b.mkv: tool failed"
+        );
+        let many = batch_failure(
+            (0..7)
+                .map(|index| failed(&format!("{index}.mkv")))
+                .collect(),
+            9,
+        );
+        assert!(
+            many.to_string()
+                .starts_with("internal error: 7 of 9 files failed: 0.mkv: ")
+        );
+        assert!(
+            many.to_string()
+                .ends_with("; and 2 more, listed in the job log")
+        );
+        assert!(matches!(
+            batch_failure(vec![canceled(), canceled()], 4),
+            ApplicationError::Canceled
+        ));
+    }
+
+    #[test]
+    fn tool_messages_come_from_stdout_when_stderr_is_empty() {
+        let invocation = ToolInvocation {
+            tool: "mkvmerge".to_owned(),
+            executable: PathBuf::from("mkvmerge"),
+            arguments: Vec::new(),
+            working_directory: None,
+            expected_outputs: Vec::new(),
+        };
+
+        let clean = tool_warning("mkvmerge", &exited(&invocation, 0, WARNED)).expect("clean");
+        assert_eq!(clean, None);
+        let warned = tool_warning("mkvmerge", &exited(&invocation, 1, WARNED)).expect("warned");
+        assert_eq!(
+            warned.as_deref(),
+            Some(
+                "mkvmerge finished with warnings: Warning: 'a.srt' track 0: The start timestamp is smaller than that of the previous entry."
+            )
+        );
+        let unlabelled =
+            tool_warning("mkvmerge", &exited(&invocation, 2, "one\ntwo\r\n")).expect_err("failed");
+        assert_eq!(
+            unlabelled.to_string(),
+            "internal error: mkvmerge failed (exit code 2): one | two"
+        );
+        let mut on_stderr = exited(&invocation, 2, FAILED);
+        on_stderr.stderr = "1\n2\n3\n4\n5\n6\naccess denied\n".to_owned();
+        let on_stderr = tool_warning("mkvmerge", &on_stderr).expect_err("failed");
+        assert!(
+            on_stderr
+                .to_string()
+                .ends_with("(exit code 2): 3 | 4 | 5 | 6 | access denied")
+        );
+    }
+
+    // What `taskkill /F` left of a real mkvmerge v102 run: exit code 1 and a third of the file.
+    const KILLED: &str =
+        "mkvmerge v102.0 ('Little Houses') 64-bit\nProgress: 0%\rProgress: 10%\rProgress: 35%\r";
+
+    #[tokio::test]
+    async fn a_killed_mkvmerge_is_not_taken_for_one_that_finished_with_warnings() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            std::fs::write(&invocation.expected_outputs[0], "truncated").expect("output");
+            exited(invocation, 1, KILLED)
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+
+        let job = library.run_remux(remux_plan(vec![episode.clone()])).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            std::fs::read_to_string(&episode.path).expect("episode"),
+            "original"
+        );
+        assert_eq!(library.file_names(), ["Episode 01.mkv"]);
+        let error = job.error.expect("error");
+        assert!(
+            error.contains("mkvmerge did not finish (exit code 1)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exit_code_one_counts_only_with_the_line_a_finished_tool_prints_last() {
+        let ended = |tool: &str, stdout: &str| {
+            let execution = mkvo_application::ToolExecutionResult {
+                exit_code: Some(1),
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                validated_outputs: Vec::new(),
+            };
+            tool_warning(tool, &execution).is_ok()
+        };
+
+        assert!(ended("mkvmerge", WARNED));
+        assert!(ended(
+            "mkvmerge",
+            "Multiplexing took 1 minute 5 seconds.\r\n"
+        ));
+        assert!(!ended("mkvmerge", KILLED));
+        assert!(ended(
+            "mkvpropedit",
+            "Warning: x\nThe changes are written to the file.\nDone.\n"
+        ));
+        assert!(ended("mkvpropedit", "Warning: x\nNo changes were made.\n"));
+        assert!(!ended(
+            "mkvpropedit",
+            "The file is being analyzed.\nThe changes are written to the file.\n"
+        ));
+        assert!(!ended("mkvextract", "Progress: 100%\n"));
     }
 }

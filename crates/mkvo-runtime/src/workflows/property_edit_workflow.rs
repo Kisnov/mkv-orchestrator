@@ -1,3 +1,4 @@
+use super::remux_workflow::{batch_failure, tool_warning};
 use super::*;
 
 impl MkvoRuntime {
@@ -183,35 +184,55 @@ impl MkvoRuntime {
             .settings
             .workers
             .max_edit_workers;
+        let halted = &std::sync::atomic::AtomicBool::new(false);
         let mut executions = stream::iter(runnable.into_iter().enumerate())
             .map(|(index, item)| async move {
                 let key = item.path.to_string_lossy().into_owned();
-                let result = self
-                    .execute_propedit_item(&item, context, index, total)
-                    .await;
+                let result = if halted.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(ApplicationError::Canceled)
+                } else {
+                    self.execute_propedit_item(&item, context, index, total)
+                        .await
+                };
                 (key, result)
             })
             .buffer_unordered(workers);
-        let mut first_error = None;
+        let mut failures = Vec::new();
+        let mut recorded = Ok(());
         while let Some((key, result)) = executions.next().await {
-            match result {
-                Ok(()) => {
-                    journal.step = journal.step.saturating_add(1);
-                    journal.complete_item(&key);
-                    context.record_completed().await?;
-                }
-                Err(error) => {
-                    journal.fail_item(&key, error.to_string());
-                    context.record_failed().await?;
-                    if first_error.is_none() {
-                        first_error = Some(error);
+            // Returning here would drop, and so kill, the edits still writing: they are drained.
+            if recorded.is_err() {
+                continue;
+            }
+            recorded = async {
+                match result {
+                    Ok(()) => {
+                        journal.step = journal.step.saturating_add(1);
+                        journal.complete_item(&key);
+                        context.record_completed().await?;
+                    }
+                    Err(error) => {
+                        // A canceled file was not changed: it stays pending rather than failed.
+                        if !matches!(error, ApplicationError::Canceled) {
+                            journal.fail_item(&key, error.to_string());
+                            context.record_failed().await?;
+                            context
+                                .log(JobLogLevel::Error, format!("{key}: {error}"))
+                                .await?;
+                        }
+                        failures.push((key, error));
                     }
                 }
+                journal.updated_utc = Utc::now();
+                self.dependencies().journal.advance(&journal).await?;
+                Ok::<_, ApplicationError>(())
             }
-            journal.updated_utc = Utc::now();
-            self.dependencies().journal.advance(&journal).await?;
+            .await;
+            halted.store(recorded.is_err(), std::sync::atomic::Ordering::Relaxed);
         }
-        if let Some(error) = first_error {
+        recorded?;
+        if !failures.is_empty() {
+            let error = batch_failure(failures, total);
             journal.status = mkvo_application::JournalStatus::Failed;
             journal.detail = Some(error.to_string());
             journal.updated_utc = Utc::now();
@@ -259,17 +280,19 @@ impl MkvoRuntime {
             )
             .await?;
         let invocation = self.propedit_invocation(item).await?;
+        // mkvpropedit rewrites the file in place; a cancel waits for it rather than kill it mid-write.
         let execution = self
             .dependencies()
             .tool_executor
-            .execute(&invocation, context.cancellation_token())
+            .execute(&invocation, tokio_util::sync::CancellationToken::new())
             .await?;
-        if execution.exit_code != Some(0) {
-            return Err(ApplicationError::Internal(format!(
-                "mkvpropedit exited with {:?}: {}",
-                execution.exit_code,
-                execution.stderr.trim()
-            )));
+        if let Some(warning) = tool_warning(&invocation.tool, &execution)? {
+            context
+                .log(
+                    JobLogLevel::Warning,
+                    format!("{}: {warning}", item.path.display()),
+                )
+                .await?;
         }
         // Refresh each successful file immediately. If a later file in the
         // batch fails, every tab still sees the edits that already landed.
@@ -293,5 +316,277 @@ impl MkvoRuntime {
             working_directory: item.path.parent().map(Path::to_path_buf),
             expected_outputs: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use std::sync::Arc;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use mkvo_application::{
+        JournalRecord, OperationJournal, PortError, ToolExecutionResult, ToolExecutor,
+    };
+    use mkvo_contracts::{JobSnapshot, JobStatus};
+    use tokio::sync::{Notify, Semaphore};
+    use tokio_util::sync::CancellationToken;
+
+    use super::super::remux_workflow::execution_tests::{
+        Library, ScriptedTools, exited, library, library_with,
+    };
+    use super::*;
+
+    fn title_edit_plan(files: Vec<MediaFile>) -> PropertyEditPlan {
+        PropertyEditPlanner
+            .build_plan(PropertyEditPlanRequest {
+                files,
+                source_access: BTreeMap::new(),
+                container_title: TextEdit::Set("Title".to_owned()),
+                video_track_name: TextEdit::Keep,
+                track_edits: Vec::new(),
+                authorized_roots: Vec::new(),
+                settings_fingerprint: "settings".to_owned(),
+                tool_fingerprints: BTreeMap::new(),
+                expires_in_seconds: 60,
+                idempotency_key: IdempotencyKey::generate(),
+            })
+            .expect("propedit plan")
+    }
+
+    async fn start_title_edit(library: &Library, plan: PropertyEditPlan) -> mkvo_domain::JobId {
+        library.runtime.persist_plan(&plan).await.expect("persist");
+        library
+            .start_job(JobKind::PropertyEdit, |runtime, context| async move {
+                runtime.execute_propedit_plan(&plan, &context).await
+            })
+            .await
+    }
+
+    async fn run_title_edit(library: &Library, files: Vec<MediaFile>) -> JobSnapshot {
+        let id = start_title_edit(library, title_edit_plan(files)).await;
+        library.finished_job(id).await
+    }
+
+    #[tokio::test]
+    async fn an_edit_written_with_warnings_is_not_a_failure() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            exited(
+                invocation,
+                1,
+                "The file is being analyzed.\nWarning: No attachment matched the spec '5'.\nThe changes are written to the file.\nDone.\n",
+            )
+        }));
+        let episode = library.media("Episode 01.mkv").await;
+
+        let job = run_title_edit(&library, vec![episode]).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error);
+        assert!(
+            job.lines
+                .iter()
+                .any(|line| line.contains("No attachment matched the spec"))
+        );
+    }
+
+    /// An edit that stays in flight until released, and stops early if it is told to.
+    #[derive(Clone)]
+    struct HeldEdit {
+        started: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+
+    impl HeldEdit {
+        fn new() -> Self {
+            Self {
+                started: Arc::default(),
+                release: Arc::new(Semaphore::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for HeldEdit {
+        async fn execute(
+            &self,
+            invocation: &ToolInvocation,
+            cancel: CancellationToken,
+        ) -> Result<ToolExecutionResult, PortError> {
+            self.started.notify_one();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(PortError::Canceled),
+                released = self.release.acquire() => {
+                    released.expect("open").forget();
+                    Ok(exited(invocation, 0, "Done.\n"))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_lets_the_edit_in_flight_finish() {
+        let tools = HeldEdit::new();
+        let library = library(tools.clone());
+        let episode = library.media("Episode 01.mkv").await;
+
+        let id = start_title_edit(&library, title_edit_plan(vec![episode])).await;
+        tools.started.notified().await;
+        library.runtime.jobs().cancel(id).await.expect("cancel");
+        tools.release.add_permits(1);
+        let job = library.finished_job(id).await;
+
+        assert_eq!(job.status, JobStatus::Canceled);
+        assert_eq!((job.completed, job.failed), (1, 0));
+    }
+
+    /// A journal that stops accepting updates once the batch is under way.
+    struct BrokenJournal {
+        inner: Arc<dyn OperationJournal>,
+        updates: AtomicUsize,
+        broke: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl OperationJournal for BrokenJournal {
+        async fn begin(&self, record: &JournalRecord) -> Result<(), PortError> {
+            self.inner.begin(record).await
+        }
+
+        async fn advance(&self, record: &JournalRecord) -> Result<(), PortError> {
+            // The first update only marks the batch as running.
+            if self.updates.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.inner.advance(record).await;
+            }
+            self.broke.notify_one();
+            Err(PortError::Other("the journal is unavailable".to_owned()))
+        }
+
+        async fn get(&self, key: &IdempotencyKey) -> Result<Option<JournalRecord>, PortError> {
+            self.inner.get(key).await
+        }
+    }
+
+    /// Edits `Episode 02` only once released; every other file at once.
+    #[derive(Clone)]
+    struct SlowSecondEdit {
+        release: Arc<Semaphore>,
+        finished: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SlowSecondEdit {
+        async fn execute(
+            &self,
+            invocation: &ToolInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<ToolExecutionResult, PortError> {
+            if invocation.arguments[0].contains("Episode 02") {
+                self.release.acquire().await.expect("open").forget();
+            }
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(exited(invocation, 0, "Done.\n"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bookkeeping_error_lets_the_edit_in_flight_finish() {
+        let tools = SlowSecondEdit {
+            release: Arc::new(Semaphore::new(0)),
+            finished: Arc::default(),
+        };
+        let broke = Arc::new(Notify::new());
+        let library = library_with(tools.clone(), |dependencies| {
+            dependencies.journal = Arc::new(BrokenJournal {
+                inner: dependencies.journal.clone(),
+                updates: AtomicUsize::new(0),
+                broke: broke.clone(),
+            });
+        });
+        let files = vec![
+            library.media("Episode 01.mkv").await,
+            library.media("Episode 02.mkv").await,
+        ];
+
+        let id = start_title_edit(&library, title_edit_plan(files)).await;
+        broke.notified().await;
+        tools.release.add_permits(1);
+        let job = library.finished_job(id).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.error.expect("error").contains("journal is unavailable"));
+        assert_eq!(tools.finished.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn files_canceled_before_their_turn_are_not_failures() {
+        let tools = HeldEdit::new();
+        let library = library(tools.clone());
+        let mut files = Vec::new();
+        for name in ["Episode 01.mkv", "Episode 02.mkv", "Episode 03.mkv"] {
+            files.push(library.media(name).await);
+        }
+        let plan = title_edit_plan(files);
+        let key = plan.metadata.idempotency_key.clone();
+
+        let id = start_title_edit(&library, plan).await;
+        tools.started.notified().await;
+        library.runtime.jobs().cancel(id).await.expect("cancel");
+        tools.release.add_permits(3);
+        let job = library.finished_job(id).await;
+
+        assert_eq!(job.status, JobStatus::Canceled);
+        assert_eq!(job.failed, 0);
+        let journal = library
+            .runtime
+            .dependencies()
+            .journal
+            .get(&key)
+            .await
+            .expect("journal")
+            .expect("record");
+        let pending = mkvo_application::JournalItemStatus::Pending;
+        let failed = mkvo_application::JournalItemStatus::Failed;
+        assert!(journal.items.iter().any(|item| item.status == pending));
+        assert!(journal.items.iter().all(|item| item.status != failed));
+    }
+
+    #[tokio::test]
+    async fn every_failed_file_is_reported() {
+        let library = library(ScriptedTools(|invocation: &ToolInvocation| {
+            if invocation.arguments[0].contains("Episode 02") {
+                exited(invocation, 0, "Done.\n")
+            } else {
+                let failed = "Error: The file could not be opened for writing.\n";
+                exited(invocation, 2, failed)
+            }
+        }));
+        let mut files = Vec::new();
+        for name in ["Episode 01.mkv", "Episode 02.mkv", "Episode 03.mkv"] {
+            files.push(library.media(name).await);
+        }
+
+        let job = run_title_edit(&library, files).await;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(job.failed, 2);
+        let error = job.error.expect("error");
+        assert!(error.contains("2 of 3 files failed"), "{error}");
+        assert!(
+            error.contains("Episode 01.mkv: mkvpropedit failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Episode 03.mkv: mkvpropedit failed"),
+            "{error}"
+        );
+        assert!(!error.contains("Episode 02.mkv"), "{error}");
+        let logged = job
+            .lines
+            .iter()
+            .filter(|line| line.contains("could not be opened for writing"))
+            .count();
+        assert_eq!(logged, 2);
     }
 }

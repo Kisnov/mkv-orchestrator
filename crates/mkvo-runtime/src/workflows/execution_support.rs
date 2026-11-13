@@ -95,13 +95,6 @@ pub(super) fn append_propedit_arguments(arguments: &mut Vec<String>, mutation: &
     }
 }
 
-pub(super) fn backup_path(source: &Path) -> PathBuf {
-    let name = source
-        .file_name()
-        .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
-    source.with_file_name(format!(".{name}.mkvo-backup"))
-}
-
 pub(super) fn extraction_temp_path(output: &Path, track_id: u64) -> PathBuf {
     let name = output
         .file_name()

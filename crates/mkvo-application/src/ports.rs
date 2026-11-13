@@ -119,6 +119,10 @@ pub trait FileSystem: Send + Sync {
         path: &Path,
         access: RequiredAccess,
     ) -> Result<FileAccessState, PortError>;
+
+    /// Put `source` in place of the existing `target` with a single rename,
+    /// once `source` is safely on disk.
+    async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
