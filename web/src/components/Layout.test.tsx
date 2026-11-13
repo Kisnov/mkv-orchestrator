@@ -1,5 +1,5 @@
 import userEvent from "@testing-library/user-event";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Layout } from "./Layout";
@@ -107,4 +107,24 @@ it("does not toggle the sidebar when its edge is clicked outside the toggle", ()
   fireEvent.click(sidebar, { clientX: 234 });
   expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
   expect(window.localStorage.getItem("mkvo.sidebar.collapsed")).toBe("false");
+});
+
+it("folds the sidebar when the window narrows and restores the saved choice when it widens", () => {
+  window.localStorage.setItem("mkvo.sidebar.collapsed", "false");
+  const listeners = new Set<() => void>();
+  const narrow = { matches: false, addEventListener: (_: string, listener: () => void) => listeners.add(listener), removeEventListener: (_: string, listener: () => void) => listeners.delete(listener) };
+  vi.stubGlobal("matchMedia", (query: string) => query === "(max-width: 1099px)" ? narrow : { matches: false, addEventListener: () => undefined, removeEventListener: () => undefined });
+  renderWithBackend(<MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Dashboard content</div>} /></Route></Routes></MediaLibraryProvider>, {
+    getStatus: () => Promise.resolve({ name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 })
+  });
+
+  narrow.matches = true;
+  act(() => listeners.forEach((listener) => listener()));
+  expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
+  expect(window.localStorage.getItem("mkvo.sidebar.collapsed")).toBe("false");
+
+  narrow.matches = false;
+  act(() => listeners.forEach((listener) => listener()));
+  expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+  vi.unstubAllGlobals();
 });

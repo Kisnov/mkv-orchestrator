@@ -39,6 +39,14 @@ export function Layout() {
   const location = useLocation();
   useEffect(() => { setMobileMenuOpen(false); }, [location.pathname]);
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("mkvo.sidebar.collapsed") === null ? window.innerWidth < 1100 : localStorage.getItem("mkvo.sidebar.collapsed") === "true");
+  // Narrowing the window folds the sidebar for room; widening it restores the saved choice.
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const narrow = window.matchMedia("(max-width: 1099px)");
+    const sync = () => setCollapsed(narrow.matches || localStorage.getItem("mkvo.sidebar.collapsed") === "true");
+    narrow.addEventListener("change", sync);
+    return () => narrow.removeEventListener("change", sync);
+  }, []);
   const pageContentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const content = pageContentRef.current;
