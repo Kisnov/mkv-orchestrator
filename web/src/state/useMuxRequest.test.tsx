@@ -42,7 +42,7 @@ describe("buildMuxRequest", () => {
 
 describe("useMuxRequest", () => {
   it("plans, applies that plan once with an idempotency key, and tracks the job", async () => {
-    const startMuxApply = vi.fn((_: MuxPreviewRequest) => Promise.resolve(job({ total: 1 })));
+    const startMuxApply = vi.fn((sent: MuxPreviewRequest) => Promise.resolve(job({ total: sent.selectedPaths.length })));
     const { result } = setup({ buildMuxPreview: () => Promise.resolve(plan), startMuxApply, getOperationJob: () => Promise.resolve(job({ total: 1 })) });
 
     await act(() => result.current.apply(request));
