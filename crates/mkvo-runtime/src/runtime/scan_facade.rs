@@ -114,7 +114,7 @@ impl MkvoRuntime {
             && let Some(requested) = path.as_deref()
             && let Some(UncTarget::Server(server)) = classify_unc(requested)
         {
-            return server_listing(&server);
+            return server_listing(&server).await;
         }
 
         let requested = match path.filter(|value| !value.trim().is_empty()) {
