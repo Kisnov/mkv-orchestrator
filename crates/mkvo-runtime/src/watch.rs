@@ -15,7 +15,7 @@ use std::{
 };
 
 use mkvo_application::{MediaEnumerationRequest, WatchChange, WatchChangeKind, WatchHealth};
-use mkvo_domain::AppSettings;
+use mkvo_domain::{AppSettings, path_key};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
@@ -332,15 +332,23 @@ async fn reconcile_roots(
         }
     };
 
-    let present: BTreeSet<PathBuf> = fingerprints
+    let present: BTreeSet<String> = fingerprints
         .iter()
-        .map(|fingerprint| fingerprint.path.clone())
+        .map(|fingerprint| path_key(&fingerprint.path))
         .collect();
     for root in roots {
-        match dependencies.cache.list_under(root).await {
+        // Rows are keyed by the spelling the filesystem reports, not the one typed in settings.
+        let root = match tokio::fs::canonicalize(root).await {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(root = %root.display(), %error, "watch root could not be resolved");
+                continue;
+            }
+        };
+        match dependencies.cache.list_under(&root).await {
             Ok(cached) => {
                 for file in cached {
-                    if !present.contains(&file.path) {
+                    if !present.contains(&path_key(&file.path)) {
                         prune(dependencies, &file.path).await;
                     }
                 }
@@ -388,7 +396,151 @@ async fn reconcile_roots(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
+    use mkvo_application::{MediaProbe, PortError};
+    use mkvo_domain::{ContainerMetadata, FileFingerprint, MediaFile, MediaStatus};
+
     use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// Stands in for mkvmerge and counts how often it is asked.
+    #[derive(Default)]
+    struct CountingProbe(AtomicUsize);
+
+    #[async_trait]
+    impl MediaProbe for CountingProbe {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let metadata =
+                std::fs::metadata(path).map_err(|error| PortError::Other(error.to_string()))?;
+            Ok(MediaFile {
+                path: path.to_path_buf(),
+                original_file_name: None,
+                watch_root: None,
+                relative_path: None,
+                fingerprint: FileFingerprint {
+                    path: path.to_path_buf(),
+                    size_bytes: metadata.len(),
+                    modified_at: metadata.modified().expect("modified").into(),
+                    quick_hash: None,
+                },
+                container: ContainerMetadata::default(),
+                tracks: Vec::new(),
+                attachments: Vec::new(),
+                episode: None,
+                provider_match: None,
+                status: MediaStatus::Ready,
+            })
+        }
+    }
+
+    struct Library {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        runtime: MkvoRuntime,
+        probe: Arc<CountingProbe>,
+    }
+
+    /// A watch root holding `names`, each one cached.
+    async fn library(names: &[&str]) -> Library {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in names {
+            std::fs::write(root.join(name), name.as_bytes()).unwrap();
+        }
+        let built = MkvoRuntimeBuilder::new(&root, directory.path().join("config"))
+            .app_name("test")
+            .disable_legacy_migration()
+            .authorized_root(&root, true)
+            .build()
+            .unwrap();
+        let probe = Arc::new(CountingProbe::default());
+        let mut dependencies = built.dependencies().clone();
+        dependencies.probe = probe.clone();
+        let runtime = MkvoRuntime::from_parts(built.config().clone(), dependencies);
+        refresh(runtime.dependencies(), &root, &BTreeSet::new()).await;
+        assert_eq!(probe.0.load(Ordering::SeqCst), names.len());
+        Library {
+            _directory: directory,
+            root,
+            runtime,
+            probe,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_prunes_deleted_files_without_probing_the_rest() {
+        let library = library(&["keep.mkv", "gone.mkv"]).await;
+        std::fs::remove_file(library.root.join("gone.mkv")).unwrap();
+
+        let dependencies = library.runtime.dependencies();
+        reconcile_roots(dependencies, &[library.root.clone()], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 1);
+        assert_eq!(library.probe.0.load(Ordering::SeqCst), 2);
+    }
+
+    /// Settings keep the root as typed, but cache rows carry the spelling the
+    /// filesystem reports; reconciliation must still find the rows to prune.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconciliation_prunes_under_a_root_typed_in_another_case() {
+        let library = library(&["keep.mkv", "gone.mkv"]).await;
+        std::fs::remove_file(library.root.join("gone.mkv")).unwrap();
+        let typed = PathBuf::from(format!(
+            "{}\\",
+            mkvo_domain::normalized_path_text(&library.root).to_uppercase()
+        ));
+
+        let dependencies = library.runtime.dependencies();
+        reconcile_roots(dependencies, &[typed], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 1);
+        assert_eq!(
+            library.probe.0.load(Ordering::SeqCst),
+            2,
+            "keep.mkv is not probed again"
+        );
+    }
+
+    /// A row whose path is spelled differently from the enumeration, as one a
+    /// rename carried over is, is the same file and must not be pruned.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconciliation_keeps_a_row_spelled_differently() {
+        let library = library(&["keep.mkv"]).await;
+        let dependencies = library.runtime.dependencies();
+        let path = library.root.join("keep.mkv");
+        let mut file = dependencies
+            .probe
+            .inspect(&path, CancellationToken::new())
+            .await
+            .unwrap();
+        file.path = mkvo_domain::normalized_path(&path);
+        dependencies.cache.upsert(&file).await.unwrap();
+        let probed = library.probe.0.load(Ordering::SeqCst);
+
+        reconcile_roots(dependencies, &[library.root.clone()], &BTreeSet::new()).await;
+
+        assert_eq!(dependencies.cache.count().await.unwrap(), 1);
+        assert_eq!(
+            library.probe.0.load(Ordering::SeqCst),
+            probed,
+            "keep.mkv is not probed again"
+        );
+    }
 
     #[test]
     fn only_supported_media_extensions_refresh() {
