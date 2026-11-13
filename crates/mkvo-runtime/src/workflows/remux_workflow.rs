@@ -555,9 +555,10 @@ impl MkvoRuntime {
                     context.record_completed().await?;
                 }
                 Err(error) => {
-                    journal.fail_item(&key, error.to_string());
-                    context.record_failed().await?;
+                    // A canceled file was not changed: it stays pending rather than failed.
                     if !matches!(error, ApplicationError::Canceled) {
+                        journal.fail_item(&key, error.to_string());
+                        context.record_failed().await?;
                         context
                             .log(JobLogLevel::Error, format!("{key}: {error}"))
                             .await?;

@@ -202,9 +202,10 @@ impl MkvoRuntime {
                     context.record_completed().await?;
                 }
                 Err(error) => {
-                    journal.fail_item(&key, error.to_string());
-                    context.record_failed().await?;
+                    // A canceled file was not changed: it stays pending rather than failed.
                     if !matches!(error, ApplicationError::Canceled) {
+                        journal.fail_item(&key, error.to_string());
+                        context.record_failed().await?;
                         context
                             .log(JobLogLevel::Error, format!("{key}: {error}"))
                             .await?;
@@ -310,14 +311,14 @@ mod execution_tests {
     use async_trait::async_trait;
     use mkvo_application::{PortError, ToolExecutionResult, ToolExecutor};
     use mkvo_contracts::{JobSnapshot, JobStatus};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
     use tokio_util::sync::CancellationToken;
 
     use super::super::remux_workflow::execution_tests::{Library, ScriptedTools, exited, library};
     use super::*;
 
-    async fn start_title_edit(library: &Library, files: Vec<MediaFile>) -> mkvo_domain::JobId {
-        let plan = PropertyEditPlanner
+    fn title_edit_plan(files: Vec<MediaFile>) -> PropertyEditPlan {
+        PropertyEditPlanner
             .build_plan(PropertyEditPlanRequest {
                 files,
                 source_access: BTreeMap::new(),
@@ -330,7 +331,10 @@ mod execution_tests {
                 expires_in_seconds: 60,
                 idempotency_key: IdempotencyKey::generate(),
             })
-            .expect("propedit plan");
+            .expect("propedit plan")
+    }
+
+    async fn start_title_edit(library: &Library, plan: PropertyEditPlan) -> mkvo_domain::JobId {
         library.runtime.persist_plan(&plan).await.expect("persist");
         library
             .start_job(JobKind::PropertyEdit, |runtime, context| async move {
@@ -340,7 +344,7 @@ mod execution_tests {
     }
 
     async fn run_title_edit(library: &Library, files: Vec<MediaFile>) -> JobSnapshot {
-        let id = start_title_edit(library, files).await;
+        let id = start_title_edit(library, title_edit_plan(files)).await;
         library.finished_job(id).await
     }
 
@@ -366,10 +370,19 @@ mod execution_tests {
     }
 
     /// An edit that stays in flight until released, and stops early if it is told to.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct HeldEdit {
         started: Arc<Notify>,
-        release: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+
+    impl HeldEdit {
+        fn new() -> Self {
+            Self {
+                started: Arc::default(),
+                release: Arc::new(Semaphore::new(0)),
+            }
+        }
     }
 
     #[async_trait]
@@ -383,25 +396,61 @@ mod execution_tests {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(PortError::Canceled),
-                () = self.release.notified() => Ok(exited(invocation, 0, "Done.\n")),
+                released = self.release.acquire() => {
+                    released.expect("open").forget();
+                    Ok(exited(invocation, 0, "Done.\n"))
+                }
             }
         }
     }
 
     #[tokio::test]
     async fn canceling_lets_the_edit_in_flight_finish() {
-        let tools = HeldEdit::default();
+        let tools = HeldEdit::new();
         let library = library(tools.clone());
         let episode = library.media("Episode 01.mkv").await;
 
-        let id = start_title_edit(&library, vec![episode]).await;
+        let id = start_title_edit(&library, title_edit_plan(vec![episode])).await;
         tools.started.notified().await;
         library.runtime.jobs().cancel(id).await.expect("cancel");
-        tools.release.notify_one();
+        tools.release.add_permits(1);
         let job = library.finished_job(id).await;
 
         assert_eq!(job.status, JobStatus::Canceled);
         assert_eq!((job.completed, job.failed), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn files_canceled_before_their_turn_are_not_failures() {
+        let tools = HeldEdit::new();
+        let library = library(tools.clone());
+        let mut files = Vec::new();
+        for name in ["Episode 01.mkv", "Episode 02.mkv", "Episode 03.mkv"] {
+            files.push(library.media(name).await);
+        }
+        let plan = title_edit_plan(files);
+        let key = plan.metadata.idempotency_key.clone();
+
+        let id = start_title_edit(&library, plan).await;
+        tools.started.notified().await;
+        library.runtime.jobs().cancel(id).await.expect("cancel");
+        tools.release.add_permits(3);
+        let job = library.finished_job(id).await;
+
+        assert_eq!(job.status, JobStatus::Canceled);
+        assert_eq!(job.failed, 0);
+        let journal = library
+            .runtime
+            .dependencies()
+            .journal
+            .get(&key)
+            .await
+            .expect("journal")
+            .expect("record");
+        let pending = mkvo_application::JournalItemStatus::Pending;
+        let failed = mkvo_application::JournalItemStatus::Failed;
+        assert!(journal.items.iter().any(|item| item.status == pending));
+        assert!(journal.items.iter().all(|item| item.status != failed));
     }
 
     #[tokio::test]
