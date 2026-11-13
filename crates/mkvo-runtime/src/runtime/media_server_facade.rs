@@ -620,6 +620,7 @@ mod media_server_credential_tests {
         paths: Arc<Mutex<Vec<String>>>,
         refuse_everything: Arc<AtomicBool>,
         forbid_libraries: Arc<AtomicBool>,
+        slow_first_answer: Arc<AtomicBool>,
     }
 
     impl FakeJellyfin {
@@ -632,6 +633,8 @@ mod media_server_credential_tests {
             let refusing = Arc::clone(&refuse_everything);
             let forbid_libraries = Arc::new(AtomicBool::new(false));
             let forbidding = Arc::clone(&forbid_libraries);
+            let slow_first_answer = Arc::new(AtomicBool::new(false));
+            let slow = Arc::clone(&slow_first_answer);
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let mut reader = BufReader::new(stream);
@@ -651,6 +654,9 @@ mod media_server_credential_tests {
                         line.clear();
                     }
                     seen.lock().expect("path log").push(path.clone());
+                    if slow.swap(false, Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                     let (status, content_type, body) = if !authorized
                         || refusing.load(Ordering::SeqCst)
                     {
@@ -688,6 +694,7 @@ mod media_server_credential_tests {
                 paths,
                 refuse_everything,
                 forbid_libraries,
+                slow_first_answer,
             }
         }
 
@@ -1047,6 +1054,80 @@ mod media_server_credential_tests {
             .get_library_artwork(artwork_request(&server))
             .await
             .expect("artwork still works with this key");
+    }
+
+    /// Server ids the facade warned about. Process-wide on purpose: tracing
+    /// caches whether a callsite is enabled per process, so a per-test
+    /// subscriber misses events when another test reached the callsite first.
+    static WARNED_SERVERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct RejectionWarnings;
+
+    impl tracing::Subscriber for RejectionWarnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+                && metadata.target().ends_with("media_server_facade")
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct ServerId(Option<String>);
+            impl tracing::field::Visit for ServerId {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "server_id" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut server_id = ServerId(None);
+            event.record(&mut server_id);
+            WARNED_SERVERS
+                .lock()
+                .expect("warning log")
+                .extend(server_id.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A poster grid asks for its posters at once. The ones already on their
+    /// way when the first 401 arrives are not held back, so the server can
+    /// still see one request per card; the log line is what must stay single.
+    #[tokio::test]
+    async fn concurrent_refusals_are_logged_once() {
+        static CAPTURE: std::sync::Once = std::sync::Once::new();
+        CAPTURE.call_once(|| {
+            tracing::subscriber::set_global_default(RejectionWarnings)
+                .expect("no other global subscriber in this test binary");
+        });
+        let jellyfin = FakeJellyfin::start();
+        let host = host();
+        let server = save_server(&host.runtime, None, &jellyfin.url, Some("wrong")).await;
+        jellyfin.slow_first_answer.store(true, Ordering::SeqCst);
+
+        let results = futures::future::join_all(
+            (0..8).map(|_| host.runtime.get_library_artwork(artwork_request(&server))),
+        )
+        .await;
+
+        for result in results {
+            let error = result.expect_err("refused key");
+            assert_eq!(error.code, ApiErrorCode::CredentialRejected);
+        }
+        let warnings = WARNED_SERVERS
+            .lock()
+            .expect("warning log")
+            .iter()
+            .filter(|id| **id == server.id)
+            .count();
+        assert_eq!(warnings, 1);
     }
 
     #[tokio::test]
