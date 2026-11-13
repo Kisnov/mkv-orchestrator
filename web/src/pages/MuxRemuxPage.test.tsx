@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { buildRemovedTrackDetails, MuxRemuxPage } from "./MuxRemuxPage";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, MuxPreviewRequest, WebSettings } from "../generated/contracts";
+import type { MediaFileRow, MuxPreviewRequest, MuxPreviewResponse, WebSettings } from "../generated/contracts";
 
 function mediaFile(name: string): MediaFileRow {
   return {
@@ -366,7 +366,7 @@ it("asks to delete MP4s only while conversion is on", async () => {
   const mp4 = { ...mediaFile("Movie.mp4"), extension: ".mp4", reader: "ffprobe" };
   const files = [mkv, mp4];
   const scan = { updatedUtc: "2026-11-13T10:00:00Z", files, selectedPaths: files.map((file) => file.path), summary: { total: 2, mkv: 1, mp4: 1, failed: 0, cached: 0 } };
-  const buildMuxPreview = vi.fn((_request: MuxPreviewRequest) => Promise.resolve({ actions: [], noChangeFiles: [], summary: "", status: "Preview ready", planId: null, planFingerprint: null, idempotencyKey: null }));
+  const buildMuxPreview = vi.fn<(request: MuxPreviewRequest) => Promise<MuxPreviewResponse>>(() => Promise.resolve({ actions: [], noChangeFiles: [], summary: "", status: "Preview ready", planId: null, planFingerprint: null, idempotencyKey: null }));
   renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow="convert" /></MediaLibraryProvider>, {
     getCurrentScanFiles: () => Promise.resolve(scan),
     getWebSettings: () => Promise.resolve({ mkvMergeDefaultAudioLanguages: "eng", mkvMergeDefaultSubtitleLanguages: "eng" } as WebSettings),
