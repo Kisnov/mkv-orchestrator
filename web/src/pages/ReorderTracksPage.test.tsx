@@ -103,7 +103,8 @@ it("opens with every MKV in the batch whatever was selected before", async () =>
 
   await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select 03.mkv" })).toBeChecked());
   expect(screen.getByRole("checkbox", { name: "Select 01.mkv" })).toBeChecked();
-  expect(screen.getByRole("button", { name: "Apply Changes" })).toBeEnabled();
+  // The template is chosen one render after the files arrive.
+  await waitFor(() => expect(screen.getByRole("button", { name: "Apply Changes" })).toBeEnabled());
   expect(selected).toEqual(["/media/01.mkv", "/media/02.mkv", "/media/03.mkv"]);
 });
 
