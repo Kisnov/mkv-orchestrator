@@ -60,6 +60,8 @@ impl MkvoRuntime {
     /// restarts the backend through `SettingsService`, which this supervisor's
     /// subscription survives because it holds a receiver rather than a handle.
     pub async fn start_watchers(&self) -> RuntimeResult<WatchStartReport> {
+        // Every host calls this once at startup, whether or not it watches.
+        self.spawn_history_pruning();
         let settings = self.settings_service().load().await?.settings;
         let Some(watcher) = self.dependencies().watcher.clone() else {
             return Ok(WatchStartReport {

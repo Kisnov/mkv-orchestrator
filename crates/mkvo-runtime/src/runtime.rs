@@ -48,6 +48,7 @@ mod media_servers;
 mod metadata_facade;
 mod migration_facade;
 mod recovery;
+mod retention;
 mod runtime_support;
 mod scan_facade;
 mod scan_state;
@@ -185,11 +186,7 @@ pub struct LogExport {
     pub content: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecentJobsResponse {
-    pub jobs: Vec<JobSnapshot>,
-}
+pub use mkvo_contracts::RecentJobsResponse;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

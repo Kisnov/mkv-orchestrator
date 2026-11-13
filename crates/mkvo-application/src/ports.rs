@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mkvo_contracts::{JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, ToolStatus};
+use mkvo_contracts::{
+    JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, RecentJob, ToolStatus,
+};
 use mkvo_domain::{
     AppSettings, EpisodeMetadata, FileFingerprint, IdempotencyKey, MediaFile, MediaServerKind,
     MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchId,
@@ -210,10 +212,20 @@ pub trait JobRepository: Send + Sync {
         &self,
         key: &IdempotencyKey,
     ) -> Result<Option<JobSnapshot>, PortError>;
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError>;
+    /// The most recently updated jobs, without their result payloads.
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError>;
     /// Jobs that have not reached a terminal status.
     async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError>;
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError>;
+    /// Delete the history that finished before `cutoff`: terminal jobs with
+    /// their events and journals, finished journals of operations that had no
+    /// job, and operation logs. With or without a cutoff, also clear what
+    /// older builds stored and nothing reads: job events other than the one
+    /// that ended the job, and the file lists inside scan results. Returns
+    /// the rows deleted. A store that keeps no history has nothing to delete.
+    async fn prune_history(&self, _cutoff: Option<DateTime<Utc>>) -> Result<u64, PortError> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -222,6 +234,8 @@ pub trait RenameHistoryRepository: Send + Sync {
     async fn get(&self, id: RenameBatchId) -> Result<Option<RenameBatchRecord>, PortError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<RenameBatchRecord>, PortError>;
     async fn mark_undone(&self, id: RenameBatchId, at: DateTime<Utc>) -> Result<(), PortError>;
+    /// Forget the batches applied before `before`; they can no longer be undone.
+    async fn remove_before(&self, before: DateTime<Utc>) -> Result<u64, PortError>;
     async fn clear(&self) -> Result<u64, PortError>;
 }
 

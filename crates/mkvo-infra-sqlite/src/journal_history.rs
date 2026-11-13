@@ -134,6 +134,16 @@ impl SqliteStore {
         )? > 0)
     }
 
+    /// Delete the batches applied before `cutoff_ms`, entries included.
+    pub fn delete_rename_batches_before(&self, cutoff_ms: i64) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let removed = connection.execute(
+            "DELETE FROM rename_batches WHERE created_at_ms < ?1",
+            [cutoff_ms],
+        )?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
     pub fn clear_rename_batches(&self) -> StoreResult<u64> {
         let connection = self.connection()?;
         let removed = connection.execute("DELETE FROM rename_batches", [])?;

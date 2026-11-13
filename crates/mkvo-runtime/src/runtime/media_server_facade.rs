@@ -521,7 +521,7 @@ impl MkvoRuntime {
         limit: Option<usize>,
     ) -> RuntimeResult<RecentJobsResponse> {
         let limit = limit.unwrap_or(50).clamp(1, 500);
-        let jobs = self.inner.dependencies.jobs.list_recent(limit).await?;
+        let jobs = self.inner.jobs.list_recent(limit).await?;
         Ok(RecentJobsResponse { jobs })
     }
 }

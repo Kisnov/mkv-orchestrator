@@ -498,6 +498,27 @@ export interface PropEditTrackConfigRow {
   "editedLanguage": string;
 }
 
+export interface RecentJob {
+  "id": string;
+  "kind": JobKind;
+  "status": JobStatus;
+  "createdUtc": string;
+  "startedUtc"?: string | null;
+  "completedUtc"?: string | null;
+  "completed": number;
+  "failed": number;
+  "skipped": number;
+  "total": number;
+  "currentFile": string;
+  "currentFilePercent": number;
+  "summary": string;
+  "error"?: string | null;
+}
+
+export interface RecentJobsResponse {
+  "jobs": Array<RecentJob>;
+}
+
 export type RemuxMode = "remux" | "convert_to_mkv" | "mux_subtitles" | "extract_subtitles";
 
 export interface RemuxPreviewRequest {
@@ -931,6 +952,8 @@ export interface ContractTypes {
   PropEditTemplateRequest: PropEditTemplateRequest;
   PropEditTemplateResponse: PropEditTemplateResponse;
   PropEditTrackConfigRow: PropEditTrackConfigRow;
+  RecentJob: RecentJob;
+  RecentJobsResponse: RecentJobsResponse;
   RemuxMode: RemuxMode;
   RemuxPreviewRequest: RemuxPreviewRequest;
   RenameApplyRequest: RenameApplyRequest;
@@ -1058,6 +1081,8 @@ export const contractSchemas: Record<ContractName, ContractSchema> = {
   PropEditTemplateRequest: { kind: "object", fields: { "files": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "MediaFileRow" } } }, "templatePath": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },
   PropEditTemplateResponse: { kind: "object", fields: { "templatePath": { optional: false, schema: { kind: "string" } }, "templateFileName": { optional: false, schema: { kind: "string" } }, "audioTracks": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "PropEditTrackConfigRow" } } }, "subtitleTracks": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "PropEditTrackConfigRow" } } }, "defaultAudio": { optional: false, schema: { kind: "string" } }, "forcedAudio": { optional: false, schema: { kind: "string" } }, "defaultSubtitle": { optional: false, schema: { kind: "string" } }, "forcedSubtitle": { optional: false, schema: { kind: "string" } } }, flatten: [] },
   PropEditTrackConfigRow: { kind: "object", fields: { "trackNumber": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "trackLabel": { optional: false, schema: { kind: "string" } }, "type": { optional: false, schema: { kind: "string" } }, "currentName": { optional: false, schema: { kind: "string" } }, "currentLanguage": { optional: false, schema: { kind: "string" } }, "currentCodec": { optional: false, schema: { kind: "string" } }, "currentChannels": { optional: false, schema: { kind: "union", variants: [{ kind: "number", integer: true, unsigned: true }, { kind: "null" }] } }, "currentDefault": { optional: false, schema: { kind: "boolean" } }, "editedName": { optional: false, schema: { kind: "string" } }, "nameFromMetadata": { optional: false, schema: { kind: "boolean" } }, "nameFromChannels": { optional: true, schema: { kind: "union", variants: [{ kind: "boolean" }, { kind: "null" }] } }, "nameFromCodecChannels": { optional: true, schema: { kind: "union", variants: [{ kind: "boolean" }, { kind: "null" }] } }, "editedLanguage": { optional: false, schema: { kind: "string" } } }, flatten: [] },
+  RecentJob: { kind: "object", fields: { "id": { optional: false, schema: { kind: "string" } }, "kind": { optional: false, schema: { kind: "ref", name: "JobKind" } }, "status": { optional: false, schema: { kind: "ref", name: "JobStatus" } }, "createdUtc": { optional: false, schema: { kind: "string" } }, "startedUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "completedUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "completed": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "failed": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "skipped": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "total": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "currentFile": { optional: false, schema: { kind: "string" } }, "currentFilePercent": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "summary": { optional: false, schema: { kind: "string" } }, "error": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },
+  RecentJobsResponse: { kind: "object", fields: { "jobs": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "RecentJob" } } } }, flatten: [] },
   RemuxMode: { kind: "union", variants: [{ kind: "literal", value: "remux" }, { kind: "literal", value: "convert_to_mkv" }, { kind: "literal", value: "mux_subtitles" }, { kind: "literal", value: "extract_subtitles" }] },
   RemuxPreviewRequest: { kind: "object", fields: { "mode": { optional: false, schema: { kind: "ref", name: "RemuxMode" } }, "files": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "MediaFileDto" } } }, "selectedPaths": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "keepAudioLanguages": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "keepSubtitleLanguages": { optional: false, schema: { kind: "array", item: { kind: "string" } } }, "removeTrackIds": { optional: false, schema: { kind: "array", item: { kind: "number", integer: true, unsigned: true } } }, "preserveChapters": { optional: false, schema: { kind: "boolean" } }, "preserveAttachments": { optional: false, schema: { kind: "boolean" } }, "deleteSourceAfterSuccess": { optional: false, schema: { kind: "boolean" } }, "expiresInSeconds": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "idempotencyKey": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },
   RenameApplyRequest: { kind: "object", fields: { "items": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "RenamePreviewRow" } } }, "provider": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "template": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "planId": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "planFingerprint": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "idempotencyKey": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },

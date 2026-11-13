@@ -4,16 +4,19 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use mkvo_application::ScanOutcome;
 use mkvo_contracts::{CurrentScanResponse, JobSnapshot, MediaFileRow, ScanSummary};
-use mkvo_domain::MediaFile;
+use mkvo_domain::{JobId, MediaFile};
 use serde::{Deserialize, Serialize};
 
 use super::display_path;
 
+/// Skipped paths kept in a scan's job result; the summary has the full count.
+const MAX_STORED_SKIPS: usize = 500;
+
+/// What a finished scan leaves in its job. The files are not here: they live
+/// in the working set only, however large the library is.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ScanResultState {
-    pub(super) files: Vec<MediaFile>,
-    pub(super) rows: Vec<MediaFileRow>,
     pub(super) skipped: Vec<String>,
     pub(super) summary: ScanSummary,
 }
@@ -21,6 +24,9 @@ pub(super) struct ScanResultState {
 #[derive(Clone, Debug, Default)]
 pub(super) struct CurrentScanState {
     pub(super) updated_utc: Option<DateTime<Utc>>,
+    /// The scan that produced `files`. Its status response serves them from
+    /// here; once it loses them they are handed to its job instead.
+    pub(super) scan_job: Option<JobId>,
     pub(super) files: Vec<MediaFile>,
     pub(super) summary: ScanSummary,
     /// Selected paths are normalized so equivalent Windows spellings match.
@@ -30,10 +36,15 @@ pub(super) struct CurrentScanState {
 impl CurrentScanState {
     /// Replace the working set after a scan, selecting every file the first
     /// time a working set is populated. Later rescans preserve an explicit
-    /// user selection, including a deliberate empty selection.
-    pub(super) fn apply_scan(&mut self, files: Vec<MediaFile>, summary: ScanSummary) {
+    /// user selection, including a deliberate empty selection. Returns the
+    /// files it replaced.
+    pub(super) fn apply_scan(
+        &mut self,
+        files: Vec<MediaFile>,
+        summary: ScanSummary,
+    ) -> Vec<MediaFile> {
         let is_initial_scan = self.files.is_empty() && self.selected.is_empty();
-        self.files = files;
+        let replaced = std::mem::replace(&mut self.files, files);
         self.summary = summary;
         if is_initial_scan {
             self.selected = self
@@ -44,6 +55,7 @@ impl CurrentScanState {
         } else {
             self.reconcile_selection();
         }
+        replaced
     }
 
     /// Move the authoritative working set and selection with completed renames.
@@ -88,14 +100,18 @@ impl CurrentScanState {
 }
 
 pub(super) fn scan_result_state(outcome: &ScanOutcome) -> ScanResultState {
+    let mut skipped: Vec<String> = outcome
+        .skipped
+        .iter()
+        .take(MAX_STORED_SKIPS)
+        .map(|skip| format!("{}: {}", skip.path.display(), skip.reason))
+        .collect();
+    let hidden = outcome.skipped.len().saturating_sub(MAX_STORED_SKIPS);
+    if hidden > 0 {
+        skipped.push(format!("... and {hidden} more"));
+    }
     ScanResultState {
-        files: outcome.files.clone(),
-        rows: outcome.files.iter().map(MediaFileRow::from).collect(),
-        skipped: outcome
-            .skipped
-            .iter()
-            .map(|skip| format!("{}: {}", skip.path.display(), skip.reason))
-            .collect(),
+        skipped,
         summary: outcome.summary,
     }
 }
@@ -110,5 +126,6 @@ pub(super) fn current_scan_response(state: &CurrentScanState) -> CurrentScanResp
 }
 
 pub(super) fn scan_state_from_snapshot(snapshot: &JobSnapshot) -> Option<ScanResultState> {
-    serde_json::from_value(snapshot.result.clone()?).ok()
+    // Read in place: a result stored by an older build also holds every file.
+    ScanResultState::deserialize(snapshot.result.as_ref()?).ok()
 }
