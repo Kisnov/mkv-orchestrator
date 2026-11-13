@@ -205,19 +205,32 @@ pub async fn check_origin(State(auth): State<AuthState>, request: Request, next:
     let refused = !request.method().is_safe()
         && headers.get(header::ORIGIN).is_some_and(|origin| {
             let origin = origin.to_str().unwrap_or_default();
-            let authority = origin
-                .strip_prefix("https://")
-                .or_else(|| origin.strip_prefix("http://"))
-                .unwrap_or_default();
-            let served_as = [header::HOST.as_str(), "x-forwarded-host"]
+            let (authority, default_port) = match origin.strip_prefix("https://") {
+                Some(authority) => (authority, "443"),
+                None => (origin.strip_prefix("http://").unwrap_or_default(), "80"),
+            };
+            let port_of = |authority| port(authority).unwrap_or(default_port);
+            let served_as: Vec<_> = [header::HOST.as_str(), "x-forwarded-host"]
                 .into_iter()
                 .filter_map(|name| headers.get(name)?.to_str().ok())
-                .map(|value| value.split(',').next().unwrap_or_default().trim());
+                .map(|value| value.split(',').next().unwrap_or_default().trim())
+                .collect();
+            let (name, origin_port) = (hostname(authority), port_of(authority));
+            // A listed name must also match the port: "name:port" exactly, a bare name
+            // only on the port MKVO is served on, so other apps on that host stay out.
+            let listed = auth.allowed_hosts.iter().any(|entry| {
+                entry == "*"
+                    || hostname(entry).eq_ignore_ascii_case(name)
+                        && port(entry).map_or_else(
+                            || served_as.iter().any(|host| port_of(host) == origin_port),
+                            |port| port == origin_port,
+                        )
+            });
             authority.is_empty()
                 || !(served_as
-                    .into_iter()
+                    .iter()
                     .any(|host| host.eq_ignore_ascii_case(authority))
-                    || auth.listed_host(hostname(authority)))
+                    || listed)
         });
     if refused {
         return error(
@@ -234,6 +247,17 @@ fn request_host(request: &Request) -> Option<&str> {
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .or_else(|| request.uri().host())
+}
+
+/// The port of `host[:port]`, if it names one.
+fn port(authority: &str) -> Option<&str> {
+    let tail = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']')?.1,
+        None => authority,
+    };
+    tail.rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// The host name of `host[:port]`, without IPv6 brackets.
@@ -477,7 +501,7 @@ impl AuthState {
     fn listed_host(&self, host: &str) -> bool {
         self.allowed_hosts
             .iter()
-            .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(host))
+            .any(|allowed| allowed == "*" || hostname(allowed).eq_ignore_ascii_case(host))
     }
 
     /// IP addresses and localhost always work; other names must be listed.

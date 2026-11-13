@@ -63,7 +63,7 @@ MKVO_SOURCE_ROOTS=downloads=/downloads
 | `MKVO_AUTH_ENABLED` | true | In-app administrator login. False gives everyone who can reach MKVO full access, including reverse-proxy visitors, and needs `MKVO_ALLOW_NO_LOGIN=true` as well. |
 | `MKVO_ALLOW_NO_LOGIN` | false | Confirms running without login on a non-loopback address; otherwise the server refuses to start. |
 | `MKVO_USERNAME` / `MKVO_PASSWORD` | admin / generated | Use a password of at least 12 characters. Blank generates one in `/config/admin-password.txt`, replaced by `admin-password.hash` after the first sign-in. Never publish either file. |
-| `MKVO_ALLOWED_HOSTS` | unset | Extra host names (comma separated) accepted without login and as request origins; IP addresses and `localhost` always work. Needed for a host name with login off, or behind a proxy that rewrites `Host`. |
+| `MKVO_ALLOWED_HOSTS` | unset | Extra host names (comma separated, `name` or `name:port`) accepted without login and as request origins; a bare name matches origins only on the port MKVO is served on, and `*` turns the checks off; IP addresses and `localhost` always work. Needed for a host name with login off, or behind a proxy that rewrites `Host`. |
 | `MKVO_TOOL_DIRECTORIES` | unset | Directories the Settings page may choose for MKVToolNix/FFmpeg. The image finds its bundled tools on its own, so leave the Settings fields blank; any other directory is refused. |
 | `RUST_LOG` | `info` in compose and Unraid, errors only otherwise | Log level. At `info` the startup log names the file that holds the generated password. |
 | `MKVO_SECURE_COOKIES` | false | Enable for HTTPS; leave false for plain HTTP. A proxy sending `X-Forwarded-Proto: https` gets a Secure cookie anyway. |

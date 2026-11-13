@@ -725,10 +725,34 @@ mod tests {
     #[tokio::test]
     async fn state_changes_from_another_origin_are_refused() {
         let mut host = TestHost::new(None);
-        Arc::get_mut(&mut host.config).unwrap().allowed_hosts = vec!["nas.local".to_owned()];
+        Arc::get_mut(&mut host.config).unwrap().allowed_hosts =
+            vec!["nas.local".to_owned(), "mkvo.example.com:443".to_owned()];
         let router = host.router();
         for (headers, expected) in [
             (vec![], StatusCode::OK),
+            // A listed name without a port only matches on the port MKVO is served on,
+            // so another app on the same NAS cannot borrow it.
+            (
+                vec![
+                    ("Host", "10.0.0.2:8886"),
+                    ("Origin", "http://nas.local:9000"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![
+                    ("Host", "127.0.0.1:8080"),
+                    ("Origin", "https://mkvo.example.com"),
+                ],
+                StatusCode::OK,
+            ),
+            (
+                vec![
+                    ("Host", "127.0.0.1:8080"),
+                    ("Origin", "https://mkvo.example.com:8443"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
             (
                 vec![
                     ("Host", "192.168.1.10:8886"),

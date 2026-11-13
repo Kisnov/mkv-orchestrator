@@ -104,8 +104,14 @@ host that can reach the published port is trusted.
   `Origin` header must come from the host the page was served from: the
   `Host` header, or `X-Forwarded-Host` behind a proxy. A proxy that rewrites
   `Host` without sending `X-Forwarded-Host` needs the public name listed in
-  `MKVO_ALLOWED_HOSTS` (comma separated; `*` turns the Host and Origin checks
-  off). Clients without `Origin`, such as curl, are unaffected.
+  `MKVO_ALLOWED_HOSTS` with its public port, for example
+  `mkvo.example.com:443`. A listed name without a port is accepted as an origin
+  only on the port MKVO is being served on, so another web app on the same
+  host (say `http://nas.local:9000`) cannot send requests with your session.
+  Clients without `Origin`, such as curl, are unaffected.
+- `MKVO_ALLOWED_HOSTS=*` switches both checks off: any web page you visit can
+  then send requests to MKVO from your browser, and with login off a rebinding
+  page can read and change everything. Use it only on a network you fully trust.
 - Every response carries `Content-Security-Policy` (same-origin scripts only,
   no framing), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and
   `Referrer-Policy: same-origin`.
