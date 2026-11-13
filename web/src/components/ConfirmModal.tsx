@@ -8,6 +8,7 @@ type ConfirmModalProps = {
   onClose: () => void;
 };
 
+// Focus trap and Escape come from useOverlayAccessibility, which Layout mounts.
 export function ConfirmModal({ title, message, confirmLabel, onConfirm, onClose }: ConfirmModalProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-6">
