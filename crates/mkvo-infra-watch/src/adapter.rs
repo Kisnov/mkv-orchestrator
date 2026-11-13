@@ -258,6 +258,20 @@ impl FileSystem for LocalFileSystem {
             .authorize_existing(target, AccessMode::Write)
             .map_err(path_port_error)?
             .into_path_buf();
+        // After the rename no other copy exists, so the new data has to be on disk before it.
+        let flushed = async {
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .await?;
+            file.sync_all().await
+        };
+        flushed.await.map_err(|error| {
+            PortError::Other(format!(
+                "could not flush `{}` to disk: {error}",
+                source.display()
+            ))
+        })?;
         // A rename onto an existing file swaps it atomically on POSIX and on NTFS.
         tokio::fs::rename(&source, &target).await.map_err(|error| {
             PortError::Other(format!(
