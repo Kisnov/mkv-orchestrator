@@ -39,11 +39,12 @@ export function ReorderTracksPage() {
       setPreviewResult(null);
       setSelectedDetailPath("");
     } else if (initializedSelectionScope.current !== scope) {
+      const opening = initializedSelectionScope.current === "";
       initializedSelectionScope.current = scope;
       const mkvPaths = (isWorkingView ? files : scan.files).filter((file) => file.extension.toLowerCase() === ".mkv").map((file) => file.path);
       const known = new Set(mkvPaths.map(normalizePath));
-      // A new scan only starts as the full batch when nothing is selected yet.
-      if (!selectedPaths.some((path) => known.has(normalizePath(path)))) setSelectedPaths(mkvPaths);
+      // Opening the page starts a full batch; a later scan keeps the selection unless none of it is left.
+      if (opening || !selectedPaths.some((path) => known.has(normalizePath(path)))) setSelectedPaths(mkvPaths);
     }
   }, [currentScan.data, isWorkingView]);
 
@@ -121,7 +122,7 @@ export function ReorderTracksPage() {
           <div className="mt-3 flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3" aria-label="Operation actions">
             <button type="button" onClick={() => { setIsSummaryExpanded(true); runPreview(); }} disabled={busy || !canRun} className="h-9 min-w-0 flex-1 rounded-md border border-border bg-button px-1.5 text-xs font-semibold disabled:text-disabled">Preview Summary</button>
             <button type="button" onClick={runApply} disabled={busy || !canRun} className="h-9 min-w-0 flex-1 rounded-md bg-accent px-1.5 text-xs font-semibold disabled:bg-button disabled:text-disabled">Apply Changes</button>
-            <span className="w-full text-xs text-muted">{selectedMkvPaths.length} files selected</span><span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
+            <span className="w-full text-xs text-muted">{selectedMkvPaths.length} files selected</span>{template && !canRun ? <span className="w-full text-xs text-warning">The template file is not in the batch. Check it in the list to continue.</span> : null}<span role="status" className="w-full min-w-0 break-words text-xs text-muted [overflow-wrap:anywhere]">{statusText}</span>
           </div>
         </section>
 
