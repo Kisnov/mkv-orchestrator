@@ -331,6 +331,11 @@ export function SettingsPage() {
           ? { ...server, hasApiKey: match.hasApiKey, apiKey: clearIfStored(match.hasApiKey, sentKey)(server.apiKey ?? "") }
           : server;
       }));
+      // Dashboard keeps each server's last connection check; a new key or address makes it stale.
+      const address = (servers: WebSettings["mediaServers"] | undefined) => JSON.stringify(servers?.map((server) => [server.id, server.serverUrl, server.hasApiKey]));
+      if (sent.mediaServers?.some((server) => server.apiKey) || address(previous?.mediaServers) !== address(saved.mediaServers)) {
+        void queryClient.invalidateQueries({ queryKey: ["media-server-check"] });
+      }
       const droppedKeys = saved.mediaServers.filter((server) =>
         !server.hasApiKey && previous?.mediaServers.some((item) => item.id === server.id && item.hasApiKey));
       if (droppedKeys.length > 0) {
