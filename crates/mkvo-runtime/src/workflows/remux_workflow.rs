@@ -3062,7 +3062,8 @@ pub(super) mod execution_tests {
         };
         let tv = root.join("tv");
         let at = |name: &str| tv.join(name);
-        // Ep 01 was being remuxed; Ep 02 lost its original in the replace; Ep 03 completed;
+        // Ep 01 was being remuxed; Ep 02 lost its original in the replace (an extraction never
+        // holds the only copy, so its subtitle temp goes either way); Ep 03 completed;
         // Ep 04's journal is a property edit; Ep 05 is in use by a job started after startup.
         for name in [
             "Ep 04.mkv",
@@ -3077,6 +3078,7 @@ pub(super) mod execution_tests {
             "Ep 01.eng.2.srt",
             ".Ep 01.eng.2.srt.mkvo-extract-2.tmp",
             ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
+            ".Ep 03.eng.2.srt.mkvo-extract-2.tmp",
             ".Other.mkv.mkvo-remux.tmp",
         ] {
             write(at(name));
@@ -3090,6 +3092,7 @@ pub(super) mod execution_tests {
             "Ep 05.mkv",
             "Ep 01.eng.2.srt",
             "Ep 02.eng.2.srt",
+            "Ep 03.eng.2.srt",
         ]
         .map(at)
         .into_iter()
@@ -3140,8 +3143,8 @@ pub(super) mod execution_tests {
         assert_eq!(
             names_in(&tv),
             [
-                ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
                 ".Ep 02.mkv.mkvo-remux.tmp",
+                ".Ep 03.eng.2.srt.mkvo-extract-2.tmp",
                 ".Ep 03.mkv.mkvo-remux.tmp",
                 ".Ep 04.mkv.mkvo-remux.tmp",
                 ".Ep 05.mkv.mkvo-remux.tmp",

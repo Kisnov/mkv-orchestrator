@@ -370,15 +370,29 @@ impl MkvoRuntime {
                 continue;
             }
             let temporary = folder.join(name);
-            // An extraction temporary is keyed by the subtitle it replaces, not the item.
-            let completed = !extraction
-                && claimants
-                    .iter()
-                    .flat_map(|journal| &journal.items)
-                    .any(|item| {
-                        item.status == mkvo_application::JournalItemStatus::Completed
-                            && mkvo_domain::path_key(Path::new(&item.key)) == key
-                    });
+            let mut items = claimants.iter().flat_map(|journal| &journal.items);
+            let completed = if extraction {
+                // A subtitle is named after its source: "Ep 01.eng.2.srt" belongs to "Ep 01.mkv".
+                let subtitle = original.file_name().unwrap_or_default().to_string_lossy();
+                let source = items
+                    .filter(|item| {
+                        let source = Path::new(&item.key);
+                        same_path(source.parent().unwrap_or(source), folder)
+                            && source.file_stem().is_some_and(|stem| {
+                                subtitle.starts_with(&format!("{}.", stem.to_string_lossy()))
+                            })
+                    })
+                    .max_by_key(|item| item.key.len());
+                let Some(source) = source else {
+                    continue;
+                };
+                source.status == mkvo_application::JournalItemStatus::Completed
+            } else {
+                items.any(|item| {
+                    item.status == mkvo_application::JournalItemStatus::Completed
+                        && mkvo_domain::path_key(Path::new(&item.key)) == key
+                })
+            };
             if completed {
                 tracing::warn!(path = %temporary.display(), "an interrupted job left this file; it was kept");
                 continue;
@@ -391,7 +405,8 @@ impl MkvoRuntime {
             let removal =
                 self.jobs()
                     .with_resource_lease(&claims, CancellationToken::new(), || async {
-                        if !file_system.exists(&original).await.unwrap_or(false) {
+                        // Extraction only reads the source, so its temporary is never the only copy.
+                        if !extraction && !file_system.exists(&original).await.unwrap_or(false) {
                             return Ok(false);
                         }
                         file_system.remove_file(&temporary).await?;
