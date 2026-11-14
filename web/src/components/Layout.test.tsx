@@ -40,6 +40,47 @@ describe("global operation status", () => {
   });
 });
 
+describe("several jobs at once", () => {
+  const status = { name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [], contractVersion: 1 };
+  const operationJob = (id: string) => ({
+    id, kind: "Remux", status: "Running" as const, createdUtc: "2026-11-14T10:00:00Z", startedUtc: null, completedUtc: null,
+    completed: 1, failed: 0, skipped: 0, total: 4, currentFile: "", currentFilePercent: 0, lines: [], muxResult: null, propEditResult: null, error: ""
+  });
+  const recentJob = (id: string, kind: "scan" | "property_edit", completed: number, total: number) => ({
+    id, kind, status: "Running" as const, createdUtc: "2026-11-14T10:00:00Z", completed, failed: 0, skipped: 0, total, currentFile: "", currentFilePercent: 0, summary: ""
+  });
+  const page = <MediaLibraryProvider><Routes><Route element={<Layout />}><Route path="*" element={<div>Any route</div>} /></Route></Routes></MediaLibraryProvider>;
+
+  it("lists the jobs this tab started and the running ones only the backend knows", async () => {
+    window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "edit", label: "Edit Tracks" }, { id: "reorder", label: "Reorder Tracks" }]));
+    renderWithBackend(page, {
+      getStatus: () => Promise.resolve(status),
+      getOperationJob: (id) => Promise.resolve(operationJob(id)),
+      listRecentJobs: () => Promise.resolve({ jobs: [recentJob("scan-1", "scan", 12, 128), recentJob("edit", "property_edit", 1, 4)] })
+    });
+
+    const sidebar = within(screen.getByRole("complementary"));
+    expect(await sidebar.findByText("Edit Tracks: 1/4")).toBeInTheDocument();
+    expect(sidebar.getByText("Reorder Tracks: 1/4")).toBeInTheDocument();
+    expect(await sidebar.findByText("Scan: 12/128")).toBeInTheDocument();
+    // The backend lists the tracked job too; it is the same job.
+    expect(sidebar.getAllByText(/Edit Tracks: /)).toHaveLength(1);
+  });
+
+  it("marks Dashboard in the folded sidebar while a job runs", async () => {
+    window.localStorage.setItem("mkvo.sidebar.collapsed", "true");
+    renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.resolve({ jobs: [recentJob("scan-1", "scan", 12, 128)] }) });
+
+    await waitFor(() => expect(screen.getByRole("link", { name: "Dashboard" }).querySelector("[data-running]")).not.toBeNull());
+  });
+
+  it("stays ready when the job list cannot be read", async () => {
+    renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.reject(new ApiError("down", { code: "internal", status: 500 })) });
+
+    expect(await screen.findByText("ready")).toBeInTheDocument();
+  });
+});
+
 
 it("navigates from the mobile menu and closes it after changing routes", async () => {
   const user = userEvent.setup();

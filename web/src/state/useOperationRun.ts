@@ -4,6 +4,7 @@ import { useMutation } from "@tanstack/react-query";
 import { cancelOperationJob, type OperationJobResponse } from "../api";
 import { createLocalId } from "../lib/localId";
 import { useOperationJob } from "./OperationJobContext";
+import { activeJobStatuses } from "./useRecentJobs";
 
 type Plan = { actions: unknown[]; status: string; planId: string | null; planFingerprint: string | null; idempotencyKey: string | null };
 type PlannedRequest = { planId?: string | null; planFingerprint?: string | null; idempotencyKey?: string | null };
@@ -24,7 +25,7 @@ export type OperationRunOptions<Request, Result extends Plan> = {
   onPreview?: (plan: Result, request: Request) => void;
 };
 
-export const activeStatuses = new Set(["Running", "Queued", "WaitingForResources", "Canceling"]);
+export { activeJobStatuses as activeStatuses };
 
 /** The preview, apply, progress and cancel flow every track operation shares. */
 export function useOperationRun<Request, Result extends Plan>(options: OperationRunOptions<Request, Result>) {
@@ -55,13 +56,13 @@ export function useOperationRun<Request, Result extends Plan>(options: Operation
   });
   const cancel = useMutation({ mutationFn: cancelOperationJob });
 
-  const ours = operation.activeOperation?.label === label;
-  const job = ours ? operation.job : undefined;
-  const isApplying = apply.isPending || (ours && operation.isRunning);
+  const own = operation.operationFor(label);
+  const job = own?.job;
+  const isApplying = apply.isPending || Boolean(own?.isRunning);
 
   useEffect(() => {
     if (!job) return;
-    if (activeStatuses.has(job.status)) {
+    if (activeJobStatuses.has(job.status)) {
       const file = job.currentFile ? ` | ${job.currentFile} ${job.currentFilePercent}%` : "";
       setStatus(`Applying ${job.completed + job.failed + job.skipped}/${job.total}${file}`);
       return;
@@ -108,8 +109,8 @@ export function useOperationRun<Request, Result extends Plan>(options: Operation
       } catch { /* Mutation handlers display the error. */ }
     },
     cancel() {
-      if (!ours || !operation.activeOperation) return;
-      cancel.mutate(operation.activeOperation.id);
+      if (!own) return;
+      cancel.mutate(own.id);
       setStatus(options.cancelingText ?? `Canceling ${label}...`);
     }
   };

@@ -52,7 +52,7 @@ describe("useMuxRequest", () => {
     expect(sent).toMatchObject({ planId: "plan", planFingerprint: "fingerprint", reorderTracks: true });
     expect(sent.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);
     await waitFor(() => expect(result.current.isApplying).toBe(true));
-    expect(JSON.parse(sessionStorage.getItem("mkvo.web.activeOperationJob")!)).toEqual({ id: "job-1", label: "Reorder Tracks" });
+    expect(JSON.parse(sessionStorage.getItem("mkvo.web.activeOperationJob")!)).toEqual([{ id: "job-1", label: "Reorder Tracks" }]);
   });
 
   it("says so and applies nothing when the plan has no actions", async () => {
@@ -108,6 +108,14 @@ describe("useMuxRequest", () => {
 
     await waitFor(() => expect(result.current.previewResult).toEqual(ran));
     expect(result.current.status).toBe("Reordered 1 file");
+  });
+
+  it("keeps its own job while another page's newer job runs", async () => {
+    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "job-2", label: "Edit Tracks" }, { id: "job-1", label: "Reorder Tracks" }]));
+    const { result } = setup({ getOperationJob: (id) => Promise.resolve(job({ id })) });
+
+    await waitFor(() => expect(result.current.job?.id).toBe("job-1"));
+    expect(result.current.isApplying).toBe(true);
   });
 
   it("ignores another page's job", async () => {
