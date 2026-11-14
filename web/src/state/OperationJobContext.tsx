@@ -2,6 +2,7 @@ import { createContext, type ReactNode, useContext, useEffect, useRef, useMemo, 
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { getOperationJob, type OperationJobResponse } from "../api";
 import { ApiError } from "../backend/error";
+import { currentFileText } from "../lib/jobActivity";
 import { recentJobsKey } from "./useRecentJobs";
 
 const storageKey = "mkvo.web.activeOperationJob";
@@ -48,8 +49,8 @@ function describe(label: string, job: OperationJobResponse | undefined) {
   if (!job) return `${label}: checking job`;
   const finished = job.completed + job.failed + job.skipped;
   if (!terminalStatuses.has(job.status)) {
-    const file = job.currentFile ? ` · ${job.currentFile} ${job.currentFilePercent}%` : "";
-    return `${label}: ${finished}/${job.total}${file}`;
+    const file = currentFileText(job);
+    return `${label}: ${finished}/${job.total}${file ? ` · ${file}` : ""}`;
   }
   if (job.status === "Completed") return `${label}: completed ${finished}/${job.total}`;
   if (job.status === "Failed") return `${label}: failed`;

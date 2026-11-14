@@ -88,7 +88,8 @@ export function Layout() {
   const missingTools = status.data?.tools.filter((tool) => !tool.available).length ?? 0;
   const { selectionError } = useMediaLibrary();
   const operation = useOperationJob();
-  const recentJobs = useRecentJobs(30_000);
+  // Dashboard shows this list, so it is read more often there.
+  const recentJobs = useRecentJobs(location.pathname === "/dashboard" ? 10_000 : 30_000);
   // The jobs this tab started carry their page's name; the backend's list adds scans and other tabs' jobs.
   const trackedIds = new Set(operation.operations.map((tracked) => tracked.id));
   const activeJobs = (recentJobs.data?.jobs ?? []).filter((job) => activeJobStatuses.has(job.status));

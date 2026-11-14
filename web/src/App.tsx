@@ -4,11 +4,13 @@ import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import AuthGate from "./components/AuthGate";
 import StartupGate from "./components/StartupGate";
 import { getBackendTransport } from "./api";
+import { DashboardTabs } from "./components/DashboardTabs";
 import { Layout } from "./components/Layout";
 import { MediaLibraryProvider, MediaLibrarySynchronizer } from "./state/MediaLibraryContext";
 import { PropEditTemplateWarmer } from "./state/propEditTemplate";
 import { OperationJobProvider } from "./state/OperationJobContext";
 
+const DashboardPage = lazy(() => import("./pages/DashboardPage").then((page) => ({ default: page.DashboardPage })));
 const ScanPage = lazy(() => import("./pages/ScanPage").then((page) => ({ default: page.ScanPage })));
 const LibraryPage = lazy(() => import("./pages/LibraryPage").then((page) => ({ default: page.LibraryPage })));
 const LogsPage = lazy(() => import("./pages/LogsPage").then((page) => ({ default: page.LogsPage })));
@@ -74,8 +76,10 @@ function ProtectedApp() {
         <Route element={<Layout />}>
           <Route element={<LazyPage />}>
             <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<Navigate to="/dashboard/scan" replace />} />
-            <Route path="/dashboard/scan" element={<ScanPage />} />
+            <Route element={<DashboardTabs />}>
+              <Route path="/dashboard" element={<DashboardPage />} />
+              <Route path="/dashboard/scan" element={<ScanPage />} />
+            </Route>
             <Route path="/rename" element={<RenamePage />} />
             <Route path="/tracks" element={<Navigate to="/tracks/properties" replace />} />
             <Route path="/tracks/:op" element={<TracksPage />} />
