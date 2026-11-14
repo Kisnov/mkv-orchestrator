@@ -413,7 +413,7 @@ fn preserved_output_for(file: &MediaFile, suffix: &str) -> PathBuf {
 }
 
 fn mark_duplicate_outputs(items: &mut [RemuxPlanItem]) {
-    let mut outputs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut outputs: BTreeMap<String, Vec<(usize, PathBuf)>> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         // An extraction's final output is the source folder, which it does not write.
         if item.mode != RemuxMode::ExtractSubtitles && !same_path(&item.source, &item.final_output)
@@ -421,21 +421,21 @@ fn mark_duplicate_outputs(items: &mut [RemuxPlanItem]) {
             outputs
                 .entry(path_key(&item.final_output))
                 .or_default()
-                .push(index);
+                .push((index, item.final_output.clone()));
         }
         for extraction in &item.extract_tracks {
             outputs
                 .entry(path_key(&extraction.output))
                 .or_default()
-                .push(index);
+                .push((index, extraction.output.clone()));
         }
     }
-    for indices in outputs.values().filter(|indices| indices.len() > 1) {
-        for &index in indices {
+    for writers in outputs.into_values().filter(|writers| writers.len() > 1) {
+        for (index, output) in writers {
             items[index].conflicts.push(PlanConflict::blocking(
                 PlanConflictKind::DuplicateTarget,
                 "Multiple actions write the same output",
-                Some(items[index].final_output.clone()),
+                Some(output),
             ));
         }
     }
@@ -638,6 +638,47 @@ mod tests {
         let plan = RemuxPlanner.build_plan(request).unwrap();
         for item in &plan.payload.items {
             assert!(item.can_apply(), "{:?}", item.conflicts);
+        }
+    }
+
+    #[test]
+    fn colliding_extractions_name_the_subtitle() {
+        let subtitle = PathBuf::from("show/Ep.eng.1.srt");
+        let files = vec![media("show/Ep 01.mkv"), media("show/Ep 02.mkv")];
+        let extractions = files
+            .iter()
+            .map(|file| {
+                let track = TrackExtraction {
+                    track_id: 1,
+                    kind: TrackKind::Subtitle,
+                    output: subtitle.clone(),
+                };
+                (file.path.clone(), vec![track])
+            })
+            .collect();
+        let request = RemuxPlanRequest {
+            source_access: BTreeMap::new(),
+            mode: RemuxMode::ExtractSubtitles,
+            files,
+            options: RemuxOptions::default(),
+            external_subtitles: BTreeMap::new(),
+            extractions,
+            existing_paths: BTreeSet::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            tool_fingerprints: BTreeMap::new(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        };
+
+        let plan = RemuxPlanner.build_plan(request).unwrap();
+        for item in &plan.payload.items {
+            let conflict = item
+                .conflicts
+                .iter()
+                .find(|conflict| conflict.kind == PlanConflictKind::DuplicateTarget)
+                .expect("duplicate");
+            assert_eq!(conflict.path.as_deref(), Some(subtitle.as_path()));
         }
     }
 
