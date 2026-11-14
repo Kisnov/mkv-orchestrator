@@ -1198,6 +1198,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_dashboard_reads_recent_jobs_and_watch_health() {
+        let host = TestHost::new(None);
+        let job = host
+            .runtime
+            .start_scan(mkvo_contracts::ScanRequest {
+                source_path: Some(host.config.media_root.display().to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let response = host
+            .router()
+            .oneshot(request("GET", "/api/jobs/recent?limit=5", &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let recent: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(recent["jobs"][0]["id"], job.id.to_string());
+        assert_eq!(recent["jobs"][0]["kind"], "scan");
+        assert!(recent["jobs"][0].get("result").is_none());
+
+        let response = host
+            .router()
+            .oneshot(request("GET", "/api/watch/health", &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let health: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(
+            health,
+            serde_json::json!({ "running": false, "backend": "native", "watchedRoots": 0 })
+        );
+    }
+
+    #[tokio::test]
     async fn job_events_of_a_running_job_end_with_the_event_that_ends_it() {
         let (sender, receiver) = tokio::sync::broadcast::channel(8);
         for (sequence, event) in [
