@@ -31,7 +31,6 @@ type OperationJobContextValue = {
   isRunning: boolean;
   statusText: string | null;
   trackJob: (id: string, label: string) => void;
-  clearJob: () => void;
 };
 
 const OperationJobContext = createContext<OperationJobContextValue | null>(null);
@@ -72,13 +71,6 @@ export function OperationJobProvider({ children }: { children: ReactNode }) {
   });
   // A job the server has forgotten is neither shown nor remembered.
   const unknownIds = tracked.filter((_, index) => isUnknownJob(jobQueries[index]?.error)).map((operation) => operation.id).join("|");
-  const remembered = JSON.stringify(tracked.filter((operation) => !unknownIds.split("|").includes(operation.id)));
-  useEffect(() => {
-    try {
-      if (remembered === "[]") sessionStorage.removeItem(storageKey);
-      else sessionStorage.setItem(storageKey, remembered);
-    } catch { /* state still tracks them */ }
-  }, [remembered]);
 
   const jobs = jobQueries.map((query) => query.data);
   const jobsKey = jobs.map((job) => job ? `${job.id}:${job.status}:${job.completed}:${job.failed}:${job.skipped}:${job.currentFile}:${job.currentFilePercent}:${job.lines.length}` : "").join("|");
@@ -91,12 +83,25 @@ export function OperationJobProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tracked, jobsKey, unknownIds]);
 
-  const queryClient = useQueryClient();
-  const refreshedJobs = useRef(new Set<string>());
+  // Nor is one remembered that ended over a day ago: its page has nothing left to show for it.
   useEffect(() => {
-    for (const { job } of operations) {
-      if (!job || !terminalStatuses.has(job.status) || refreshedJobs.current.has(job.id)) continue;
-      refreshedJobs.current.add(job.id);
+    const remembered = operations
+      .filter(({ job }) => !(job && terminalStatuses.has(job.status) && Date.now() - new Date(job.completedUtc ?? job.createdUtc).getTime() > 86_400_000))
+      .map(({ id, label }) => ({ id, label }));
+    try {
+      if (remembered.length) sessionStorage.setItem(storageKey, JSON.stringify(remembered));
+      else sessionStorage.removeItem(storageKey);
+    } catch { /* state still tracks them */ }
+  }, [operations]);
+
+  const queryClient = useQueryClient();
+  // The jobs seen running. One that was already over when the tab loaded has changed nothing since.
+  const runningJobs = useRef(new Set<string>());
+  useEffect(() => {
+    for (const { id, job } of operations) {
+      if (!job) continue;
+      if (!terminalStatuses.has(job.status)) { runningJobs.current.add(id); continue; }
+      if (!runningJobs.current.delete(id)) continue;
       void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });
       void queryClient.invalidateQueries({ queryKey: ["propedit-template"] });
       void queryClient.invalidateQueries({ queryKey: recentJobsKey });
@@ -115,9 +120,9 @@ export function OperationJobProvider({ children }: { children: ReactNode }) {
       trackJob: (id, label) => {
         setTracked((current) => [{ id, label }, ...current.filter((operation) => operation.label !== label && operation.id !== id)]);
         rememberJobLabel(id, label);
+        runningJobs.current.add(id);
         void queryClient.invalidateQueries({ queryKey: recentJobsKey });
-      },
-      clearJob: () => setTracked((current) => current.slice(1))
+      }
     };
   }, [operations, queryClient]);
 

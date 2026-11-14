@@ -102,7 +102,8 @@ export function Layout() {
   const statusLines = isRunning ? runningLines : operation.statusText ? [{ id: "last", text: operation.statusText }] : null;
   // A job that ended anywhere may have changed the scanned files. Scan applies its own scan's result itself.
   const queryClient = useQueryClient();
-  const activeIds = activeJobs.map((job) => job.id).join("|");
+  // The jobs this tab follows are re-read for by OperationJobContext.
+  const activeIds = activeJobs.filter((job) => !trackedIds.has(job.id)).map((job) => job.id).join("|");
   const previousActiveIds = useRef("");
   const onScanPage = location.pathname === "/dashboard/scan";
   useEffect(() => {

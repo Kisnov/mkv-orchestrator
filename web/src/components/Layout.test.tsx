@@ -88,6 +88,26 @@ describe("several jobs at once", () => {
     vi.useRealTimers();
   });
 
+  it("leaves the re-read to the job's own page when this tab follows the job", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "edit", label: "Edit Tracks" }]));
+    let ended = false;
+    const getCurrentScanFiles = vi.fn(() => Promise.resolve({ updatedUtc: null, files: [], selectedPaths: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 } }));
+    renderWithBackend(<MediaLibraryProvider><MediaLibrarySynchronizer />{page.props.children}</MediaLibraryProvider>, {
+      getStatus: () => Promise.resolve(status),
+      getOperationJob: (id) => Promise.resolve({ ...operationJob(id), status: ended ? "Completed" as const : "Running" as const }),
+      listRecentJobs: () => Promise.resolve({ jobs: [{ ...recentJob("edit", "property_edit", 1, 4), status: ended ? "Completed" as const : "Running" as const }] }),
+      getCurrentScanFiles
+    });
+
+    expect(await screen.findAllByText("Edit Tracks: 1/4")).not.toHaveLength(0);
+    ended = true;
+    await act(() => vi.advanceTimersByTimeAsync(4500));
+    // Once for the page load, once for the job's end: not a third time for the job list noticing it too.
+    expect(getCurrentScanFiles).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
   it("stays ready when the job list cannot be read", async () => {
     renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.reject(new ApiError("down", { code: "internal", status: 500 })) });
 

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 
@@ -77,4 +77,44 @@ it("forgets only the job the server no longer knows", async () => {
   await waitFor(() => expect(JSON.parse(sessionStorage.getItem(storageKey)!)).toEqual([{ id: "live", label: "Subtitle Format" }]));
   expect(result.current.statusText).toBe("Subtitle Format: completed 4/4");
   expect(result.current.isRunning).toBe(false);
+});
+
+function setupWithFiles(getOperationJob: (id: string) => Promise<OperationJobResponse>) {
+  const readFiles = vi.fn(() => Promise.resolve("files"));
+  setBackendClient(createMockBackendClient({ getOperationJob }));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}><OperationJobProvider>{children}</OperationJobProvider></QueryClientProvider>;
+  const hook = renderHook(() => {
+    useQuery({ queryKey: ["current-scan-files"], queryFn: readFiles });
+    return useOperationJob();
+  }, { wrapper });
+  return { ...hook, readFiles };
+}
+
+it("does not read the scanned files again for a job that was over when the tab loaded", async () => {
+  sessionStorage.setItem(storageKey, JSON.stringify([{ id: "done", label: "Edit Tracks" }]));
+  const { result, readFiles } = setupWithFiles((id) => Promise.resolve(job(id, { status: "Completed", completed: 4 })));
+
+  await waitFor(() => expect(result.current.statusText).toBe("Edit Tracks: completed 4/4"));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(readFiles).toHaveBeenCalledTimes(1);
+});
+
+it("reads the scanned files once when a job it follows ends", async () => {
+  let status: OperationJobResponse["status"] = "Running";
+  const { result, readFiles } = setupWithFiles((id) => Promise.resolve(job(id, { status })));
+
+  act(() => result.current.trackJob("live", "Edit Tracks"));
+  await waitFor(() => expect(result.current.job?.status).toBe("Running"));
+  status = "Completed";
+  await waitFor(() => expect(result.current.job?.status).toBe("Completed"), { timeout: 3000 });
+  await waitFor(() => expect(readFiles).toHaveBeenCalledTimes(2));
+});
+
+it("stops remembering a job that ended more than a day ago", async () => {
+  sessionStorage.setItem(storageKey, JSON.stringify([{ id: "old", label: "Edit Tracks" }, { id: "recent", label: "Subtitle Format" }]));
+  const ended = (hoursAgo: number) => new Date(Date.now() - hoursAgo * 3_600_000).toISOString();
+  setup((id) => Promise.resolve(job(id, { status: "Completed", completedUtc: ended(id === "old" ? 30 : 2) })));
+
+  await waitFor(() => expect(JSON.parse(sessionStorage.getItem(storageKey)!)).toEqual([{ id: "recent", label: "Subtitle Format" }]));
 });
