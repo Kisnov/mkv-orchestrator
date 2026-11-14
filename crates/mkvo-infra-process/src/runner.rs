@@ -26,6 +26,9 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 const KILL_GRACE: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+// taskkill only asks; the wait for the tool to go comes after it.
+#[cfg(windows)]
+const TASKKILL_GRACE: Duration = Duration::from_secs(2);
 
 // Everything else, such as the server password and provider API keys, stays out of child tools.
 #[cfg(windows)]
@@ -308,7 +311,7 @@ async fn kill_descendants(id: u32) {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     taskkill.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-    match tokio::time::timeout(KILL_GRACE, taskkill.status()).await {
+    match tokio::time::timeout(TASKKILL_GRACE, taskkill.status()).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => tracing::debug!(%error, "could not run taskkill"),
         Err(_) => tracing::warn!("taskkill did not finish"),
@@ -510,7 +513,7 @@ mod tests {
 
         assert!(matches!(error, ProcessError::Inactive(_)));
         assert!(started.elapsed() < Duration::from_secs(5));
-        // On Windows `ping` outlives the killed shell and keeps the output pipes open.
+        // Do not wait for the stopped shell's runtime tasks.
         runtime.shutdown_background();
     }
 
