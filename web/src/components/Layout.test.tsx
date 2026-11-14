@@ -75,7 +75,8 @@ describe("several jobs at once", () => {
     window.localStorage.setItem("mkvo.sidebar.collapsed", "true");
     renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.resolve({ jobs: [recentJob("scan-1", "scan", 12, 128)] }) });
 
-    await waitFor(() => expect(screen.getByRole("link", { name: "Dashboard" }).querySelector("[data-running]")).not.toBeNull());
+    const dashboard = await screen.findByRole("link", { name: "Dashboard, job running" });
+    expect(dashboard.querySelector("[data-running]")).not.toBeNull();
   });
 
   it("re-reads the scanned files when a job only the backend knows has ended", async () => {
@@ -142,6 +143,23 @@ describe("several jobs at once", () => {
     await act(() => vi.advanceTimersByTimeAsync(11_000));
     // One quick retry found it down; the next is half a minute away, not two seconds.
     expect(listRecentJobs).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("announces a job's start and end, not its progress", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let completed = 12;
+    renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.resolve({ jobs: completed < 128 ? [recentJob("scan-1", "scan", completed, 128)] : [] }) });
+
+    const announcement = await screen.findByRole("status");
+    await waitFor(() => expect(announcement).toHaveTextContent("1 job running: Scan"));
+    completed = 60;
+    await act(() => vi.advanceTimersByTimeAsync(2100));
+    expect(screen.getAllByText("Scan: 60/128")).not.toHaveLength(0);
+    expect(announcement).toHaveTextContent("1 job running: Scan");
+    completed = 128;
+    await act(() => vi.advanceTimersByTimeAsync(2100));
+    expect(announcement).toHaveTextContent("Ready");
     vi.useRealTimers();
   });
 

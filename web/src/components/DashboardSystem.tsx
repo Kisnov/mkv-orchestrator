@@ -29,7 +29,7 @@ function Row({ health, name, children, action, className = "" }: { health: Healt
       <span className="mt-1"><HealthIcon health={health} /></span>
       <div className="min-w-0">
         <div className="font-medium text-text">{name}</div>
-        <div className={["break-words text-xs [overflow-wrap:anywhere]", health === "problem" ? "text-text" : "text-muted"].join(" ")}>{children}</div>
+        <div className={["break-words text-xs [overflow-wrap:anywhere]", "text-text"].join(" ")}>{children}</div>
       </div>
       {action}
     </li>
@@ -82,7 +82,7 @@ export function DashboardSystem({ tools, toolsLoading, watch, servers }: {
               health={isChecking ? "checking" : health}
               name={<>{server.name} <span className="text-xs font-normal text-muted">{server.type}</span></>}
               action={server.hasApiKey ? (
-                <button type="button" onClick={check} disabled={isChecking} aria-label={`Check ${server.name} again`} title="Check again" className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted transition hover:bg-button-hover hover:text-text disabled:text-disabled">
+                <button type="button" onClick={check} disabled={isChecking} aria-label={`Check ${server.name} again`} title="Check again" className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted transition hover:bg-button-hover hover:text-text disabled:text-disabled pointer-coarse:h-11 pointer-coarse:w-11">
                   <RefreshCw size={14} aria-hidden="true" />
                 </button>
               ) : undefined}

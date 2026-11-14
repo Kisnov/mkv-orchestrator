@@ -48,7 +48,15 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
   const log = useQuery({ queryKey: ["job-log", logJobId], queryFn: () => getOperationJob(logJobId!), enabled: logJobId !== null, retry: false });
 
   const ordered = [...jobs.filter((job) => activeJobStatuses.has(job.status)), ...jobs.filter((job) => !activeJobStatuses.has(job.status))];
-  const shown = showAll ? ordered : ordered.slice(0, shownAtFirst);
+  // Scans repeated with the same result read as one line.
+  const rows: Array<{ job: RecentJob; count: number }> = [];
+  for (const job of ordered) {
+    const last = rows.at(-1);
+    const finishedScan = (candidate: RecentJob) => candidate.kind === "scan" && candidate.status === "Completed";
+    if (last && finishedScan(job) && finishedScan(last.job) && jobResultText(job) === jobResultText(last.job)) last.count += 1;
+    else rows.push({ job, count: 1 });
+  }
+  const shown = showAll ? rows : rows.slice(0, shownAtFirst);
   const running = ordered.filter((job) => activeJobStatuses.has(job.status)).length;
   const nameOf = (job: RecentJob) => jobName(job, labels);
   const logJob = jobs.find((job) => job.id === logJobId);
@@ -70,14 +78,13 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
         </div>
       ) : (
         <ul aria-label="Running and recent jobs">
-          {shown.map((job) => {
+          {shown.map(({ job, count }) => {
             const label = nameOf(job);
             const active = activeJobStatuses.has(job.status);
             const failed = jobFailed(job);
             const percent = job.total ? Math.min(100, Math.round(((jobFinishedCount(job) + job.currentFilePercent / 100) / job.total) * 100)) : 0;
-            const detail = active
-              ? currentFileText(job)
-              : jobErrorText(job) || job.summary;
+            // A second line only for what a glance cannot tell: the file in progress, or what went wrong.
+            const detail = active ? currentFileText(job) : jobErrorText(job);
             const page = jobPage(job, labels);
             const logFailed = logJobId === job.id && log.isError;
             return (
@@ -87,8 +94,9 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
                   <div className="flex flex-wrap items-baseline gap-x-2">
                     <span className="text-sm font-semibold text-text">{label}</span>
                     <span className={["text-sm tabular-nums", failed ? "font-semibold text-text" : "text-muted"].join(" ")}>{jobResultText(job)}</span>
+                    {count > 1 ? <span className="text-sm tabular-nums text-muted"><span aria-hidden="true">×{count}</span><span className="sr-only">, {count} scans in a row</span></span> : null}
                   </div>
-                  {detail ? <div className="mt-0.5 truncate text-xs text-muted" title={detail}>{detail}</div> : null}
+                  {detail ? <div className="mt-0.5 truncate text-xs text-text" title={detail}>{detail}</div> : null}
                   {logFailed ? <div role="alert" className="mt-0.5 text-xs text-warning">This job's log is no longer available.</div> : null}
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-1 max-md:w-full max-md:flex-row max-md:flex-wrap max-md:items-center max-md:justify-between max-md:gap-x-3 max-md:pl-7">
@@ -99,7 +107,7 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
                     {failed && page ? <Link to={page.to} className={rowAction} aria-label={`Retry in ${page.label}: ${label}, ${jobResultText(job)}`}>Retry in {page.label}</Link> : null}
                     {job.kind !== "scan" && !active ? <button type="button" onClick={() => onLogJobChange(job.id)} className={rowAction} aria-label={`View log of ${label}, ${jobResultText(job)}`}>View log</button> : null}
                     {active ? (
-                      <button type="button" onClick={() => cancel.mutate(job)} disabled={job.status === "Canceling" || (cancel.isPending && cancel.variables?.id === job.id)} aria-label={`Cancel ${label}`} title={job.kind === "property_edit" ? "Stops after the current file" : undefined} className="h-7 rounded-md border border-warning bg-button px-2.5 text-xs font-semibold text-warning disabled:border-border disabled:text-disabled">
+                      <button type="button" onClick={() => cancel.mutate(job)} disabled={job.status === "Canceling" || (cancel.isPending && cancel.variables?.id === job.id)} aria-label={`Cancel ${label}`} title={job.kind === "property_edit" ? "Stops after the current file" : undefined} className="h-7 rounded-md border border-warning bg-button px-2.5 text-xs font-semibold text-warning disabled:border-border disabled:text-disabled pointer-coarse:h-11">
                         Cancel
                       </button>
                     ) : null}
@@ -115,10 +123,10 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
           })}
         </ul>
       )}
-      {ordered.length > shownAtFirst ? (
+      {rows.length > shownAtFirst ? (
         <div className="border-t border-border px-4 py-2 text-xs font-semibold">
           <button type="button" onClick={() => setShowAll(!showAll)} aria-expanded={showAll} className={rowAction}>
-            {showAll ? "Show fewer" : `Show ${ordered.length - shownAtFirst} more`}
+            {showAll ? "Show fewer" : `Show ${rows.length - shownAtFirst} more`}
           </button>
         </div>
       ) : null}

@@ -98,7 +98,11 @@ export function DashboardPage() {
   return (
     <div className="dashboard-page @container pb-2">
       <SectionHeader title="Dashboard" description="Jobs, scanned files and the state of your tools." />
-      <section aria-label="Needs attention" aria-live="polite" className={["rounded-lg border px-4 py-2.5", attention.length ? "border-warning bg-input" : "border-border bg-card"].join(" ")}>
+      {/* Announces the count when it changes, rather than re-reading the whole list. */}
+      <p role="status" className="sr-only">
+        {attention.length ? `${attention.length} ${attention.length === 1 ? "item needs" : "items need"} attention` : stillChecking ? "" : "Nothing needs your attention"}
+      </p>
+      <section aria-label="Needs attention" className={["rounded-lg border px-4 py-2.5", attention.length ? "border-warning bg-input" : "border-border bg-card"].join(" ")}>
         {attention.length === 0 ? (
           <p className="flex items-center gap-2 text-sm text-muted">
             {stillChecking ? "Checking jobs, tools and servers." : <><Check size={16} className="shrink-0 text-success" aria-hidden="true" />Nothing needs your attention.</>}

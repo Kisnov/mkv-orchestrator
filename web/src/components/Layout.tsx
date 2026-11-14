@@ -94,12 +94,16 @@ export function Layout() {
   const trackedIds = new Set(operation.operations.map((tracked) => tracked.id));
   const activeJobs = (recentJobs.data?.jobs ?? []).filter((job) => activeJobStatuses.has(job.status));
   const runningLines = [
-    ...operation.operations.filter((tracked) => tracked.isRunning).map((tracked) => ({ id: tracked.id, text: tracked.statusText })),
-    ...activeJobs.filter((job) => !trackedIds.has(job.id)).map((job) => ({ id: job.id, text: describeActiveJob(jobKindLabel(job), job) }))
+    ...operation.operations.filter((tracked) => tracked.isRunning).map((tracked) => ({ id: tracked.id, name: tracked.label, text: tracked.statusText })),
+    ...activeJobs.filter((job) => !trackedIds.has(job.id)).map((job) => ({ id: job.id, name: jobKindLabel(job), text: describeActiveJob(jobKindLabel(job), job) }))
   ];
   const isRunning = runningLines.length > 0;
   const lastFailed = operation.job?.status === "Failed";
   const statusLines = isRunning ? runningLines : operation.statusText ? [{ id: "last", text: operation.statusText }] : null;
+  // What a screen reader is told: it changes when a job starts or ends, not with every file.
+  const announcement = isRunning
+    ? `${runningLines.length} ${runningLines.length === 1 ? "job" : "jobs"} running: ${runningLines.map((line) => line.name).join(", ")}`
+    : operation.statusText ?? (missingTools ? `${missingTools} tool issue(s)` : "Ready");
   // A job that ended anywhere may have changed the scanned files. Scan applies its own scan's result itself.
   const queryClient = useQueryClient();
   // The jobs this tab follows are re-read for by OperationJobContext.
@@ -155,7 +159,7 @@ export function Layout() {
               return (
                 <NavLink
                   key={item.to}
-                  aria-label={item.label}
+                  aria-label={item.to === "/dashboard" && collapsed && isRunning ? `${item.label}, job running` : item.label}
                   aria-describedby={collapsed && sidebarTooltip?.label === item.label ? "collapsed-sidebar-tooltip" : undefined}
                   to={item.to}
                   onMouseEnter={(event) => collapsed && setSidebarTooltip({ label: item.label, top: event.currentTarget.getBoundingClientRect().top + event.currentTarget.getBoundingClientRect().height / 2 })}
@@ -215,7 +219,8 @@ export function Layout() {
             {navItems.map((item) => <NavLink key={item.to} to={item.to} className={({ isActive }) => `flex items-center gap-2 rounded-md px-2 py-2 text-sm ${isActive ? "bg-selected text-accent" : "text-muted"}`}><item.icon size={16} /><span>{item.label}</span></NavLink>)}
             <SignOutButton className="col-span-2" />
           </nav> : null}
-          <div role="status" className="space-y-1 break-words border-t border-border px-4 py-2 text-xs text-muted">{statusLines ? statusLines.map((line) => <div key={line.id}>{line.text}</div>) : missingTools ? `${missingTools} tool issue(s)` : "Ready"}</div>
+          <div className="space-y-1 break-words border-t border-border px-4 py-2 text-xs text-muted">{statusLines ? statusLines.map((line) => <div key={line.id}>{line.text}</div>) : missingTools ? `${missingTools} tool issue(s)` : "Ready"}</div>
+          <div role="status" className="sr-only">{announcement}</div>
         </div>
         <main className={`app-main flex min-h-0 min-w-0 flex-col overflow-hidden ${isSettingsPage ? "px-4 py-4 sm:px-6 lg:px-8" : "px-4 py-4 lg:px-8 lg:py-8"}`}>
           <header className={`desktop-signout shrink-0 ${collapsed ? "" : "md:hidden"}`}><SignOutButton className="mb-3" /></header>

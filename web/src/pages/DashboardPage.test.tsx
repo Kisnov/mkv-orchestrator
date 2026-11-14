@@ -180,6 +180,23 @@ describe("Dashboard activity", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
   });
 
+  it("keeps a row to one line unless it has an error or a file in progress, and folds repeated scans", async () => {
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs: [
+      recentJob("remux", { summary: "Mux/remux operation completed" }),
+      recentJob("scan-3", { kind: "scan", total: 369, completed: 369, summary: "Scan completed" }),
+      recentJob("scan-2", { kind: "scan", total: 369, completed: 369, summary: "Scan completed" }),
+      recentJob("scan-1", { kind: "scan", total: 369, completed: 369, summary: "Scan completed" }),
+      recentJob("scan-0", { kind: "scan", total: 9, completed: 9, summary: "Scan completed" })
+    ] }) });
+
+    const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(rows[1]).toHaveTextContent("Scan369 files×3, 3 scans in a row");
+    expect(rows[2]).toHaveTextContent("Scan9 files");
+    expect(screen.queryByText("Scan completed")).not.toBeInTheDocument();
+    expect(screen.queryByText("Mux/remux operation completed")).not.toBeInTheDocument();
+  });
+
   it("says why the list is empty when it cannot be read, and tries again", async () => {
     const user = userEvent.setup();
     const listRecentJobs = vi.fn<() => Promise<{ jobs: RecentJob[] }>>().mockRejectedValueOnce(new ApiError("database is locked", { code: "internal", status: 500 })).mockResolvedValue({ jobs: [recentJob("ok")] });
@@ -210,6 +227,9 @@ describe("Dashboard attention list", () => {
     expect(attention.getByRole("link", { name: "Server settings" })).toHaveAttribute("href", "/settings?tab=library");
     expect(await attention.findByText("Remux failed 5 minutes ago.")).toBeInTheDocument();
     expect(attention.getAllByRole("listitem")).toHaveLength(4);
+    // A screen reader hears the count change, not every line of the list.
+    expect(screen.getByRole("status")).toHaveTextContent("4 items need attention");
+    expect(screen.getByRole("region", { name: "Needs attention" })).not.toHaveAttribute("aria-live");
     // Only a failed job can be dismissed: the other lines go away when the cause does.
     expect(attention.getAllByRole("button", { name: /^Dismiss/ })).toHaveLength(1);
     expect(testMediaServerConnection).toHaveBeenCalledTimes(1);

@@ -19,7 +19,7 @@ export function DashboardRenames({ batches, now }: { batches: RenameBatchListRes
             <li key={batch.id} className="flex items-start gap-3 border-b border-border px-4 py-2.5 last:border-b-0">
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium text-text" title={name}>{name}</div>
-                <div className="text-xs tabular-nums text-muted">{batch.totalFiles} {batch.totalFiles === 1 ? "file" : "files"}, {timeAgo(batch.createdAt, now)}</div>
+                <div className="text-xs tabular-nums text-text">{batch.totalFiles} {batch.totalFiles === 1 ? "file" : "files"}, {timeAgo(batch.createdAt, now)}</div>
               </div>
               {batch.isUndone
                 ? <span className="text-xs text-muted">Undone</span>
