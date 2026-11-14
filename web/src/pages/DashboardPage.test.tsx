@@ -132,7 +132,8 @@ describe("Dashboard activity", () => {
     const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
     expect(within(rows[0]).getByText("1 of 4 failed")).toBeInTheDocument();
     expect(within(rows[0]).getByText("1 of 4 files failed: 04.mkv: tool failed")).toBeInTheDocument();
-    expect(within(rows[0]).getByRole("link", { name: "Retry Remux in Tracks" })).toHaveAttribute("href", "/tracks");
+    // Nothing says which page ran this remux, so there is nowhere to send a retry.
+    expect(within(rows[0]).queryByRole("link")).not.toBeInTheDocument();
     expect(within(rows[1]).queryByRole("button")).not.toBeInTheDocument();
     expect(getOperationJob).not.toHaveBeenCalled();
 
@@ -140,6 +141,18 @@ describe("Dashboard activity", () => {
     const dialog = await screen.findByRole("dialog", { name: "Remux log" });
     expect(within(dialog).getByText("04.mkv: tool failed")).toBeInTheDocument();
     expect(getOperationJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends a retry to the page that ran the job, in this tab or an earlier one", async () => {
+    localStorage.setItem("mkvo.web.jobLabels", JSON.stringify([["reorder", "Reorder Tracks"]]));
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs: [
+      recentJob("reorder", { status: "Failed", failed: 1, error: "tool failed" }),
+      recentJob("edit", { kind: "property_edit", status: "Failed", failed: 2, error: "tool failed" })
+    ] }) });
+
+    const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
+    expect(within(rows[0]).getByRole("link", { name: /^Retry in Reorder Tracks/ })).toHaveAttribute("href", "/tracks/reorder");
+    expect(within(rows[1]).getByRole("link", { name: /^Retry in Edit Tracks/ })).toHaveAttribute("href", "/tracks/properties");
   });
 
   it("says why the list is empty when it cannot be read, and tries again", async () => {

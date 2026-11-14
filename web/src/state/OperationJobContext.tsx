@@ -3,6 +3,7 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { getOperationJob, type OperationJobResponse } from "../api";
 import { ApiError } from "../backend/error";
 import { currentFileText } from "../lib/jobActivity";
+import { rememberJobLabel } from "../lib/jobLabels";
 import { recentJobsKey } from "./useRecentJobs";
 
 const storageKey = "mkvo.web.activeOperationJob";
@@ -113,6 +114,7 @@ export function OperationJobProvider({ children }: { children: ReactNode }) {
       statusText: newest?.statusText ?? null,
       trackJob: (id, label) => {
         setTracked((current) => [{ id, label }, ...current.filter((operation) => operation.label !== label && operation.id !== id)]);
+        rememberJobLabel(id, label);
         void queryClient.invalidateQueries({ queryKey: recentJobsKey });
       },
       clearJob: () => setTracked((current) => current.slice(1))

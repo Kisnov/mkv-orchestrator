@@ -75,7 +75,7 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
             const detail = active
               ? currentFileText(job)
               : jobErrorText(job) || job.summary;
-            const page = jobPage(job);
+            const page = jobPage(job, labels);
             const logFailed = logJobId === job.id && log.isError;
             return (
               <li key={job.id} className="relative flex flex-wrap items-start gap-x-3 gap-y-1 border-b border-border px-4 py-2.5 last:border-b-0">
@@ -93,7 +93,7 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
                     {active ? `started ${timeAgo(job.startedUtc ?? job.createdUtc, now)}` : [duration(job.startedUtc, job.completedUtc), timeAgo(job.completedUtc ?? job.createdUtc, now)].filter(Boolean).join(", ")}
                   </span>
                   <span className="flex flex-wrap items-center justify-end gap-x-3 text-xs font-semibold">
-                    {failed && page ? <Link to={page.to} className={rowAction} aria-label={`Retry ${label} in ${page.label}`}>Retry in {page.label}</Link> : null}
+                    {failed && page ? <Link to={page.to} className={rowAction} aria-label={`Retry in ${page.label}: ${label}, ${jobResultText(job)}`}>Retry in {page.label}</Link> : null}
                     {job.kind !== "scan" && !active ? <button type="button" onClick={() => onLogJobChange(job.id)} className={rowAction} aria-label={`View log of ${label}, ${jobResultText(job)}`}>View log</button> : null}
                     {active ? (
                       <button type="button" onClick={() => cancel.mutate(job)} disabled={job.status === "Canceling" || (cancel.isPending && cancel.variables?.id === job.id)} aria-label={`Cancel ${label}`} className="h-7 rounded-md border border-warning bg-button px-2.5 text-xs font-semibold text-warning disabled:border-border disabled:text-disabled">

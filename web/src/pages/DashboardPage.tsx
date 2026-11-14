@@ -11,6 +11,7 @@ import { DashboardSystem, type ServerCheck } from "../components/DashboardSystem
 import { rowAction } from "../components/dashboardStyles";
 import { SectionHeader } from "../components/SectionHeader";
 import { jobName, timeAgo, unresolvedFailures } from "../lib/jobActivity";
+import { readJobLabels } from "../lib/jobLabels";
 import { watchState } from "../lib/systemHealth";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useOperationJob } from "../state/OperationJobContext";
@@ -60,7 +61,8 @@ export function DashboardPage() {
   const [logJobId, setLogJobId] = useState<string | null>(null);
 
   const jobs = recentJobs.data?.jobs ?? [];
-  const labels = useMemo(() => new Map(operation.operations.map((tracked) => [tracked.id, tracked.label])), [operation.operations]);
+  // The names this browser remembers, and the jobs it follows now.
+  const labels = useMemo(() => new Map([...readJobLabels(), ...operation.operations.map((tracked): [string, string] => [tracked.id, tracked.label])]), [operation.operations]);
   const tools = status.data?.tools ?? [];
   const watch = watchState(settings.data?.enableLiveWatchFolderMonitoring ?? false, watchHealth.data, watchHealth.isError, now);
   const checks: ServerCheck[] = servers.map((server, index) => {

@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 
 import type { RecentJob } from "../api";
-import { describeActiveJob, duration, jobErrorText, jobResultText, timeAgo, unresolvedFailures } from "./jobActivity";
+import { describeActiveJob, duration, jobErrorText, jobPage, jobResultText, timeAgo, unresolvedFailures } from "./jobActivity";
 
 const now = new Date("2026-11-14T12:00:00Z").getTime();
 
@@ -24,6 +24,18 @@ it("says how a job ended", () => {
   expect(jobResultText(job({ status: "Failed", completed: 0, total: 0 }))).toBe("Failed");
   expect(jobResultText(job({ status: "Canceled", completed: 1 }))).toBe("Canceled at 1 of 4");
   expect(jobResultText(job({ status: "Running", completed: 1, total: 1 }))).toBe("1 of 1 file");
+});
+
+it("sends a retry to the page the job came from, or nowhere", () => {
+  const labels = new Map([["reorder", "Reorder Tracks"], ["old", "MKV Operations"]]);
+  expect(jobPage(job({ id: "reorder" }), labels)).toEqual({ to: "/tracks/reorder", label: "Reorder Tracks" });
+  // A remux can be any of four pages: without its page's name there is no telling.
+  expect(jobPage(job({ id: "unknown" }), labels)).toBeNull();
+  expect(jobPage(job({ id: "old" }), labels)).toBeNull();
+  expect(jobPage(job({ kind: "property_edit" }), labels)).toEqual({ to: "/tracks/properties", label: "Edit Tracks" });
+  expect(jobPage(job({ kind: "extract_subtitles" }), labels)).toEqual({ to: "/subtitles", label: "Subtitles" });
+  expect(jobPage(job({ kind: "convert_to_mkv" }), labels)).toEqual({ to: "/tracks/convert", label: "Convert / Remux" });
+  expect(jobPage(job({ kind: "scan" }), labels)).toEqual({ to: "/dashboard/scan", label: "Scan" });
 });
 
 it("opens a batch error on what failed", () => {

@@ -14,16 +14,24 @@ const kindLabels: Record<RecentJob["kind"], string> = {
   media_server_sync: "Media Server Sync"
 };
 
-// Where each kind of job is started, to run it again.
-const kindPages: Partial<Record<RecentJob["kind"], { to: string; label: string }>> = {
-  scan: { to: "/dashboard/scan", label: "Scan" },
-  rename: { to: "/rename", label: "Rename Files" },
-  rename_undo: { to: "/rename", label: "Rename Files" },
-  remux: { to: "/tracks", label: "Tracks" },
-  convert_to_mkv: { to: "/tracks/convert", label: "Tracks" },
-  mux_subtitles: { to: "/subtitles", label: "Subtitles" },
-  extract_subtitles: { to: "/subtitles", label: "Subtitles" },
-  property_edit: { to: "/tracks/properties", label: "Tracks" }
+// The pages that start jobs, by the name each gives its jobs.
+const labelPages: Record<string, string> = {
+  "Edit Tracks": "/tracks/properties",
+  "Reorder Tracks": "/tracks/reorder",
+  "Subtitle Format": "/tracks/subtitle-format",
+  "Remove Tracks": "/tracks/remove",
+  "Convert / Remux": "/tracks/convert",
+  Subtitles: "/subtitles",
+  Scan: "/dashboard/scan"
+};
+
+// The kinds only one page starts. A remux is not one: four pages run them.
+const kindPageLabels: Partial<Record<RecentJob["kind"], string>> = {
+  scan: "Scan",
+  convert_to_mkv: "Convert / Remux",
+  mux_subtitles: "Subtitles",
+  extract_subtitles: "Subtitles",
+  property_edit: "Edit Tracks"
 };
 
 export function jobKindLabel(job: RecentJob) {
@@ -35,8 +43,10 @@ export function jobName(job: RecentJob, pageLabels: Map<string, string>) {
   return (job.kind === "remux" && pageLabels.get(job.id)) || jobKindLabel(job);
 }
 
-export function jobPage(job: RecentJob) {
-  return kindPages[job.kind] ?? null;
+/** The page a job was started from, to run it again; null when that cannot be known. */
+export function jobPage(job: RecentJob, pageLabels: Map<string, string>) {
+  const label = kindPageLabels[job.kind] ?? pageLabels.get(job.id) ?? "";
+  return labelPages[label] ? { to: labelPages[label], label } : null;
 }
 
 export function jobFinishedCount(job: RecentJob) {
