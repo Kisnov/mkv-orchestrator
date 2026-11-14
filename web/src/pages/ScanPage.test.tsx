@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import { DashboardPage } from "./DashboardPage";
+import { ScanPage } from "./ScanPage";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
 import type { MediaFileRow, WebSettings } from "../generated/contracts";
@@ -87,20 +87,20 @@ beforeEach(() => {
   window.sessionStorage.clear();
 });
 
-function renderDashboard(overrides: Parameters<typeof renderWithBackend>[1]) {
+function renderScan(overrides: Parameters<typeof renderWithBackend>[1]) {
   return renderWithBackend(
     <MediaLibraryProvider>
-      <DashboardPage />
+      <ScanPage />
     </MediaLibraryProvider>,
     overrides
   );
 }
 
-describe("Dashboard empty state", () => {
+describe("Scan empty state", () => {
   /// The desktop browses the whole machine. Telling it to mount a volume is
   /// instructions for a container the user is not running.
   it("tells a desktop user to browse rather than to mount a volume", async () => {
-    renderDashboard({
+    renderScan({
       transport: "tauri",
       getStatus: () => Promise.resolve({ ...emptyStatus, mediaRoot: "C:\\media" }),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
@@ -114,7 +114,7 @@ describe("Dashboard empty state", () => {
   /// The served build really is reached through a bind mount, so the original
   /// guidance is still the right guidance there.
   it("keeps the mount guidance when served over HTTP", async () => {
-    renderDashboard({
+    renderScan({
       transport: "http",
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
@@ -125,11 +125,11 @@ describe("Dashboard empty state", () => {
   });
 });
 
-describe("Dashboard scan source labels", () => {
+describe("Scan scan source labels", () => {
   it("shows only the selected folder name while retaining the full path as its tooltip", async () => {
     window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/downloads/complete/Superstore"]));
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings())
@@ -146,7 +146,7 @@ describe("Dashboard scan source labels", () => {
       String.raw`C:\media\Show\Episode 02.mkv`
     ]));
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings())
@@ -182,7 +182,7 @@ describe("Dashboard scan source labels", () => {
     };
     const showB = { ...showA, path: "/media/ShowB/Episode 02.mkv", fileName: "Episode 02.mkv" };
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files: [showA, showB] }),
       getWebSettings: () => Promise.resolve(settings())
@@ -198,11 +198,11 @@ describe("Dashboard scan source labels", () => {
   });
 });
 
-describe("Dashboard file sorting", () => {
+describe("Scan file sorting", () => {
   it("sorts File Info rows in both directions without changing their identity", async () => {
     const user = userEvent.setup();
     const files = [mediaFile("Episode 10.mkv"), mediaFile("Episode 2.mkv")];
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files }),
       getWebSettings: () => Promise.resolve(settings())
@@ -216,7 +216,7 @@ describe("Dashboard file sorting", () => {
   });
 });
 
-describe("Dashboard UI cache reset", () => {
+describe("Scan UI cache reset", () => {
   it("clears scan state and workflow caches while keeping the chosen sources", async () => {
     const user = userEvent.setup();
     const scannedFile = mediaFile("Episode 01.mkv");
@@ -226,7 +226,7 @@ describe("Dashboard UI cache reset", () => {
     window.sessionStorage.setItem("mkvo.web.trackPropertiesConfiguration", "stale track state");
     const clearCurrentScanFiles = vi.fn().mockResolvedValue(emptyScan);
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files }),
       getWebSettings: () => Promise.resolve(settings()),
@@ -258,7 +258,7 @@ describe("Dashboard UI cache reset", () => {
     const scannedFile = mediaFile("Episode 01.mkv");
     window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files: [scannedFile] }),
       getWebSettings: () => Promise.resolve(settings()),
@@ -311,7 +311,7 @@ describe("Dashboard UI cache reset", () => {
     const now = new Date().toISOString();
     const job = { id: "lost-job", createdUtc: now, startedUtc: now, completedUtc: now, currentSource: "/media/Show", completed: 2, total: 2, files: [], skipped: [], summary: { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 }, error: "" };
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings()),
@@ -332,7 +332,7 @@ describe("Dashboard UI cache reset", () => {
     const clearCurrentScanFiles = vi.fn().mockResolvedValue(emptyScan);
     let reportRunning: () => void = () => undefined;
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings()),
@@ -354,11 +354,11 @@ describe("Dashboard UI cache reset", () => {
   });
 });
 
-describe("Dashboard ignored folders", () => {
+describe("Scan ignored folders", () => {
   /// The ignored list is sent with every scan request, so seeding it from a
   /// local constant silently overrode whatever the user configured in Settings.
   it("seeds the ignored list from saved settings rather than a local default", async () => {
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () =>
@@ -376,7 +376,7 @@ describe("Dashboard ignored folders", () => {
       resolveSettings = resolve;
     });
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => pending
@@ -391,7 +391,7 @@ describe("Dashboard ignored folders", () => {
   });
 
   it("restores an ignored-folder edit when the page reloads before saving finishes", async () => {
-    const firstRender = renderDashboard({
+    const firstRender = renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras"] })),
@@ -402,7 +402,7 @@ describe("Dashboard ignored folders", () => {
     fireEvent.change(field, { target: { value: "Backdrops, OVAs, Specials" } });
     firstRender.unmount();
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras"] })),
@@ -416,7 +416,7 @@ describe("Dashboard ignored folders", () => {
     const saveWebSettings = vi.fn().mockImplementation((request) =>
       Promise.resolve(settings({ ignoredScanFolderNames: request.ignoredScanFolderNames ?? [] }))
     );
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras"] })),
@@ -449,7 +449,7 @@ describe("Dashboard ignored folders", () => {
       error: ""
     });
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve({ ...emptyStatus, sourceRoots: [{ name: "Media", path: "/media" }] }),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras", "Samples"] })),
@@ -508,7 +508,7 @@ describe("Dashboard ignored folders", () => {
       error: ""
     });
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings()),
@@ -569,7 +569,7 @@ describe("Dashboard ignored folders", () => {
       error: ""
     });
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve({
         ...emptyStatus,
         sourceRoots: [{ name: "Media", path: "/media" }]
@@ -594,12 +594,12 @@ describe("Dashboard ignored folders", () => {
   });
 });
 
-describe("Dashboard detail panels", () => {
+describe("Scan detail panels", () => {
   /// They used to appear only once a file was selected, so the dashboard
   /// reflowed as scans came and went and an empty page gave no hint of what
   /// these panels are for.
   it("keeps Media Info and Track Info in place with nothing scanned", async () => {
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve(emptyScan),
       getWebSettings: () => Promise.resolve(settings())
@@ -668,7 +668,7 @@ describe("Dashboard detail panels", () => {
       attachments: []
     };
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () =>
         Promise.resolve({ ...emptyScan, files: [file], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
@@ -703,7 +703,7 @@ describe("Dashboard detail panels", () => {
     const secondFile = { ...baseFile, path: "/media/Show/Ep02.mkv", fileName: "Ep02.mkv" };
     const thirdFile = { ...baseFile, path: "/media/Show/Ep03.mkv", fileName: "Ep03.mkv" };
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve({
         ...emptyScan,
@@ -734,7 +734,7 @@ describe("Dashboard detail panels", () => {
   });
 });
 
-describe("Dashboard template highlighting", () => {
+describe("Scan template highlighting", () => {
   const templateFile = {
     path: "/media/Show/Ep01.mkv",
     fileName: "Ep01.mkv",
@@ -757,7 +757,7 @@ describe("Dashboard template highlighting", () => {
   };
 
   function renderWithTemplate() {
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () =>
         Promise.resolve({
@@ -784,7 +784,7 @@ describe("Dashboard template highlighting", () => {
       fileName: "Ep02.mkv"
     };
     const setFileSelection = vi.fn();
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () =>
         Promise.resolve({
@@ -851,7 +851,7 @@ describe("Dashboard template highlighting", () => {
       ]
     };
 
-    renderDashboard({
+    renderScan({
       getStatus: () => Promise.resolve(emptyStatus),
       getCurrentScanFiles: () => Promise.resolve({
         ...emptyScan,

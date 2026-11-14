@@ -107,7 +107,7 @@ export function RenamePage() {
   );
   const [previewRows, setPreviewRows] = useState<RenamePreviewRow[]>(storedRenameState.previewRows ?? []);
   const [previewSummary, setPreviewSummary] = useState(storedRenameState.previewSummary || "");
-  const [statusText, setStatusText] = useState(storedRenameState.statusText || "Scan files on Dashboard, then search metadata.");
+  const [statusText, setStatusText] = useState(storedRenameState.statusText || "Scan files first, then search metadata.");
   const [searchResults, setSearchResults] = useState<RenameSearchResult[]>(storedRenameState.searchResults ?? []);
   const [scopeRows, setScopeRows] = useState<RenameScopeRow[]>(storedRenameState.scopeRows ?? []);
   const [settingsDefaultsApplied, setSettingsDefaultsApplied] = useState(false);
@@ -204,7 +204,7 @@ export function RenamePage() {
     syncFromBackend(currentScan.data);
     if (currentScan.data.files.length > 0 && storedRenameState.statusText === undefined && !initialScanStatusApplied.current) {
       initialScanStatusApplied.current = true;
-      setStatusText(`Loaded ${currentScan.data.files.length} scanned file(s) from Dashboard.`);
+      setStatusText(`Loaded ${currentScan.data.files.length} scanned file(s).`);
     }
   }, [currentScan.data, storedRenameState.statusText]);
 
@@ -569,9 +569,9 @@ export function RenamePage() {
     const result = await currentScan.refetch();
     if (result.data?.files.length) {
       syncFromBackend(result.data);
-      setStatusText(`Loaded ${result.data.files.length} scanned file(s) from Dashboard.`);
+      setStatusText(`Loaded ${result.data.files.length} scanned file(s).`);
     } else {
-      setStatusText("No Dashboard scan is available yet.");
+      setStatusText("No scan is available yet.");
     }
   }
 

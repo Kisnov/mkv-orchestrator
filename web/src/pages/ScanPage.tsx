@@ -9,13 +9,14 @@ import { FileBrowser } from "../components/FileBrowser";
 import { SortableColumnHeader, type SortDirection } from "../components/SortableColumnHeader";
 import { getTemplateMismatchMessages, hasTemplateMismatch, normalizeCompareValue, normalizeTrackSignature } from "../lib/templateMatch";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
+import { recentJobsKey } from "../state/useRecentJobs";
 
 const lastBrowsePathStorageKey = "mkvo.web.lastBrowsePath";
 const scanSourcesStorageKey = "mkvo.web.scanSources";
 const ignoredFoldersDraftStorageKey = "mkvo.web.ignoredFoldersDraft";
 type DashboardSortKey = "file" | "reader" | "codec" | "resolution" | "audio" | "subtitles" | "status";
 
-export function DashboardPage() {
+export function ScanPage() {
   const queryClient = useQueryClient();
   const status = useQuery({ queryKey: ["status"], queryFn: getStatus });
   const {
@@ -114,6 +115,7 @@ export function DashboardPage() {
     mutationFn: startScan,
     onSuccess: (job) => {
       setScanJobId(job.id);
+      void queryClient.invalidateQueries({ queryKey: recentJobsKey });
     }
   });
   const scanCancel = useMutation({ mutationFn: cancelScan });
@@ -576,7 +578,7 @@ export function DashboardPage() {
 
   return (
     <div className="workspace-page flex h-full min-h-0 flex-col">
-      <SectionHeader title="Dashboard" description="Scan folders and review MKV or MP4 file metadata." />
+      <SectionHeader title="Scan" description="Scan folders and review MKV or MP4 file metadata." />
       <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[18.75rem_minmax(0,1fr)] gap-5">
         <section className="min-h-0 overflow-auto rounded-xl border border-border bg-card p-5 shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
           <h2 className="text-base font-semibold">Scan Sources</h2>

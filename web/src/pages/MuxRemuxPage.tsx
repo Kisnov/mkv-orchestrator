@@ -55,7 +55,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
   const initializedSelectionScope = useRef("");
   const run = useMuxRequest({
     label: "MKV Operations",
-    initialStatus: "Load scanned files from Dashboard, then choose an action.",
+    initialStatus: "Scan files first, then choose an action.",
     startedText: (total) => `Applying ${total} MKV operation(s)...`,
     noChangesText: "No changes are needed for the selected files.",
     cancelingText: "Canceling MKV operation job...",
@@ -72,7 +72,7 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
     if (scan.files.length === 0) {
       run.setPreviewResult(null);
       setSelectedDetailPath("");
-      run.setStatus("Load scanned files from Dashboard, then choose an action.");
+      run.setStatus("Scan files first, then choose an action.");
     } else if (initializedSelectionScope.current !== selectionScope) {
       // MKV Operations starts every newly loaded scan as a full batch. Record
       // the scan identity first so later user deselection is preserved for the

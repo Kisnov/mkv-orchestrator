@@ -15,7 +15,7 @@ export type FileColumn = {
   truncate?: boolean;
 };
 
-/** Columns FileSelectionTable can show after the file name; `status` is the Dashboard's template status. */
+/** Columns FileSelectionTable can show after the file name; `status` is Scan's template status. */
 export const fileColumns = {
   reader: { key: "reader", label: "Reader", sortValue: (row) => row.file.reader },
   codec: { key: "codec", label: "Codec", sortValue: (row) => row.file.codec || "Unknown" },

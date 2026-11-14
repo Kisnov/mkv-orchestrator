@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router-dom";
 
 import { buildLibraryTitles, LibraryPage, resetLibraryViewCacheForTests } from "./LibraryPage";
-import { DashboardPage } from "./DashboardPage";
+import { ScanPage } from "./ScanPage";
 import { MediaLibraryProvider } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
 import { ApiError } from "../api";
@@ -116,7 +116,7 @@ describe("Library title aggregation", () => {
 });
 
 describe("Library poster workflow", () => {
-  it("replaces the previous Dashboard scan during a mismatch handoff", async () => {
+  it("replaces the previous scan during a mismatch handoff", async () => {
     const user = userEvent.setup();
     const row = auditRow(1, true);
     const handoffRoot = "/media/handoff/Example Show/Season 1";
@@ -147,7 +147,7 @@ describe("Library poster workflow", () => {
       <MediaLibraryProvider>
         <Routes>
           <Route path="/" element={<LibraryPage />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/dashboard/scan" element={<ScanPage />} />
         </Routes>
       </MediaLibraryProvider>,
       {
@@ -172,9 +172,9 @@ describe("Library poster workflow", () => {
     );
 
     await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
-    await user.click(screen.getByRole("button", { name: /send mismatches \+ template to dashboard/i }));
+    await user.click(screen.getByRole("button", { name: /send mismatches \+ template to scan/i }));
 
-    expect(await screen.findByRole("heading", { name: "Dashboard" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Scan" })).toBeInTheDocument();
     expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
     expect(screen.queryByText("Previous Scan.mkv")).not.toBeInTheDocument();
     const handoffFileList = screen.getByLabelText("Scanned files").parentElement;
@@ -182,7 +182,7 @@ describe("Library poster workflow", () => {
     expect(handoffFileList).toHaveClass("max-h-[20rem]", "shrink-0");
   });
 
-  it("shows a slate placeholder and offers both Dashboard handoff scopes", async () => {
+  it("shows a slate placeholder and offers both Scan handoff scopes", async () => {
     const user = userEvent.setup();
     const rows = [auditRow(1, true), auditRow(2, false)];
     const files = rows.flatMap((row) => row.allFilePaths.map(media));
@@ -229,9 +229,9 @@ describe("Library poster workflow", () => {
     expect(screen.getByText(/mismatch · 1/i)).toBeInTheDocument();
 
     await user.click(card);
-    expect(await screen.findByRole("button", { name: /send mismatches \+ template to dashboard/i })).toBeEnabled();
-    expect(screen.getByRole("button", { name: /send all files to dashboard/i })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: /send mismatches \+ template to dashboard/i }));
+    expect(await screen.findByRole("button", { name: /send mismatches \+ template to scan/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /send all files to scan/i })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: /send mismatches \+ template to scan/i }));
 
     await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith([
       "/media/tv/Example Show/Season 1/Episode 01.mkv",
@@ -492,7 +492,7 @@ describe("Library poster workflow", () => {
     expect(libraryArtworkUrl).not.toHaveBeenCalled();
   });
 
-  it("sends a title to Dashboard with the backend's rows, not copies kept in the browser", async () => {
+  it("sends a title to Scan with the backend's rows, not copies kept in the browser", async () => {
     const user = userEvent.setup();
     const backend = posterBackend({ getLibraryCatalog: () => Promise.resolve({ items: [] }), getLibraryLocalArtwork: () => Promise.reject(new Error("No local poster")) });
     const held = media("/media/tv/Example Show/Season 1/Episode 01.mkv");
@@ -507,7 +507,7 @@ describe("Library poster workflow", () => {
     );
 
     await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
-    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to scan/i }));
 
     await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith([
       "/media/tv/Example Show/Season 1/Episode 01.mkv",
@@ -522,14 +522,14 @@ describe("Library poster workflow", () => {
       <MediaLibraryProvider>
         <Routes>
           <Route path="/" element={<LibraryPage />} />
-          <Route path="/dashboard" element={<h1>Dashboard</h1>} />
+          <Route path="/dashboard/scan" element={<h1>Scan</h1>} />
         </Routes>
       </MediaLibraryProvider>,
       backend
     );
   }
 
-  it("leaves Dashboard alone when none of the title's files can be read", async () => {
+  it("leaves Scan alone when none of the title's files can be read", async () => {
     const user = userEvent.setup();
     const setFileSelection = vi.fn().mockResolvedValue({ selectedPaths: ["/media/other.mkv"] });
     openTitleWith({
@@ -538,12 +538,12 @@ describe("Library poster workflow", () => {
     });
 
     await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
-    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to scan/i }));
 
     const dialog = screen.getByRole("dialog");
     expect(await within(dialog).findByText(/none of this title's files could be read/i)).toBeInTheDocument();
     expect(setFileSelection).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("heading", { name: "Dashboard" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Scan" })).not.toBeInTheDocument();
   });
 
   it("says so in the dialog when the sent files cannot be loaded back", async () => {
@@ -554,10 +554,10 @@ describe("Library poster workflow", () => {
     });
 
     await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
-    await user.click(screen.getByRole("button", { name: /send all files to dashboard/i }));
+    await user.click(screen.getByRole("button", { name: /send all files to scan/i }));
 
     expect(await within(screen.getByRole("dialog")).findByText(/server went away/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /send all files to dashboard/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /send all files to scan/i })).toBeEnabled();
   });
 
   it("runs one hand-off at a time and shows its progress in the dialog", async () => {
@@ -567,12 +567,12 @@ describe("Library poster workflow", () => {
     openTitleWith({ setFileSelection, getCurrentScanFiles: () => new Promise(() => undefined) });
 
     await user.click(await screen.findByRole("button", { name: /open example show library details/i }));
-    const sendAll = screen.getByRole("button", { name: /send all files to dashboard/i });
+    const sendAll = screen.getByRole("button", { name: /send all files to scan/i });
     await user.dblClick(sendAll);
 
-    expect(within(screen.getByRole("dialog")).getByText(/sending example show to dashboard/i)).toBeInTheDocument();
+    expect(within(screen.getByRole("dialog")).getByText(/sending example show to scan/i)).toBeInTheDocument();
     expect(sendAll).toBeDisabled();
-    expect(screen.getByRole("button", { name: /send mismatches \+ template to dashboard/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /send mismatches \+ template to scan/i })).toBeDisabled();
     expect(setFileSelection).toHaveBeenCalledTimes(1);
     release({ selectedPaths: [] });
   });

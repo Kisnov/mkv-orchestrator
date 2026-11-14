@@ -88,7 +88,7 @@ export function TrackPropertiesPage() {
   const [pendingApply, setPendingApply] = useState<{ request: PropEditPreviewRequest; plan: PropEditPreviewResponse; rows: PreviewSummaryRow[] } | null>(null);
   const run = useOperationRun<PropEditPreviewRequest, PropEditPreviewResponse>({
     label: "Edit Tracks",
-    initialStatus: "Load scanned files from Dashboard, then select a template.",
+    initialStatus: "Scan files first, then select a template.",
     preview: buildPropEditPreview,
     apply: startPropEditApply,
     resultOf: (job) => job.propEditResult,

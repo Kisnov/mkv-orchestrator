@@ -9,7 +9,7 @@ import { MediaLibraryProvider, MediaLibrarySynchronizer } from "./state/MediaLib
 import { PropEditTemplateWarmer } from "./state/propEditTemplate";
 import { OperationJobProvider } from "./state/OperationJobContext";
 
-const DashboardPage = lazy(() => import("./pages/DashboardPage").then((page) => ({ default: page.DashboardPage })));
+const ScanPage = lazy(() => import("./pages/ScanPage").then((page) => ({ default: page.ScanPage })));
 const LibraryPage = lazy(() => import("./pages/LibraryPage").then((page) => ({ default: page.LibraryPage })));
 const LogsPage = lazy(() => import("./pages/LogsPage").then((page) => ({ default: page.LogsPage })));
 const MuxRemuxPage = lazy(() => import("./pages/MuxRemuxPage").then((page) => ({ default: page.MuxRemuxPage })));
@@ -74,12 +74,14 @@ function ProtectedApp() {
         <Route element={<Layout />}>
           <Route element={<LazyPage />}>
             <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/dashboard" element={<Navigate to="/dashboard/scan" replace />} />
+            <Route path="/dashboard/scan" element={<ScanPage />} />
             <Route path="/rename" element={<RenamePage />} />
             <Route path="/tracks" element={<Navigate to="/tracks/properties" replace />} />
             <Route path="/tracks/:op" element={<TracksPage />} />
             <Route path="/subtitles" element={<MuxRemuxPage workflow="subtitles" />} />
             {/* Earlier addresses, kept for bookmarks. */}
+            <Route path="/scan" element={<Navigate to="/dashboard/scan" replace />} />
             <Route path="/edit-tracks" element={<Navigate to="/tracks/properties" replace />} />
             <Route path="/track-properties" element={<Navigate to="/tracks/properties" replace />} />
             <Route path="/reorder-tracks" element={<Navigate to="/tracks/reorder" replace />} />
