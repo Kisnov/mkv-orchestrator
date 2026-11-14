@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 
 import { RenamePage } from "./RenamePage";
 import { MediaLibraryProvider, useMediaLibrary } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
+import { createMockBackendClient } from "../backend/mockClient";
+import { setBackendClient } from "../backend/runtime";
 import type { MediaFileRow, RenameApplyResponse, RenamePreviewResponse } from "../api";
 
 function mediaFile(fileName: string): MediaFileRow {
@@ -350,5 +354,49 @@ describe("batch movie matching", () => {
     expect(searchRenameMetadata.mock.calls.map(([request]) => request.query)).toEqual(["Arrival", "Heat"]);
     expect(await screen.findByText("Arrival (2026)")).toBeInTheDocument();
     expect(screen.getByText("Heat (2026)")).toBeInTheDocument();
+  });
+});
+
+describe("Rename undo from Dashboard", () => {
+  const batch = (id: string, file: string) => ({ id, createdAt: "2026-11-14T09:00:00Z", undoneAt: null, provider: "TVDB", template: "", totalFiles: 1, entries: [], isUndone: false, displayName: file });
+
+  function LocationState() {
+    return <output aria-label="Location state">{JSON.stringify(useLocation().state)}</output>;
+  }
+
+  function renderRenameAsked(undoBatchId: string) {
+    const previewRenameBatchUndo = vi.fn((id: string) => Promise.resolve({ restorable: 1, skipped: 0, lines: [`Restore plan of ${id}`], hasSkippedFiles: false }));
+    setBackendClient(createMockBackendClient({
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: null, files: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 }, selectedPaths: [] }),
+      getRenameBatches: () => Promise.resolve({ batches: [batch("batch-1", "First batch"), batch("batch-2", "Second batch")] }),
+      previewRenameBatchUndo
+    }));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+        <MemoryRouter initialEntries={[{ pathname: "/rename", state: { undoBatchId } }]}>
+          <MediaLibraryProvider><RenamePage /></MediaLibraryProvider>
+          <LocationState />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    return previewRenameBatchUndo;
+  }
+
+  it("opens the undo dialog on the batch a link asked for, once", async () => {
+    const previewRenameBatchUndo = renderRenameAsked("batch-2");
+
+    expect(await screen.findByText("Restore plan of batch-2")).toBeInTheDocument();
+    // The first batch in the list is not what was asked for.
+    expect(previewRenameBatchUndo.mock.calls.map(([id]) => id)).not.toContain("batch-1");
+    // A refresh or Back must not open the dialog again.
+    expect(screen.getByLabelText("Location state")).toHaveTextContent("null");
+  });
+
+  it("says the batch is gone rather than opening another one", async () => {
+    const previewRenameBatchUndo = renderRenameAsked("batch-9");
+
+    expect(await screen.findByText(/that rename batch is no longer available/i)).toBeInTheDocument();
+    expect(await screen.findByText("First batch")).toBeInTheDocument();
+    expect(previewRenameBatchUndo).not.toHaveBeenCalled();
   });
 });

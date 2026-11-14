@@ -331,6 +331,11 @@ export function SettingsPage() {
           ? { ...server, hasApiKey: match.hasApiKey, apiKey: clearIfStored(match.hasApiKey, sentKey)(server.apiKey ?? "") }
           : server;
       }));
+      // Dashboard keeps each server's last connection check; a new key or address makes it stale.
+      const address = (servers: WebSettings["mediaServers"] | undefined) => JSON.stringify(servers?.map((server) => [server.id, server.serverUrl, server.hasApiKey]));
+      if (sent.mediaServers?.some((server) => server.apiKey) || address(previous?.mediaServers) !== address(saved.mediaServers)) {
+        void queryClient.invalidateQueries({ queryKey: ["media-server-check"] });
+      }
       const droppedKeys = saved.mediaServers.filter((server) =>
         !server.hasApiKey && previous?.mediaServers.some((item) => item.id === server.id && item.hasApiKey));
       if (droppedKeys.length > 0) {
@@ -537,10 +542,10 @@ export function SettingsPage() {
               <SettingsCard
                 className="flex min-h-0 flex-col"
                 contentClassName="flex min-h-0 flex-1 flex-col"
-                title={isDesktop ? "Dashboard" : "Default Directory"}
+                title={isDesktop ? "Scan" : "Default Directory"}
                 description={isDesktop
-                  ? "Choose the default folder the Dashboard opens for browsing and scans."
-                  : "Choose the Home folder used when the Dashboard opens for browsing and scans. The mounted media path is used as the starting value."}
+                  ? "Choose the default folder Scan opens for browsing and scans."
+                  : "Choose the Home folder used when Scan opens for browsing and scans. The mounted media path is used as the starting value."}
               >
                 <div className="flex min-w-0 flex-wrap items-center gap-2">
                   <input

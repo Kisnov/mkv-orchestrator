@@ -34,6 +34,29 @@ describe("HttpBackendClient library posters", () => {
   });
 });
 
+describe("HttpBackendClient dashboard reads", () => {
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+
+  it("lists recent jobs with the limit in the query", async () => {
+    const job = { id: "job-1", kind: "scan", status: "Completed", createdUtc: "2026-11-14T10:00:00Z", completed: 3, failed: 0, skipped: 0, total: 3, currentFile: "", currentFilePercent: 0, summary: "Scan completed" };
+    const fetchMock = vi.fn().mockResolvedValue(json({ jobs: [job] }));
+    const client = new HttpBackendClient({ fetch: fetchMock });
+
+    await expect(client.listRecentJobs(20)).resolves.toEqual({ jobs: [job] });
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/jobs/recent?limit=20");
+  });
+
+  it("reads watch health and refuses an answer that is not one", async () => {
+    const health = { running: true, backend: "polling", watchedRoots: 2, lastEventUtc: "2026-11-14T10:00:00Z" };
+    const fetchMock = vi.fn().mockResolvedValueOnce(json(health)).mockResolvedValueOnce(json({ running: "yes" }));
+    const client = new HttpBackendClient({ fetch: fetchMock });
+
+    await expect(client.getWatchHealth()).resolves.toEqual(health);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/watch/health");
+    await expect(client.getWatchHealth()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+  });
+});
+
 describe("HttpBackendClient timeouts", () => {
   function timedOutSignal() {
     const controller = new AbortController();

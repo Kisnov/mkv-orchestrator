@@ -19,6 +19,7 @@ import type {
   PropEditPreviewRequest,
   PropEditPreviewResponse,
   PropEditTemplateResponse,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchUndoPreviewResponse,
@@ -29,6 +30,7 @@ import type {
   RenameSearchResult,
   ScanJobResponse,
   ScanRequest,
+  WatchHealth,
   WebSettings,
   WebSettingsRequest
 } from "../api";
@@ -161,6 +163,13 @@ export interface OperationJobsClient {
   cancelOperationJob(id: string): Promise<OperationJobResponse>;
 }
 
+/** What the Dashboard polls: both answers are small and carry no file lists. */
+export interface ActivityClient {
+  /** Jobs of every kind, newest first, without their results or logs. */
+  listRecentJobs(limit?: number): Promise<RecentJobsResponse>;
+  getWatchHealth(): Promise<WatchHealth>;
+}
+
 export interface RemuxClient {
   buildMuxPreview(request: MuxPreviewRequest): Promise<MuxPreviewResponse>;
   startMuxApply(request: MuxPreviewRequest): Promise<OperationJobResponse>;
@@ -206,6 +215,7 @@ export interface BackendClient
     SettingsClient,
     RenameClient,
     OperationJobsClient,
+    ActivityClient,
     RemuxClient,
     PropertyEditClient,
     LibraryClient,

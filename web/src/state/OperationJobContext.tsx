@@ -1,7 +1,10 @@
 import { createContext, type ReactNode, useContext, useEffect, useRef, useMemo, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { getOperationJob, type OperationJobResponse } from "../api";
 import { ApiError } from "../backend/error";
+import { currentFileText } from "../lib/jobActivity";
+import { rememberJobLabel } from "../lib/jobLabels";
+import { recentJobsKey } from "./useRecentJobs";
 
 const storageKey = "mkvo.web.activeOperationJob";
 const terminalStatuses = new Set(["Completed", "Failed", "Skipped", "Canceled"]);
@@ -11,80 +14,117 @@ const isUnknownJob = (error: unknown) => error instanceof ApiError && error.code
 
 type ActiveOperation = { id: string; label: string };
 
+/** A job this tab started, with what the last poll said about it. */
+export type TrackedOperation = ActiveOperation & {
+  job: OperationJobResponse | undefined;
+  isRunning: boolean;
+  statusText: string;
+};
+
 type OperationJobContextValue = {
+  /** Every job this tab follows, newest first: the latest one of each label. */
+  operations: TrackedOperation[];
+  operationFor: (label: string) => TrackedOperation | null;
+  /** The newest job, as `activeOperation`, `job`, `isRunning` and `statusText`. */
   activeOperation: ActiveOperation | null;
   job: OperationJobResponse | undefined;
   isRunning: boolean;
   statusText: string | null;
   trackJob: (id: string, label: string) => void;
-  clearJob: () => void;
 };
 
 const OperationJobContext = createContext<OperationJobContextValue | null>(null);
 
-function readActiveOperation(): ActiveOperation | null {
+// Earlier versions stored the one job they followed as a bare object.
+function readTrackedOperations(): ActiveOperation[] {
   try {
-    const stored = sessionStorage.getItem(storageKey);
-    return stored ? JSON.parse(stored) as ActiveOperation : null;
+    const stored = JSON.parse(sessionStorage.getItem(storageKey) ?? "[]") as ActiveOperation | ActiveOperation[];
+    return Array.isArray(stored) ? stored : [stored];
   } catch {
-    return null;
+    return [];
   }
 }
 
-export function OperationJobProvider({ children }: { children: ReactNode }) {
-  const [trackedOperation, setActiveOperation] = useState<ActiveOperation | null>(readActiveOperation);
-  const jobQuery = useQuery({
-    queryKey: ["operation-job", trackedOperation?.id],
-    queryFn: () => getOperationJob(trackedOperation!.id),
-    enabled: trackedOperation !== null,
-    refetchInterval: (query) => {
-      const job = query.state.data;
-      return (job && terminalStatuses.has(job.status)) || isUnknownJob(query.state.error) ? false : 1000;
-    }
-  });
-  const unknownJob = isUnknownJob(jobQuery.error);
-  const activeOperation = unknownJob ? null : trackedOperation;
-  useEffect(() => {
-    if (unknownJob) try { sessionStorage.removeItem(storageKey); } catch { /* nothing left to forget */ }
-  }, [unknownJob]);
-  const queryClient = useQueryClient();
-  const refreshedJob = useRef<string | null>(null);
-  const job = jobQuery.data;
-  useEffect(() => {
-    if (!job || !terminalStatuses.has(job.status) || refreshedJob.current === job.id) return;
-    refreshedJob.current = job.id;
-    void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });
-    void queryClient.invalidateQueries({ queryKey: ["propedit-template"] });
-  }, [job, queryClient]);
-  const isRunning = Boolean(activeOperation && (!job || !terminalStatuses.has(job.status)));
-  const statusText = useMemo(() => {
-    if (!activeOperation) return null;
-    if (!job) return `${activeOperation.label}: checking job`;
-    const finished = job.completed + job.failed + job.skipped;
-    if (!terminalStatuses.has(job.status)) {
-      const file = job.currentFile ? ` · ${job.currentFile} ${job.currentFilePercent}%` : "";
-      return `${activeOperation.label}: ${finished}/${job.total}${file}`;
-    }
-    if (job.status === "Completed") return `${activeOperation.label}: completed ${finished}/${job.total}`;
-    if (job.status === "Failed") return `${activeOperation.label}: failed`;
-    return `${activeOperation.label}: ${job.status.toLowerCase()}`;
-  }, [activeOperation, job]);
+function describe(label: string, job: OperationJobResponse | undefined) {
+  if (!job) return `${label}: checking job`;
+  const finished = job.completed + job.failed + job.skipped;
+  if (!terminalStatuses.has(job.status)) {
+    const file = currentFileText(job);
+    return `${label}: ${finished}/${job.total}${file ? ` · ${file}` : ""}`;
+  }
+  if (job.status === "Completed") return `${label}: completed ${finished}/${job.total}`;
+  if (job.status === "Failed") return `${label}: failed`;
+  return `${label}: ${job.status.toLowerCase()}`;
+}
 
-  const value = useMemo<OperationJobContextValue>(() => ({
-    activeOperation,
-    job,
-    isRunning,
-    statusText,
-    trackJob: (id, label) => {
-      const next = { id, label };
-      setActiveOperation(next);
-      try { sessionStorage.setItem(storageKey, JSON.stringify(next)); } catch { /* state still tracks it */ }
-    },
-    clearJob: () => {
-      setActiveOperation(null);
-      try { sessionStorage.removeItem(storageKey); } catch { /* state is already clear */ }
+export function OperationJobProvider({ children }: { children: ReactNode }) {
+  const [tracked, setTracked] = useState(readTrackedOperations);
+  const jobQueries = useQueries({
+    queries: tracked.map((operation) => ({
+      queryKey: ["operation-job", operation.id],
+      queryFn: () => getOperationJob(operation.id),
+      refetchInterval: (query: { state: { data?: OperationJobResponse; error: unknown } }) => {
+        const job = query.state.data;
+        return (job && terminalStatuses.has(job.status)) || isUnknownJob(query.state.error) ? false : 1000;
+      }
+    }))
+  });
+  // A job the server has forgotten is neither shown nor remembered.
+  const unknownIds = tracked.filter((_, index) => isUnknownJob(jobQueries[index]?.error)).map((operation) => operation.id).join("|");
+
+  const jobs = jobQueries.map((query) => query.data);
+  const jobsKey = jobs.map((job) => job ? `${job.id}:${job.status}:${job.completed}:${job.failed}:${job.skipped}:${job.currentFile}:${job.currentFilePercent}:${job.lines.length}` : "").join("|");
+  const operations = useMemo<TrackedOperation[]>(() => tracked
+    .map((operation, index) => {
+      const job = jobs[index];
+      return { ...operation, job, isRunning: !job || !terminalStatuses.has(job.status), statusText: describe(operation.label, job) };
+    })
+    .filter((operation) => !unknownIds.split("|").includes(operation.id)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tracked, jobsKey, unknownIds]);
+
+  // Nor is one remembered that ended over a day ago: its page has nothing left to show for it.
+  useEffect(() => {
+    const remembered = operations
+      .filter(({ job }) => !(job && terminalStatuses.has(job.status) && Date.now() - new Date(job.completedUtc ?? job.createdUtc).getTime() > 86_400_000))
+      .map(({ id, label }) => ({ id, label }));
+    try {
+      if (remembered.length) sessionStorage.setItem(storageKey, JSON.stringify(remembered));
+      else sessionStorage.removeItem(storageKey);
+    } catch { /* state still tracks them */ }
+  }, [operations]);
+
+  const queryClient = useQueryClient();
+  // The jobs seen running. One that was already over when the tab loaded has changed nothing since.
+  const runningJobs = useRef(new Set<string>());
+  useEffect(() => {
+    for (const { id, job } of operations) {
+      if (!job) continue;
+      if (!terminalStatuses.has(job.status)) { runningJobs.current.add(id); continue; }
+      if (!runningJobs.current.delete(id)) continue;
+      void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });
+      void queryClient.invalidateQueries({ queryKey: ["propedit-template"] });
+      void queryClient.invalidateQueries({ queryKey: recentJobsKey });
     }
-  }), [activeOperation, job, isRunning, statusText]);
+  }, [operations, queryClient]);
+
+  const value = useMemo<OperationJobContextValue>(() => {
+    const newest = operations[0] ?? null;
+    return {
+      operations,
+      operationFor: (label) => operations.find((operation) => operation.label === label) ?? null,
+      activeOperation: newest ? { id: newest.id, label: newest.label } : null,
+      job: newest?.job,
+      isRunning: Boolean(newest?.isRunning),
+      statusText: newest?.statusText ?? null,
+      trackJob: (id, label) => {
+        setTracked((current) => [{ id, label }, ...current.filter((operation) => operation.label !== label && operation.id !== id)]);
+        rememberJobLabel(id, label);
+        runningJobs.current.add(id);
+        void queryClient.invalidateQueries({ queryKey: recentJobsKey });
+      }
+    };
+  }, [operations, queryClient]);
 
   return <OperationJobContext.Provider value={value}>{children}</OperationJobContext.Provider>;
 }

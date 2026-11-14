@@ -54,7 +54,7 @@ MKVO_SOURCE_ROOTS=downloads=/downloads
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MKVO_MEDIA_ROOT` | `/media` | Default root shown by the Dashboard browser. |
+| `MKVO_MEDIA_ROOT` | `/media` | Default root shown by the Scan folder browser. |
 | `MKVO_SOURCE_ROOTS` | `downloads=/downloads` | Additional named source roots (`name=/path`, comma separated). |
 | `MKVO_SCAN_WORKERS` | `6` | Maximum concurrent metadata scans (clamped 1-8). |
 | `MKVO_EDIT_WORKERS` | `2` | Maximum concurrent mkvpropedit edits (clamped 1-6). |
@@ -194,4 +194,4 @@ The Settings page reports the resolved tool paths and version strings from insid
 
 ## Current Scope
 
-This is a single-container web release. Dashboard scanning, rename preview/apply/undo, mux/remux planning, lossless MP4 to MKV conversion, track property edits, library overview, settings, and logs are exposed through the same Rust host. Processing logic remains in shared core services instead of being duplicated in the React UI.
+This is a single-container web release. Scanning, the Dashboard overview, rename preview/apply/undo, mux/remux planning, lossless MP4 to MKV conversion, track property edits, library overview, settings, and logs are exposed through the same Rust host. Processing logic remains in shared core services instead of being duplicated in the React UI.

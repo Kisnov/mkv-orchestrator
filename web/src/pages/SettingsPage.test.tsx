@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "react-router-dom";
 
 import { SettingsPage } from "./SettingsPage";
@@ -835,6 +836,26 @@ describe("Settings media server saves", () => {
     fireEvent.blur(url);
     await waitFor(() => expect(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].serverUrl).toBe("http://other.local:8096"), { timeout: 2500 });
     expect(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].apiKey).toBeUndefined();
+  });
+
+  it("has Dashboard check a media server again once a new key is saved", async () => {
+    const user = userEvent.setup();
+    const check = vi.fn(() => Promise.resolve("rejected"));
+    function DashboardCheck() {
+      useQuery({ queryKey: ["media-server-check", "server-1"], queryFn: check, staleTime: Number.POSITIVE_INFINITY });
+      return null;
+    }
+    renderWithBackend(<><SettingsPage /><DashboardCheck /></>, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: true })] })),
+      saveWebSettings: (request) => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: true })], maxScanWorkers: request.maxScanWorkers ?? 4 }))
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    expect(check).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "new-key" } });
+    await waitFor(() => expect(check).toHaveBeenCalledTimes(2), { timeout: 2500 });
   });
 
   it("keeps a key that was edited while its save was in flight", async () => {

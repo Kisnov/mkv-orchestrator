@@ -2,6 +2,7 @@ import { MobileOptions } from "../components/MobileOptions";
 import { FileName } from "../components/FileName";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLocation, useNavigate } from "react-router-dom";
 import { Copy, ExternalLink, RefreshCw, RotateCcw, Search, Trash2, X } from "lucide-react";
 import {
   applyRenamePreview,
@@ -107,15 +108,25 @@ export function RenamePage() {
   );
   const [previewRows, setPreviewRows] = useState<RenamePreviewRow[]>(storedRenameState.previewRows ?? []);
   const [previewSummary, setPreviewSummary] = useState(storedRenameState.previewSummary || "");
-  const [statusText, setStatusText] = useState(storedRenameState.statusText || "Scan files on Dashboard, then search metadata.");
+  const [statusText, setStatusText] = useState(storedRenameState.statusText || "Scan files first, then search metadata.");
   const [searchResults, setSearchResults] = useState<RenameSearchResult[]>(storedRenameState.searchResults ?? []);
   const [scopeRows, setScopeRows] = useState<RenameScopeRow[]>(storedRenameState.scopeRows ?? []);
   const [settingsDefaultsApplied, setSettingsDefaultsApplied] = useState(false);
-  const [isUndoOpen, setIsUndoOpen] = useState(false);
+  // Dashboard's recent renames open the undo dialog on one batch. The request is
+  // dropped from the history entry, so a refresh or Back does not open it again.
+  const location = useLocation();
+  const navigate = useNavigate();
+  const requestedUndoBatchId = (location.state as { undoBatchId?: string } | null)?.undoBatchId ?? "";
+  useEffect(() => {
+    if (requestedUndoBatchId) navigate(location.pathname, { replace: true, state: null });
+  }, [location.pathname, navigate, requestedUndoBatchId]);
+  // A requested batch that no longer exists leaves nothing selected until the user picks one.
+  const undoRequest = useRef({ id: requestedUndoBatchId, missing: false });
+  const [isUndoOpen, setIsUndoOpen] = useState(requestedUndoBatchId !== "");
   const [isApplyConfirmOpen, setIsApplyConfirmOpen] = useState(false);
   const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
   const [applyWarnings, setApplyWarnings] = useState<string[]>([]);
-  const [selectedUndoBatchId, setSelectedUndoBatchId] = useState("");
+  const [selectedUndoBatchId, setSelectedUndoBatchId] = useState(requestedUndoBatchId);
   const [pendingProceedBatchId, setPendingProceedBatchId] = useState("");
   const [undoSummaryLines, setUndoSummaryLines] = useState<string[]>([]);
   const [highlightedPreviewPaths, setHighlightedPreviewPaths] = useState<string[]>([]);
@@ -157,7 +168,8 @@ export function RenamePage() {
   const undoPreview = useQuery({
     queryKey: ["rename-batch-preview", selectedUndoBatchId],
     queryFn: () => previewRenameBatchUndo(selectedUndoBatchId),
-    enabled: isUndoOpen && selectedUndoBatchId.length > 0
+    // Only for a batch the list holds: a requested one may be gone.
+    enabled: isUndoOpen && selectedUndoBatch !== null
   });
 
   useEffect(() => {
@@ -204,7 +216,7 @@ export function RenamePage() {
     syncFromBackend(currentScan.data);
     if (currentScan.data.files.length > 0 && storedRenameState.statusText === undefined && !initialScanStatusApplied.current) {
       initialScanStatusApplied.current = true;
-      setStatusText(`Loaded ${currentScan.data.files.length} scanned file(s) from Dashboard.`);
+      setStatusText(`Loaded ${currentScan.data.files.length} scanned file(s).`);
     }
   }, [currentScan.data, storedRenameState.statusText]);
 
@@ -231,15 +243,25 @@ export function RenamePage() {
   }, [scannedFileNames]);
 
   useEffect(() => {
-    if (!isUndoOpen) return;
+    // Until the list arrives there is nothing to check the selection against.
+    if (!isUndoOpen || !renameBatches.data) return;
 
-    const batches = renameBatches.data?.batches ?? [];
+    const batches = renameBatches.data.batches;
     if (batches.length === 0) {
       setSelectedUndoBatchId("");
       setPendingProceedBatchId("");
       setUndoSummaryLines(["No rename batches have been recorded yet."]);
       return;
     }
+
+    if (undoRequest.current.id && !batches.some((batch) => batch.id === undoRequest.current.id)) {
+      undoRequest.current = { id: "", missing: true };
+      setSelectedUndoBatchId("");
+      setUndoSummaryLines(["That rename batch is no longer available. Choose another batch from the list."]);
+      return;
+    }
+    undoRequest.current.id = "";
+    if (undoRequest.current.missing) return;
 
     if (!selectedUndoBatchId || !batches.some((batch) => batch.id === selectedUndoBatchId)) {
       setSelectedUndoBatchId(batches[0].id);
@@ -569,9 +591,9 @@ export function RenamePage() {
     const result = await currentScan.refetch();
     if (result.data?.files.length) {
       syncFromBackend(result.data);
-      setStatusText(`Loaded ${result.data.files.length} scanned file(s) from Dashboard.`);
+      setStatusText(`Loaded ${result.data.files.length} scanned file(s).`);
     } else {
-      setStatusText("No Dashboard scan is available yet.");
+      setStatusText("No scan is available yet.");
     }
   }
 
@@ -684,11 +706,13 @@ export function RenamePage() {
   }
 
   function openUndoBatch() {
+    undoRequest.current.missing = false;
     setIsUndoOpen(true);
     renameBatches.refetch();
   }
 
   function selectUndoBatch(id: string) {
+    undoRequest.current.missing = false;
     setSelectedUndoBatchId(id);
     setPendingProceedBatchId("");
     setUndoSummaryLines(["Loading restore plan..."]);

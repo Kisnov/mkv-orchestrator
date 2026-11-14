@@ -94,7 +94,7 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
   // What the adopted set was stamped with, so a repeat of the same answer does
   // not keep replacing local state on every refetch.
   // This is synchronization bookkeeping, not render state. Keeping it in a
-  // ref also lets syncFromBackend remain stable: Dashboard depends on that
+  // ref also lets syncFromBackend remain stable: Scan depends on that
   // callback, and recreating it whenever files changed caused the cached empty
   // scan response to overwrite a newly completed scan after Clear UI Cache.
   const removedPaths = useRef(new Set(readStored<string[]>(sessionStorage, "mkvo.web.removedPaths", [])));
@@ -202,7 +202,7 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
       setFilesState((current) => current.filter((file) => !removedPaths.current.has(pathKey(file.path))));
     },
     setFiles: (nextFiles) => {
-      // A direct replacement is a new Dashboard scan or an explicit clear and
+      // A direct replacement is a new scan or an explicit clear and
       // therefore ends a scoped Library handoff.
       workingViewPaths.current = null;
       setIsWorkingView(false);

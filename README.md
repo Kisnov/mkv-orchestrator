@@ -42,12 +42,15 @@ The application combines a Rust core with a React interface hosted by Tauri for 
 - Builds and manages a local metadata cache for watch folders.
 - Discovers library paths from Emby, Jellyfin, or Plex servers with per-library enablement and path mapping.
 - Supports user-editable GUI themes.
+- Shows running and recent jobs, tool versions, watch-folder state and media-server connections on the Dashboard.
 
 ## Screenshots
 
-### Dashboard
+### Scan
 
-![Dashboard](docs/screenshots/Dashboard.png)
+The Scan view of the Dashboard.
+
+![Scan](docs/screenshots/Dashboard.png)
 
 ### Rename Files
 
@@ -172,11 +175,11 @@ Provider setup links are shown inside the app under Settings.
 7. Go to `Settings > API Providers`.
 8. Enter your own TVDB and/or TMDB API key.
 9. Click **Test Selected Provider** to confirm lookup access.
-10. Go to Dashboard and scan one or more folders.
+10. Go to `Dashboard > Scan` and scan one or more folders.
 
 ## Rename Workflow
 
-1. Scan files from the Dashboard.
+1. Scan files from `Dashboard > Scan`.
 2. Go to Rename Files.
 3. Search for the show or movie title.
 4. Select the correct TVDB or TMDB result.

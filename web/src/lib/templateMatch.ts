@@ -1,6 +1,6 @@
 import type { MediaFileRow } from "../api";
 
-// Shared by the Dashboard status and the Edit Tracks default selection.
+// Shared by the Scan status and the Edit Tracks default selection.
 
 export function normalizeCompareValue(value: string | null | undefined) {
   const clean = (value ?? "").trim();

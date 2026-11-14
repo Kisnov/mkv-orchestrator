@@ -400,17 +400,17 @@ export function LibraryPage() {
     });
   }
 
-  async function handoffToDashboard(title: LibraryTitle, mode: "mismatch" | "all") {
+  async function handoffToScan(title: LibraryTitle, mode: "mismatch" | "all") {
     if (handoffRunning.current) return;
     handoffRunning.current = true;
     try {
-      await sendToDashboard(title, mode);
+      await sendToScan(title, mode);
     } finally {
       handoffRunning.current = false;
     }
   }
 
-  async function sendToDashboard(title: LibraryTitle, mode: "mismatch" | "all") {
+  async function sendToScan(title: LibraryTitle, mode: "mismatch" | "all") {
     const paths = mode === "all"
       ? title.allFilePaths
       : uniquePaths(title.seasons.flatMap((season) => season.hasIssues ? [season.templateFilePath, ...season.issueFilePaths] : []));
@@ -418,19 +418,19 @@ export function LibraryPage() {
     const fail = (message: string) => {
       if (mounted.current) setHandoff({ sending: false, message });
     };
-    setHandoff({ sending: true, message: `Sending ${title.title} to Dashboard...` });
+    setHandoff({ sending: true, message: `Sending ${title.title} to Scan...` });
     try {
       // The backend reads these files from its probe cache and holds them as the working set.
       await setFileSelection(paths, true);
     } catch (error) {
-      fail(error instanceof Error ? error.message : "The files could not be sent to Dashboard.");
+      fail(error instanceof Error ? error.message : "The files could not be sent to Scan.");
       return;
     }
     let scan: CurrentScanResponse;
     try {
       scan = await getCurrentScanFiles();
     } catch (error) {
-      // The backend took the files; Dashboard picks them up when it next reads them.
+      // The backend took the files; Scan picks them up when it next reads them.
       void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });
       fail(`The files were sent, but could not be loaded back: ${error instanceof Error ? error.message : "request failed"}`);
       return;
@@ -438,8 +438,8 @@ export function LibraryPage() {
     if (!mounted.current) return;
     const selectedFiles = scan.files.filter((file) => wanted.has(normalizePath(file.path)));
     if (selectedFiles.length === 0) {
-      // The backend kept its working set, so Dashboard is untouched.
-      fail("None of this title's files could be read, so Dashboard was left as it was.");
+      // The backend kept its working set, so Scan is untouched.
+      fail("None of this title's files could be read, so the scanned files were left as they were.");
       return;
     }
     const templatePath = title.seasons.find((season) => season.hasIssues)?.templateFilePath
@@ -450,7 +450,7 @@ export function LibraryPage() {
       if (normalizePath(right.path) === normalizePath(templatePath)) return 1;
       return left.path.localeCompare(right.path);
     });
-    // Replace Dashboard's previous scan cache before navigation. Otherwise an
+    // Replace Scan's previous scan cache before navigation. Otherwise an
     // already cached or in-flight response can restore the old file list until
     // the whole browser is refreshed.
     void queryClient.cancelQueries({ queryKey: ["current-scan-files"] });
@@ -462,7 +462,7 @@ export function LibraryPage() {
       // The in-memory working view remains authoritative for this tab.
     }
     setWorkingView(selectedFiles, selectedPaths, templatePath);
-    navigate("/dashboard");
+    navigate("/dashboard/scan");
   }
 
   const mismatchCount = titles.filter((title) => title.hasIssues).length;
@@ -470,7 +470,7 @@ export function LibraryPage() {
 
   return (
     <div className="workspace-page flex h-full min-h-0 flex-col">
-      <SectionHeader title="Library" description="Browse your media as posters, review metadata health, and send repair batches to Dashboard." />
+      <SectionHeader title="Library" description="Browse your media as posters, review metadata health, and send repair batches to Scan." />
 
       <section className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
         <div className="shrink-0 border-b border-border px-5 pt-4">
@@ -544,7 +544,7 @@ export function LibraryPage() {
       {selectedTitle ? <LibraryTitleDialog title={selectedTitle} serverId={selectedSourceOption?.serverId} sending={handoff.sending} handoffMessage={handoff.message} onClose={() => {
         setSelectedTitleId("");
         if (!handoff.sending) setHandoff({ sending: false, message: "" });
-      }} onSendMismatches={() => void handoffToDashboard(selectedTitle, "mismatch")} onSendAll={() => void handoffToDashboard(selectedTitle, "all")} onRebuild={() => rebuildTitle(selectedTitle)} /> : null}
+      }} onSendMismatches={() => void handoffToScan(selectedTitle, "mismatch")} onSendAll={() => void handoffToScan(selectedTitle, "all")} onRebuild={() => rebuildTitle(selectedTitle)} /> : null}
       {contextMenu ? <LibraryPosterContextMenu x={contextMenu.x} y={contextMenu.y} title={titles.find((title) => title.id === contextMenu.titleId) ?? null} disabled={isBusy} onRebuild={rebuildTitle} /> : null}
     </div>
   );
@@ -657,7 +657,7 @@ function LibraryTitleDialog({ title, serverId, sending, handoffMessage, onClose,
             ))}
           </div>
         </div>
-        <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-4">{handoffMessage ? <span role="status" className={`mr-auto text-sm ${sending ? "text-accent" : "text-warning"}`}>{handoffMessage}</span> : null}<button type="button" onClick={onClose} className="h-9 rounded-md border border-border bg-button px-4 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">Close</button><button type="button" onClick={onSendMismatches} disabled={sending || !title.hasIssues} className="h-9 rounded-md border border-warning bg-button px-4 text-sm font-semibold text-warning hover:bg-button-hover disabled:border-border disabled:text-disabled">Send mismatches + template to Dashboard</button><button type="button" onClick={onSendAll} disabled={sending} className="h-9 rounded-md bg-accent px-4 text-sm font-semibold text-window disabled:bg-button disabled:text-disabled">Send all files to Dashboard</button></footer>
+        <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-4">{handoffMessage ? <span role="status" className={`mr-auto text-sm ${sending ? "text-accent" : "text-warning"}`}>{handoffMessage}</span> : null}<button type="button" onClick={onClose} className="h-9 rounded-md border border-border bg-button px-4 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">Close</button><button type="button" onClick={onSendMismatches} disabled={sending || !title.hasIssues} className="h-9 rounded-md border border-warning bg-button px-4 text-sm font-semibold text-warning hover:bg-button-hover disabled:border-border disabled:text-disabled">Send mismatches + template to Scan</button><button type="button" onClick={onSendAll} disabled={sending} className="h-9 rounded-md bg-accent px-4 text-sm font-semibold text-window disabled:bg-button disabled:text-disabled">Send all files to Scan</button></footer>
       </section>
     </div>
   );

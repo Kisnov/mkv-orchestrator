@@ -143,6 +143,26 @@ describe("MKV Operations file selection", () => {
     expect(screen.queryByRole("heading", { name: "Track Removal" })).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["remove", "Remove Tracks"],
+    ["convert", "Convert / Remux"],
+    ["subtitles", "Subtitles"]
+  ] as const)("follows only its own job on the %s page", async (workflow, label) => {
+    const files = [mediaFile("Episode 01.mkv")];
+    const other = label === "Subtitles" ? "Remove Tracks" : "Subtitles";
+    window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "other-job", label: other }, { id: "own-job", label }]));
+    const running = (id: string) => ({ id, kind: "Remux", status: "Running" as const, createdUtc: "2026-08-25T20:00:00Z", startedUtc: null, completedUtc: null, completed: id === "own-job" ? 3 : 7, failed: 0, skipped: 0, total: 9, currentFile: "", currentFilePercent: 0, lines: [], muxResult: null, propEditResult: null, error: "" });
+
+    renderWithBackend(<MediaLibraryProvider><MuxRemuxPage workflow={workflow} /></MediaLibraryProvider>, {
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: "2026-08-25T20:00:00Z", files, selectedPaths: files.map((file) => file.path), summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
+      getWebSettings: () => Promise.resolve({ mkvMergeDefaultAudioLanguages: "eng", mkvMergeDefaultSubtitleLanguages: "eng" } as WebSettings),
+      getOperationJob: (id) => Promise.resolve(running(id))
+    });
+
+    expect(await screen.findByText("Applying 3/9")).toBeInTheDocument();
+    expect(screen.queryByText("Applying 7/9")).not.toBeInTheDocument();
+  });
+
   it("restores a running operation after navigating away and back", async () => {
     const files = [mediaFile("Episode 01.mkv")];
     window.sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "mux-job", label: "MKV Operations" }));

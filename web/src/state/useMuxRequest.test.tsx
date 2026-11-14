@@ -23,7 +23,7 @@ function job(patch: Partial<OperationJobResponse>): OperationJobResponse {
   };
 }
 
-function setup(overrides: Partial<BackendClient>, options: { reusePreview?: boolean } = {}) {
+function setup(overrides: Partial<BackendClient>, options: { reusePreview?: boolean; legacyLabel?: string } = {}) {
   setBackendClient(createMockBackendClient(overrides));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}><OperationJobProvider>{children}</OperationJobProvider></QueryClientProvider>;
@@ -52,7 +52,7 @@ describe("useMuxRequest", () => {
     expect(sent).toMatchObject({ planId: "plan", planFingerprint: "fingerprint", reorderTracks: true });
     expect(sent.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);
     await waitFor(() => expect(result.current.isApplying).toBe(true));
-    expect(JSON.parse(sessionStorage.getItem("mkvo.web.activeOperationJob")!)).toEqual({ id: "job-1", label: "Reorder Tracks" });
+    expect(JSON.parse(sessionStorage.getItem("mkvo.web.activeOperationJob")!)).toEqual([{ id: "job-1", label: "Reorder Tracks" }]);
   });
 
   it("says so and applies nothing when the plan has no actions", async () => {
@@ -108,6 +108,22 @@ describe("useMuxRequest", () => {
 
     await waitFor(() => expect(result.current.previewResult).toEqual(ran));
     expect(result.current.status).toBe("Reordered 1 file");
+  });
+
+  it("keeps its own job while another page's newer job runs", async () => {
+    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "job-2", label: "Edit Tracks" }, { id: "job-1", label: "Reorder Tracks" }]));
+    const { result } = setup({ getOperationJob: (id) => Promise.resolve(job({ id })) });
+
+    await waitFor(() => expect(result.current.job?.id).toBe("job-1"));
+    expect(result.current.isApplying).toBe(true);
+  });
+
+  it("adopts a job stored under the name the page used before", async () => {
+    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "job-1", label: "MKV Operations" }));
+    const { result } = setup({ getOperationJob: () => Promise.resolve(job({})) }, { legacyLabel: "MKV Operations" });
+
+    await waitFor(() => expect(result.current.job?.id).toBe("job-1"));
+    expect(result.current.isApplying).toBe(true);
   });
 
   it("ignores another page's job", async () => {
