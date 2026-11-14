@@ -20,6 +20,7 @@ import type {
   PropEditPreviewRequest,
   PropEditPreviewResponse,
   PropEditTemplateResponse,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchUndoPreviewResponse,
@@ -30,6 +31,7 @@ import type {
   RenameSearchResult,
   ScanJobResponse,
   ScanRequest,
+  WatchHealth,
   WebSettings,
   WebSettingsRequest
 } from "../api";
@@ -292,6 +294,14 @@ export class HttpBackendClient implements BackendClient {
 
   cancelOperationJob(id: string): Promise<OperationJobResponse> {
     return this.json<OperationJobResponse>(`/api/operations/${encodeURIComponent(id)}/cancel`, "POST", undefined, "OperationJobResponse");
+  }
+
+  listRecentJobs(limit?: number): Promise<RecentJobsResponse> {
+    return this.request<RecentJobsResponse>(`/api/jobs/recent${limit ? `?limit=${limit}` : ""}`, undefined, "RecentJobsResponse");
+  }
+
+  getWatchHealth(): Promise<WatchHealth> {
+    return this.request<WatchHealth>("/api/watch/health", undefined, "WatchHealth");
   }
 
   loadPropEditTemplate(request: PropEditTemplateRequest): Promise<PropEditTemplateResponse> {

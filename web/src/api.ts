@@ -38,6 +38,8 @@ import type {
   PropEditSkippedRow,
   PropEditTemplateResponse,
   PropEditTrackConfigRow,
+  RecentJob,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchRestoreMove,
@@ -55,6 +57,7 @@ import type {
   ThemeDefinition,
   ToolStatus,
   TrackRow,
+  WatchHealth,
   WebMediaServer,
   WebMediaServerLibraryPath,
   WebMediaServerPathMapping,
@@ -134,6 +137,8 @@ export type {
   PropEditSkippedRow,
   PropEditTemplateResponse,
   PropEditTrackConfigRow,
+  RecentJob,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchRestoreMove,
@@ -151,6 +156,7 @@ export type {
   ThemeDefinition,
   ToolStatus,
   TrackRow,
+  WatchHealth,
   WebMediaServer,
   WebMediaServerLibraryPath,
   WebMediaServerPathMapping,
@@ -313,6 +319,14 @@ export function getOperationJob(id: string): Promise<OperationJobResponse> {
 
 export function cancelOperationJob(id: string): Promise<OperationJobResponse> {
   return getBackendClient().cancelOperationJob(id);
+}
+
+export function listRecentJobs(limit?: number): Promise<RecentJobsResponse> {
+  return getBackendClient().listRecentJobs(limit);
+}
+
+export function getWatchHealth(): Promise<WatchHealth> {
+  return getBackendClient().getWatchHealth();
 }
 
 export function loadPropEditTemplate(request: { files: MediaFileRow[]; templatePath?: string }): Promise<PropEditTemplateResponse> {
