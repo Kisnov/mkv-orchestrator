@@ -420,6 +420,8 @@ struct Catalog {
     item_count: usize,
     reports_total: bool,
     max_page: usize,
+    /// How many items of the previous page each later page repeats.
+    overlap: usize,
     requests: Arc<Mutex<Vec<(usize, usize)>>>,
     sort_by: Arc<Mutex<Vec<String>>>,
 }
@@ -430,6 +432,7 @@ impl Catalog {
             item_count,
             reports_total,
             max_page,
+            overlap: 0,
             requests: Arc::default(),
             sort_by: Arc::default(),
         }
@@ -472,7 +475,7 @@ async fn catalog_page(
     let end = catalog
         .item_count
         .min(start.saturating_add(limit.min(catalog.max_page)));
-    let items: Vec<_> = (start..end)
+    let items: Vec<_> = (start.saturating_sub(catalog.overlap)..end)
         .map(|index| {
             serde_json::json!({
                 "Id": format!("item-{index}"),
@@ -540,6 +543,22 @@ async fn pages_are_sorted_past_the_name() {
 
     let sorts = catalog.sort_by.lock().expect("sort log").clone();
     assert_eq!(sorts, ["SortName,DateCreated"]);
+}
+
+/// A tie the server orders differently on the next request shows up as an item repeated
+/// across a page boundary.
+#[tokio::test]
+async fn an_item_repeated_across_pages_is_listed_once() {
+    let catalog = Catalog {
+        overlap: 1,
+        ..Catalog::new(1_000, true, usize::MAX)
+    };
+
+    let items = discover_catalog(&catalog).await;
+
+    assert_eq!(items.len(), 1_000);
+    let ids: std::collections::HashSet<_> = items.iter().map(|item| item.id.clone()).collect();
+    assert_eq!(ids.len(), 1_000);
 }
 
 #[tokio::test]
