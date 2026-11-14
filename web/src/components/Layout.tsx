@@ -89,7 +89,7 @@ export function Layout() {
   const { selectionError } = useMediaLibrary();
   const operation = useOperationJob();
   // Dashboard shows this list, so it is read more often there.
-  const recentJobs = useRecentJobs(location.pathname === "/dashboard" ? 10_000 : 30_000);
+  const recentJobs = useRecentJobs(location.pathname.replace(/\/+$/, "") === "/dashboard" ? 10_000 : 30_000);
   // The jobs this tab started carry their page's name; the backend's list adds scans and other tabs' jobs.
   const trackedIds = new Set(operation.operations.map((tracked) => tracked.id));
   const activeJobs = (recentJobs.data?.jobs ?? []).filter((job) => activeJobStatuses.has(job.status));
@@ -105,7 +105,7 @@ export function Layout() {
   // The jobs this tab follows are re-read for by OperationJobContext.
   const activeIds = activeJobs.filter((job) => !trackedIds.has(job.id)).map((job) => job.id).join("|");
   const previousActiveIds = useRef("");
-  const onScanPage = location.pathname === "/dashboard/scan";
+  const onScanPage = location.pathname.replace(/\/+$/, "") === "/dashboard/scan";
   useEffect(() => {
     if (!onScanPage && previousActiveIds.current.split("|").some((id) => id && !activeIds.split("|").includes(id))) {
       void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });

@@ -155,6 +155,31 @@ describe("Dashboard activity", () => {
     expect(within(rows[1]).getByRole("link", { name: /^Retry in Edit Tracks/ })).toHaveAttribute("href", "/tracks/properties");
   });
 
+  it("says what Cancel does to an edit in place, and takes a job that is already over as canceled", async () => {
+    const user = userEvent.setup();
+    let jobs = [recentJob("edit", { kind: "property_edit", status: "Running", completedUtc: null, completed: 1 }), recentJob("remux", { status: "Running", completedUtc: null, completed: 1 })];
+    const cancelOperationJob = vi.fn((id: string) => Promise.reject(id === "edit"
+      ? new ApiError("operation job edit", { code: "not_found", status: 404 })
+      : new ApiError("the job store is busy", { code: "internal", status: 500 })));
+    const listRecentJobs = vi.fn(() => Promise.resolve({ jobs }));
+    renderDashboard({ cancelOperationJob, listRecentJobs });
+
+    const cancelEdit = await screen.findByRole("button", { name: "Cancel Edit Tracks" });
+    expect(cancelEdit).toHaveAttribute("title", "Stops after the current file");
+    expect(screen.getByRole("button", { name: "Cancel Remux" })).not.toHaveAttribute("title");
+
+    await user.click(cancelEdit);
+    await waitFor(() => expect(cancelOperationJob).toHaveBeenCalledWith("edit"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Cancel Remux" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Remux could not be canceled: the job store is busy");
+    // The line goes once the list says the job is over.
+    jobs = [recentJob("edit", { kind: "property_edit" }), recentJob("remux")];
+    await user.click(screen.getByRole("button", { name: "Cancel Remux" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  });
+
   it("says why the list is empty when it cannot be read, and tries again", async () => {
     const user = userEvent.setup();
     const listRecentJobs = vi.fn<() => Promise<{ jobs: RecentJob[] }>>().mockRejectedValueOnce(new ApiError("database is locked", { code: "internal", status: 500 })).mockResolvedValue({ jobs: [recentJob("ok")] });
@@ -277,6 +302,17 @@ describe("Dashboard polling", () => {
     expect(getWatchHealth).toHaveBeenCalledTimes(2);
     // The job list is the sidebar's poll; this page only reads it.
     for (const call of Object.values(calls)) expect(call).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it("reads the watcher's state once while watching is off", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const getWatchHealth = vi.fn(() => Promise.resolve(watchOff));
+    renderDashboard({ getWatchHealth });
+
+    expect(await screen.findByText("Folders are not watched for changes.")).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(65_000));
+    expect(getWatchHealth).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
   });
 });

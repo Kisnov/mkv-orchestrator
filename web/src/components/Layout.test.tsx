@@ -1,11 +1,15 @@
 import userEvent from "@testing-library/user-event";
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { Route, Routes } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Layout } from "./Layout";
 import { MediaLibraryProvider, MediaLibrarySynchronizer } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
 import { ApiError } from "../backend/error";
+import { createMockBackendClient } from "../backend/mockClient";
+import { setBackendClient } from "../backend/runtime";
+import { OperationJobProvider } from "../state/OperationJobContext";
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -105,6 +109,39 @@ describe("several jobs at once", () => {
     await act(() => vi.advanceTimersByTimeAsync(4500));
     // Once for the page load, once for the job's end: not a third time for the job list noticing it too.
     expect(getCurrentScanFiles).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it.each(["/dashboard/scan", "/dashboard/scan/"])("leaves the files to Scan while %s is open", async (path) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let jobs = [recentJob("scan-1", "scan", 12, 128)];
+    const getCurrentScanFiles = vi.fn(() => Promise.resolve({ updatedUtc: null, files: [], selectedPaths: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 } }));
+    setBackendClient(createMockBackendClient({ getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.resolve({ jobs }), getCurrentScanFiles }));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+        <MemoryRouter initialEntries={[path]}><OperationJobProvider><MediaLibraryProvider><MediaLibrarySynchronizer />{page.props.children}</MediaLibraryProvider></OperationJobProvider></MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findAllByText("Scan: 12/128")).not.toHaveLength(0);
+    jobs = [];
+    await act(() => vi.advanceTimersByTimeAsync(4500));
+    expect(screen.queryByText("Scan: 12/128")).not.toBeInTheDocument();
+    expect(getCurrentScanFiles).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it("slows down to the idle pace when the job list stops answering", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const listRecentJobs = vi.fn<() => Promise<{ jobs: ReturnType<typeof recentJob>[] }>>()
+      .mockResolvedValueOnce({ jobs: [recentJob("scan-1", "scan", 12, 128)] })
+      .mockRejectedValue(new ApiError("down", { code: "internal", status: 500 }));
+    renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs });
+
+    expect(await screen.findAllByText("Scan: 12/128")).not.toHaveLength(0);
+    await act(() => vi.advanceTimersByTimeAsync(11_000));
+    // One quick retry found it down; the next is half a minute away, not two seconds.
+    expect(listRecentJobs).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
 

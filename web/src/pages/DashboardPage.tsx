@@ -43,7 +43,9 @@ export function DashboardPage() {
   // The sidebar polls this list on every page; here it is only read.
   const recentJobs = useQuery({ queryKey: recentJobsKey, queryFn: () => listRecentJobs(20) });
   // The page's one poll of its own. React Query pauses it while the tab is hidden.
-  const watchHealth = useQuery({ queryKey: ["watch-health"], queryFn: getWatchHealth, refetchInterval: 30_000 });
+  // Nothing changes while watching is off, so then it is read once.
+  const watchingOn = settings.data?.enableLiveWatchFolderMonitoring ?? false;
+  const watchHealth = useQuery({ queryKey: ["watch-health"], queryFn: getWatchHealth, refetchInterval: (query) => watchingOn || query.state.data?.running ? 30_000 : false });
   const renameBatches = useQuery({ queryKey: ["rename-batches"], queryFn: getRenameBatches, staleTime: 60_000 });
   // One connection check per server and session; after that only when asked.
   const servers = settings.data?.mediaServers ?? [];
@@ -65,7 +67,7 @@ export function DashboardPage() {
   // The names this browser remembers, and the jobs it follows now.
   const labels = useMemo(() => new Map([...readJobLabels(), ...operation.operations.map((tracked): [string, string] => [tracked.id, tracked.label])]), [operation.operations]);
   const tools = status.data?.tools ?? [];
-  const watch = watchState(settings.data?.enableLiveWatchFolderMonitoring ?? false, watchHealth.data, watchHealth.isError, now);
+  const watch = watchState(watchingOn, watchHealth.data, watchHealth.isError, now);
   const checks: ServerCheck[] = servers.map((server, index) => {
     const check = serverChecks[index];
     const shared = { server, isChecking: check.isFetching, check: () => void check.refetch() };

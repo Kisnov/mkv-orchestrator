@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Ban, Check, Clock, Loader2 } from "lucide-react";
 import { Link } from "react-router-dom";
 
-import { cancelOperationJob, cancelScan, getOperationJob, type RecentJob } from "../api";
+import { ApiError, cancelOperationJob, cancelScan, getOperationJob, type RecentJob } from "../api";
 import { currentFileText, duration, jobErrorText, jobFailed, jobFinishedCount, jobName, jobPage, jobResultText, timeAgo } from "../lib/jobActivity";
 import { activeJobStatuses, recentJobsKey } from "../state/useRecentJobs";
 import { DashboardCard } from "./DashboardCard";
@@ -42,6 +42,9 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
     mutationFn: (job: RecentJob): Promise<unknown> => job.kind === "scan" ? cancelScan(job.id) : cancelOperationJob(job.id),
     onSettled: () => queryClient.invalidateQueries({ queryKey: recentJobsKey })
   });
+  // A job the server no longer runs is as good as canceled; any other failure shows until the list says the job is over.
+  const cancelGone = cancel.error instanceof ApiError && cancel.error.code === "not_found";
+  const uncanceled = cancel.isError && !cancelGone ? jobs.find((job) => job.id === cancel.variables?.id && activeJobStatuses.has(job.status)) : undefined;
   const log = useQuery({ queryKey: ["job-log", logJobId], queryFn: () => getOperationJob(logJobId!), enabled: logJobId !== null, retry: false });
 
   const ordered = [...jobs.filter((job) => activeJobStatuses.has(job.status)), ...jobs.filter((job) => !activeJobStatuses.has(job.status))];
@@ -96,7 +99,7 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
                     {failed && page ? <Link to={page.to} className={rowAction} aria-label={`Retry in ${page.label}: ${label}, ${jobResultText(job)}`}>Retry in {page.label}</Link> : null}
                     {job.kind !== "scan" && !active ? <button type="button" onClick={() => onLogJobChange(job.id)} className={rowAction} aria-label={`View log of ${label}, ${jobResultText(job)}`}>View log</button> : null}
                     {active ? (
-                      <button type="button" onClick={() => cancel.mutate(job)} disabled={job.status === "Canceling" || (cancel.isPending && cancel.variables?.id === job.id)} aria-label={`Cancel ${label}`} className="h-7 rounded-md border border-warning bg-button px-2.5 text-xs font-semibold text-warning disabled:border-border disabled:text-disabled">
+                      <button type="button" onClick={() => cancel.mutate(job)} disabled={job.status === "Canceling" || (cancel.isPending && cancel.variables?.id === job.id)} aria-label={`Cancel ${label}`} title={job.kind === "property_edit" ? "Stops after the current file" : undefined} className="h-7 rounded-md border border-warning bg-button px-2.5 text-xs font-semibold text-warning disabled:border-border disabled:text-disabled">
                         Cancel
                       </button>
                     ) : null}
@@ -119,7 +122,7 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
           </button>
         </div>
       ) : null}
-      {cancel.isError ? <p role="alert" className="border-t border-border px-4 py-2 text-xs text-warning">The job could not be canceled: {cancel.error.message}</p> : null}
+      {uncanceled ? <p role="alert" className="border-t border-border px-4 py-2 text-xs text-warning">{nameOf(uncanceled)} could not be canceled: {cancel.error?.message}</p> : null}
       {logJobId && log.data ? <JobLogModal title={`${logJob ? nameOf(logJob) : "Job"} log`} job={log.data} onClose={() => onLogJobChange(null)} /> : null}
     </DashboardCard>
   );

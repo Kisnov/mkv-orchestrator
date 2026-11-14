@@ -13,6 +13,7 @@ export function useRecentJobs(idleIntervalMs: number) {
   return useQuery({
     queryKey: recentJobsKey,
     queryFn: () => listRecentJobs(20),
-    refetchInterval: (query) => query.state.data?.jobs.some((job) => activeJobStatuses.has(job.status)) ? 2000 : idleIntervalMs
+    // A list that stopped answering still shows its last jobs as running: that is no reason to ask quickly.
+    refetchInterval: (query) => query.state.status !== "error" && query.state.data?.jobs.some((job) => activeJobStatuses.has(job.status)) ? 2000 : idleIntervalMs
   });
 }
