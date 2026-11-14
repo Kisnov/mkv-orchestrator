@@ -10,7 +10,7 @@ import { DashboardScannedFiles } from "../components/DashboardScannedFiles";
 import { DashboardSystem, type ServerCheck } from "../components/DashboardSystem";
 import { rowAction } from "../components/dashboardStyles";
 import { SectionHeader } from "../components/SectionHeader";
-import { jobKindLabel, timeAgo, unresolvedFailures } from "../lib/jobActivity";
+import { jobName, timeAgo, unresolvedFailures } from "../lib/jobActivity";
 import { watchState } from "../lib/systemHealth";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useOperationJob } from "../state/OperationJobContext";
@@ -74,7 +74,7 @@ export function DashboardPage() {
   });
 
   const failures = unresolvedFailures(jobs, now);
-  const nameOf = (job: RecentJob) => labels.get(job.id) ?? jobKindLabel(job);
+  const nameOf = (job: RecentJob) => jobName(job, labels);
   const unreadable = files.filter((file) => file.status.toLowerCase().includes("failed")).length;
   const attention: AttentionItem[] = [
     ...tools.filter((tool) => !tool.available).map((tool) => ({ id: `tool-${tool.name}`, text: `${tool.name} is not available: ${tool.error || "not found"}.`, action: { label: "Tool settings", to: "/settings?tab=general" } })),

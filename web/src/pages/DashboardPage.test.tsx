@@ -74,21 +74,23 @@ describe("Dashboard on a fresh install", () => {
 
 describe("Dashboard activity", () => {
   it("lists running jobs first with progress, under the name of the page that started them", async () => {
-    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "edit", label: "Edit Tracks" }]));
+    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "reorder", label: "Reorder Tracks" }, { id: "extract", label: "MKV Operations" }]));
     renderDashboard({
       getOperationJob: () => new Promise(() => undefined),
       listRecentJobs: () => Promise.resolve({ jobs: [
         recentJob("old"),
-        recentJob("edit", { kind: "property_edit", status: "Running", completedUtc: null, completed: 1, total: 4, currentFile: "/media/Show/02.mkv", currentFilePercent: 50 }),
+        recentJob("extract", { kind: "extract_subtitles" }),
+        recentJob("reorder", { status: "Running", completedUtc: null, completed: 1, total: 4, currentFile: "/media/Show/02.mkv", currentFilePercent: 50 }),
         recentJob("scan", { kind: "scan", status: "Running", completedUtc: null, completed: 12, total: 128, currentFile: "/media/Show/13.mkv" })
       ] })
     });
 
     const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
-    expect(rows.map((row) => row.querySelector(".font-semibold")?.textContent)).toEqual(["Edit Tracks", "Scan", "Remux"]);
+    // A remux takes its page's name; a kind that names itself keeps it.
+    expect(rows.map((row) => row.querySelector(".font-semibold")?.textContent)).toEqual(["Reorder Tracks", "Scan", "Remux", "Extract Subtitles"]);
     expect(within(rows[0]).getByText("1 of 4 files")).toBeInTheDocument();
     expect(within(rows[0]).getByText("02.mkv 50%")).toBeInTheDocument();
-    expect(within(rows[0]).getByRole("progressbar", { name: "Edit Tracks progress" })).toHaveAttribute("aria-valuenow", "38");
+    expect(within(rows[0]).getByRole("progressbar", { name: "Reorder Tracks progress" })).toHaveAttribute("aria-valuenow", "38");
     expect(within(rows[1]).getByText("13.mkv")).toBeInTheDocument();
     expect(within(rows[2]).getByText("4 done")).toBeInTheDocument();
     expect(screen.getByText("2 running")).toBeInTheDocument();

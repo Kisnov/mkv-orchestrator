@@ -30,6 +30,11 @@ export function jobKindLabel(job: RecentJob) {
   return kindLabels[job.kind] ?? job.kind;
 }
 
+/** A remux job says little by its kind, so it takes the name of the page that started it when this tab knows it. */
+export function jobName(job: RecentJob, pageLabels: Map<string, string>) {
+  return (job.kind === "remux" && pageLabels.get(job.id)) || jobKindLabel(job);
+}
+
 export function jobPage(job: RecentJob) {
   return kindPages[job.kind] ?? null;
 }

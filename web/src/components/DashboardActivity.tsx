@@ -4,7 +4,7 @@ import { AlertTriangle, Ban, Check, Clock, Loader2 } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { cancelOperationJob, cancelScan, getOperationJob, type RecentJob } from "../api";
-import { currentFileText, duration, jobErrorText, jobFailed, jobFinishedCount, jobKindLabel, jobPage, jobResultText, timeAgo } from "../lib/jobActivity";
+import { currentFileText, duration, jobErrorText, jobFailed, jobFinishedCount, jobName, jobPage, jobResultText, timeAgo } from "../lib/jobActivity";
 import { activeJobStatuses, recentJobsKey } from "../state/useRecentJobs";
 import { DashboardCard } from "./DashboardCard";
 import { linkButton, rowAction } from "./dashboardStyles";
@@ -47,7 +47,7 @@ export function DashboardActivity({ jobs, labels, now, isLoading, error, onRetry
   const ordered = [...jobs.filter((job) => activeJobStatuses.has(job.status)), ...jobs.filter((job) => !activeJobStatuses.has(job.status))];
   const shown = showAll ? ordered : ordered.slice(0, shownAtFirst);
   const running = ordered.filter((job) => activeJobStatuses.has(job.status)).length;
-  const nameOf = (job: RecentJob) => labels.get(job.id) ?? jobKindLabel(job);
+  const nameOf = (job: RecentJob) => jobName(job, labels);
   const logJob = jobs.find((job) => job.id === logJobId);
 
   return (
