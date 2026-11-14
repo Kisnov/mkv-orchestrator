@@ -100,16 +100,17 @@ export function Layout() {
   const isRunning = runningLines.length > 0;
   const lastFailed = operation.job?.status === "Failed";
   const statusLines = isRunning ? runningLines : operation.statusText ? [{ id: "last", text: operation.statusText }] : null;
-  // A job that ended anywhere may have changed the scanned files.
+  // A job that ended anywhere may have changed the scanned files. Scan applies its own scan's result itself.
   const queryClient = useQueryClient();
   const activeIds = activeJobs.map((job) => job.id).join("|");
   const previousActiveIds = useRef("");
+  const onScanPage = location.pathname === "/dashboard/scan";
   useEffect(() => {
-    if (previousActiveIds.current.split("|").some((id) => id && !activeIds.split("|").includes(id))) {
+    if (!onScanPage && previousActiveIds.current.split("|").some((id) => id && !activeIds.split("|").includes(id))) {
       void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });
     }
     previousActiveIds.current = activeIds;
-  }, [activeIds, queryClient]);
+  }, [activeIds, onScanPage, queryClient]);
   const toggleSidebar = () => setCollapsed((value) => {
     localStorage.setItem("mkvo.sidebar.collapsed", String(!value));
     return !value;

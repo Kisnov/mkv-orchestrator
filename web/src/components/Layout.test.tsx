@@ -3,7 +3,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Layout } from "./Layout";
-import { MediaLibraryProvider } from "../state/MediaLibraryContext";
+import { MediaLibraryProvider, MediaLibrarySynchronizer } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
 import { ApiError } from "../backend/error";
 
@@ -72,6 +72,20 @@ describe("several jobs at once", () => {
     renderWithBackend(page, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.resolve({ jobs: [recentJob("scan-1", "scan", 12, 128)] }) });
 
     await waitFor(() => expect(screen.getByRole("link", { name: "Dashboard" }).querySelector("[data-running]")).not.toBeNull());
+  });
+
+  it("re-reads the scanned files when a job only the backend knows has ended", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let jobs = [recentJob("scan-1", "scan", 12, 128)];
+    const getCurrentScanFiles = vi.fn(() => Promise.resolve({ updatedUtc: null, files: [], selectedPaths: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 } }));
+    renderWithBackend(<MediaLibraryProvider><MediaLibrarySynchronizer />{page.props.children}</MediaLibraryProvider>, { getStatus: () => Promise.resolve(status), listRecentJobs: () => Promise.resolve({ jobs }), getCurrentScanFiles });
+
+    expect(await screen.findAllByText("Scan: 12/128")).not.toHaveLength(0);
+    expect(getCurrentScanFiles).toHaveBeenCalledTimes(1);
+    jobs = [{ ...jobs[0], status: "Completed" as never }];
+    await act(() => vi.advanceTimersByTimeAsync(2100));
+    await waitFor(() => expect(getCurrentScanFiles).toHaveBeenCalledTimes(2));
+    vi.useRealTimers();
   });
 
   it("stays ready when the job list cannot be read", async () => {
