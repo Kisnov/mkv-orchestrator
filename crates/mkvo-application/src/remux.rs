@@ -415,7 +415,9 @@ fn preserved_output_for(file: &MediaFile, suffix: &str) -> PathBuf {
 fn mark_duplicate_outputs(items: &mut [RemuxPlanItem]) {
     let mut outputs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
-        if !same_path(&item.source, &item.final_output) {
+        // An extraction's final output is the source folder, which it does not write.
+        if item.mode != RemuxMode::ExtractSubtitles && !same_path(&item.source, &item.final_output)
+        {
             outputs
                 .entry(path_key(&item.final_output))
                 .or_default()
@@ -602,6 +604,41 @@ mod tests {
         );
         assert!(plan.payload.items[0].delete_source_after_success);
         assert!(plan.payload.items[0].can_apply());
+    }
+
+    #[test]
+    fn extracting_from_two_episodes_in_one_folder_plans_both() {
+        let files = vec![media("show/Ep 01.mkv"), media("show/Ep 02.mkv")];
+        let extractions = files
+            .iter()
+            .map(|file| {
+                let track = TrackExtraction {
+                    track_id: 1,
+                    kind: TrackKind::Subtitle,
+                    output: file.path.with_extension("eng.1.srt"),
+                };
+                (file.path.clone(), vec![track])
+            })
+            .collect();
+        let request = RemuxPlanRequest {
+            source_access: BTreeMap::new(),
+            mode: RemuxMode::ExtractSubtitles,
+            files,
+            options: RemuxOptions::default(),
+            external_subtitles: BTreeMap::new(),
+            extractions,
+            existing_paths: BTreeSet::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            tool_fingerprints: BTreeMap::new(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        };
+
+        let plan = RemuxPlanner.build_plan(request).unwrap();
+        for item in &plan.payload.items {
+            assert!(item.can_apply(), "{:?}", item.conflicts);
+        }
     }
 
     #[test]
