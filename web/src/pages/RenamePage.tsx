@@ -2,6 +2,7 @@ import { MobileOptions } from "../components/MobileOptions";
 import { FileName } from "../components/FileName";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLocation } from "react-router-dom";
 import { Copy, ExternalLink, RefreshCw, RotateCcw, Search, Trash2, X } from "lucide-react";
 import {
   applyRenamePreview,
@@ -111,11 +112,13 @@ export function RenamePage() {
   const [searchResults, setSearchResults] = useState<RenameSearchResult[]>(storedRenameState.searchResults ?? []);
   const [scopeRows, setScopeRows] = useState<RenameScopeRow[]>(storedRenameState.scopeRows ?? []);
   const [settingsDefaultsApplied, setSettingsDefaultsApplied] = useState(false);
-  const [isUndoOpen, setIsUndoOpen] = useState(false);
+  // Dashboard's recent renames open the undo dialog on one batch.
+  const requestedUndoBatchId = (useLocation().state as { undoBatchId?: string } | null)?.undoBatchId ?? "";
+  const [isUndoOpen, setIsUndoOpen] = useState(requestedUndoBatchId !== "");
   const [isApplyConfirmOpen, setIsApplyConfirmOpen] = useState(false);
   const [isSummaryExpanded, setIsSummaryExpanded] = useState(false);
   const [applyWarnings, setApplyWarnings] = useState<string[]>([]);
-  const [selectedUndoBatchId, setSelectedUndoBatchId] = useState("");
+  const [selectedUndoBatchId, setSelectedUndoBatchId] = useState(requestedUndoBatchId);
   const [pendingProceedBatchId, setPendingProceedBatchId] = useState("");
   const [undoSummaryLines, setUndoSummaryLines] = useState<string[]>([]);
   const [highlightedPreviewPaths, setHighlightedPreviewPaths] = useState<string[]>([]);
@@ -231,9 +234,10 @@ export function RenamePage() {
   }, [scannedFileNames]);
 
   useEffect(() => {
-    if (!isUndoOpen) return;
+    // Until the list arrives there is nothing to check the selection against.
+    if (!isUndoOpen || !renameBatches.data) return;
 
-    const batches = renameBatches.data?.batches ?? [];
+    const batches = renameBatches.data.batches;
     if (batches.length === 0) {
       setSelectedUndoBatchId("");
       setPendingProceedBatchId("");
