@@ -44,15 +44,27 @@ it("opens a batch error on what failed", () => {
   expect(jobErrorText(job({}))).toBe("");
 });
 
-it("counts a failure until a later clean run of the same kind", () => {
+it("counts a failure until a later clean run of the same page, or of the same kind when no page is known", () => {
+  const none = new Map<string, string>();
   const failed = job({ id: "failed", status: "Failed", failed: 1 });
-  expect(unresolvedFailures([failed], now).map((item) => item.id)).toEqual(["failed"]);
-  expect(unresolvedFailures([job({ id: "retry" }), failed], now)).toEqual([]);
+  expect(unresolvedFailures([failed], none, now).map((item) => item.id)).toEqual(["failed"]);
+  expect(unresolvedFailures([job({ id: "retry" }), failed], none, now)).toEqual([]);
   // Another kind's success, or an older one, settles nothing.
-  expect(unresolvedFailures([job({ id: "scan", kind: "scan" }), failed, job({ id: "older" })], now).map((item) => item.id)).toEqual(["failed"]);
-  expect(unresolvedFailures([job({ id: "old", status: "Failed", completedUtc: "2026-11-12T11:00:00Z" })], now)).toEqual([]);
+  expect(unresolvedFailures([job({ id: "scan", kind: "scan" }), failed, job({ id: "older" })], none, now).map((item) => item.id)).toEqual(["failed"]);
+  expect(unresolvedFailures([job({ id: "old", status: "Failed", completedUtc: "2026-11-12T11:00:00Z" })], none, now)).toEqual([]);
+  // A clean Remove does not settle a failed Reorder, though both are remuxes.
+  const pages = new Map([["failed", "Reorder Tracks"], ["remove", "Remove Tracks"], ["reorder", "Reorder Tracks"]]);
+  expect(unresolvedFailures([job({ id: "remove" }), failed], pages, now).map((item) => item.id)).toEqual(["failed"]);
+  expect(unresolvedFailures([job({ id: "reorder" }), failed], pages, now)).toEqual([]);
+});
+
+it("settles a failed scan with a later scan that finished, unreadable files or not", () => {
+  const none = new Map<string, string>();
+  const failedScan = job({ id: "failed", kind: "scan", status: "Failed" });
   // Unreadable files do not make a scan a failed job.
-  expect(unresolvedFailures([job({ kind: "scan", failed: 2 })], now)).toEqual([]);
+  expect(unresolvedFailures([job({ kind: "scan", failed: 2 })], none, now)).toEqual([]);
+  expect(unresolvedFailures([job({ id: "rescan", kind: "scan", failed: 1 }), failedScan], none, now)).toEqual([]);
+  expect(unresolvedFailures([job({ id: "again", kind: "scan", status: "Failed" }), failedScan], none, now).map((item) => item.id)).toEqual(["again", "failed"]);
 });
 
 it("formats ages and durations", () => {

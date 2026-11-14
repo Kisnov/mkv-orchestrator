@@ -11,13 +11,13 @@ import { DashboardSystem, type ServerCheck } from "../components/DashboardSystem
 import { rowAction } from "../components/dashboardStyles";
 import { SectionHeader } from "../components/SectionHeader";
 import { jobName, timeAgo, unresolvedFailures } from "../lib/jobActivity";
-import { readJobLabels } from "../lib/jobLabels";
+import { readDismissedFailures, readJobLabels, rememberDismissedFailure } from "../lib/jobLabels";
 import { watchState } from "../lib/systemHealth";
 import { useMediaLibrary } from "../state/MediaLibraryContext";
 import { useOperationJob } from "../state/OperationJobContext";
 import { activeJobStatuses, recentJobsKey } from "../state/useRecentJobs";
 
-type AttentionItem = { id: string; text: string; action?: { label: string; to?: string; onClick?: () => void } };
+type AttentionItem = { id: string; text: string; action?: { label: string; to?: string; onClick?: () => void }; onDismiss?: () => void };
 
 function readScanSources(): string[] {
   try {
@@ -59,6 +59,7 @@ export function DashboardPage() {
     }))
   });
   const [logJobId, setLogJobId] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState(readDismissedFailures);
 
   const jobs = recentJobs.data?.jobs ?? [];
   // The names this browser remembers, and the jobs it follows now.
@@ -75,20 +76,19 @@ export function DashboardPage() {
     return { ...shared, health: "checking", text: "" };
   });
 
-  const failures = unresolvedFailures(jobs, now);
+  const failures = unresolvedFailures(jobs, labels, now).filter((job) => !dismissed.includes(job.id));
   const nameOf = (job: RecentJob) => jobName(job, labels);
   const unreadable = files.filter((file) => file.status.toLowerCase().includes("failed")).length;
   const attention: AttentionItem[] = [
     ...tools.filter((tool) => !tool.available).map((tool) => ({ id: `tool-${tool.name}`, text: `${tool.name} is not available: ${tool.error || "not found"}.`, action: { label: "Tool settings", to: "/settings?tab=general" } })),
     ...(watch.health === "problem" ? [{ id: "watch", text: `Watch folders: ${watch.text}`, action: { label: "Watch settings", to: "/settings?tab=library" } }] : []),
     ...checks.filter((check) => check.health === "problem" && !check.isChecking).map((check) => ({ id: `server-${check.server.id}`, text: check.text.startsWith(check.server.name) ? check.text : `${check.server.name}: ${check.text}`, action: { label: "Server settings", to: "/settings?tab=library" } })),
-    ...(failures.length ? [{
-      id: "failed-jobs",
-      text: failures.length === 1
-        ? `${nameOf(failures[0])} failed ${timeAgo(failures[0].completedUtc ?? failures[0].createdUtc, now)}.`
-        : `${failures.length} jobs failed in the last 24 hours, most recently ${nameOf(failures[0])}.`,
-      action: failures[0].kind === "scan" ? undefined : { label: failures.length === 1 ? "View log" : "View the latest log", onClick: () => setLogJobId(failures[0].id) }
-    }] : []),
+    ...failures.map((job) => ({
+      id: `job-${job.id}`,
+      text: `${nameOf(job)} failed ${timeAgo(job.completedUtc ?? job.createdUtc, now)}.`,
+      action: job.kind === "scan" ? { label: "Open Scan", to: "/dashboard/scan" } : { label: "View log", onClick: () => setLogJobId(job.id) },
+      onDismiss: () => { rememberDismissedFailure(job.id); setDismissed((current) => [...current, job.id]); }
+    })),
     ...(unreadable ? [{ id: "unreadable", text: `${unreadable} scanned ${unreadable === 1 ? "file" : "files"} could not be read.`, action: { label: "Open Scan", to: "/dashboard/scan" } }] : [])
   ];
   const stillChecking = status.isLoading || recentJobs.isLoading || checks.some((check) => check.isChecking);
@@ -108,8 +108,11 @@ export function DashboardPage() {
                 <AlertTriangle size={14} className="mt-1 text-warning" aria-hidden="true" />
                 <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5">
                   <span className="min-w-0 break-words text-text [overflow-wrap:anywhere]">{item.text}</span>
-                  {item.action?.to ? <Link to={item.action.to} className={rowAction}>{item.action.label}</Link> : null}
-                  {item.action?.onClick ? <span className="text-xs font-semibold"><button type="button" onClick={item.action.onClick} className={rowAction}>{item.action.label}</button></span> : null}
+                  <span className="flex items-baseline gap-x-4 text-xs font-semibold">
+                    {item.action?.to ? <Link to={item.action.to} className={rowAction}>{item.action.label}</Link> : null}
+                    {item.action?.onClick ? <button type="button" onClick={item.action.onClick} className={rowAction}>{item.action.label}</button> : null}
+                    {item.onDismiss ? <button type="button" onClick={item.onDismiss} className={rowAction} aria-label={`Dismiss: ${item.text}`}>Dismiss</button> : null}
+                  </span>
                 </div>
               </li>
             ))}

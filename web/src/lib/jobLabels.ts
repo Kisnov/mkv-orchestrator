@@ -17,3 +17,20 @@ export function rememberJobLabel(id: string, label: string) {
     localStorage.setItem(storageKey, JSON.stringify([...labels, [id, label]].slice(-remembered)));
   } catch { /* the job is only named by its kind */ }
 }
+
+const dismissedKey = "mkvo.web.dismissedJobFailures";
+
+/** The failed jobs the user has acknowledged on the Dashboard. */
+export function readDismissedFailures(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(dismissedKey) ?? "[]") as string[];
+  } catch {
+    return [];
+  }
+}
+
+export function rememberDismissedFailure(id: string) {
+  try {
+    localStorage.setItem(dismissedKey, JSON.stringify([...readDismissedFailures().filter((known) => known !== id), id].slice(-remembered)));
+  } catch { /* dismissed for this visit only */ }
+}

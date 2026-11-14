@@ -185,8 +185,32 @@ describe("Dashboard attention list", () => {
     expect(attention.getByRole("link", { name: "Server settings" })).toHaveAttribute("href", "/settings?tab=library");
     expect(await attention.findByText("Remux failed 5 minutes ago.")).toBeInTheDocument();
     expect(attention.getAllByRole("listitem")).toHaveLength(4);
+    // Only a failed job can be dismissed: the other lines go away when the cause does.
+    expect(attention.getAllByRole("button", { name: /^Dismiss/ })).toHaveLength(1);
     expect(testMediaServerConnection).toHaveBeenCalledTimes(1);
     expect(testMediaServerConnection).toHaveBeenCalledWith({ id: "server-1" });
+  });
+
+  it("gives each failed job its own line, which can be dismissed for good", async () => {
+    const user = userEvent.setup();
+    const jobs = [recentJob("scan-failed", { kind: "scan", status: "Failed", error: "folder is gone" }), recentJob("failed", { status: "Failed", failed: 1, error: "tool failed" })];
+    const first = renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs }) });
+
+    const attention = within(screen.getByRole("region", { name: "Needs attention" }));
+    expect(await attention.findByText("Remux failed 5 minutes ago.")).toBeInTheDocument();
+    const scanLine = attention.getByText("Scan failed 5 minutes ago.").closest("li")!;
+    expect(within(scanLine).getByRole("link", { name: "Open Scan" })).toHaveAttribute("href", "/dashboard/scan");
+
+    await user.click(attention.getByRole("button", { name: "Dismiss: Remux failed 5 minutes ago." }));
+    expect(attention.queryByText("Remux failed 5 minutes ago.")).not.toBeInTheDocument();
+    expect(attention.getByText("Scan failed 5 minutes ago.")).toBeInTheDocument();
+
+    // Still dismissed after a reload.
+    first.unmount();
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs }) });
+    const again = within(screen.getByRole("region", { name: "Needs attention" }));
+    expect(await again.findByText("Scan failed 5 minutes ago.")).toBeInTheDocument();
+    expect(again.queryByText("Remux failed 5 minutes ago.")).not.toBeInTheDocument();
   });
 
   it("checks a media server once and again only when asked", async () => {

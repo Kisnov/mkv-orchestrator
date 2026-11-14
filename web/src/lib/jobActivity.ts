@@ -98,11 +98,15 @@ export function jobFailed(job: RecentJob) {
   return job.status === "Failed" || (job.kind !== "scan" && job.status === "Completed" && job.failed > 0);
 }
 
-/** Failures of the last day that no later clean run of the same kind has settled. `jobs` is newest first. */
-export function unresolvedFailures(jobs: RecentJob[], now = Date.now()) {
+/**
+ * Failures of the last day that no later run has settled. A run settles a failure of the same page
+ * when the pages are known, else of the same kind. `jobs` is newest first.
+ */
+export function unresolvedFailures(jobs: RecentJob[], pageLabels: Map<string, string>, now = Date.now()) {
+  const origin = (job: RecentJob) => pageLabels.get(job.id) ?? job.kind;
   return jobs.filter((job, index) => jobFailed(job)
     && now - new Date(job.completedUtc ?? job.createdUtc).getTime() < 86_400_000
-    && !jobs.slice(0, index).some((newer) => newer.kind === job.kind && newer.status === "Completed" && newer.failed === 0));
+    && !jobs.slice(0, index).some((newer) => origin(newer) === origin(job) && newer.status === "Completed" && !jobFailed(newer)));
 }
 
 const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
