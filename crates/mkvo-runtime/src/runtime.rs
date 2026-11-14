@@ -1125,6 +1125,85 @@ mod library_root_tests {
         assert_eq!(report.orphan_journals[0].items, record.items);
     }
 
+    #[tokio::test]
+    async fn startup_removes_only_temporaries_whose_original_is_intact() {
+        use mkvo_application::JournalItemStatus;
+        use mkvo_domain::ResourceClaim;
+
+        let host = host(true);
+        let folder = host.mount.join("tv");
+        let path = |name: &str| folder.join(name);
+        // Ep 01 was being remuxed; Ep 02 lost its original in the replace; Ep 03 completed.
+        for name in [
+            "Ep 01.mkv",
+            ".Ep 01.mkv.mkvo-remux.tmp",
+            ".Ep 02.mkv.mkvo-remux.tmp",
+            "Ep 03.mkv",
+            ".Ep 03.mkv.mkvo-remux.tmp",
+            "Ep 01.eng.2.srt",
+            ".Ep 01.eng.2.srt.mkvo-extract-2.tmp",
+            ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
+            ".Other.mkv.mkvo-remux.tmp",
+        ] {
+            std::fs::write(path(name), "data").unwrap();
+        }
+        let item = |name: &str, status| mkvo_application::JournalItemOutcome {
+            key: path(name).to_string_lossy().into_owned(),
+            status,
+            detail: None,
+        };
+        let record = mkvo_application::JournalRecord {
+            idempotency_key: IdempotencyKey::parse("killed-remux").unwrap(),
+            plan_id: mkvo_domain::PlanId::new(),
+            step: 1,
+            status: JournalStatus::Running,
+            resources: [
+                "Ep 01.mkv",
+                ".Ep 01.mkv.mkvo-remux.tmp",
+                "Ep 02.mkv",
+                ".Ep 02.mkv.mkvo-remux.tmp",
+                "Ep 03.mkv",
+                ".Ep 03.mkv.mkvo-remux.tmp",
+                "Ep 01.eng.2.srt",
+                "Ep 02.eng.2.srt",
+            ]
+            .map(|name| ResourceClaim::write(path(name)))
+            .to_vec(),
+            items: vec![
+                item("Ep 01.mkv", JournalItemStatus::Pending),
+                item("Ep 02.mkv", JournalItemStatus::Pending),
+                item("Ep 03.mkv", JournalItemStatus::Completed),
+            ],
+            detail: None,
+            updated_utc: Utc::now(),
+        };
+        let journal = &host.runtime.inner.dependencies.journal;
+        journal.begin(&record).await.unwrap();
+
+        host.runtime
+            .recover_startup_state()
+            .await
+            .expect("recovery");
+
+        let mut left: Vec<_> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
+                ".Ep 02.mkv.mkvo-remux.tmp",
+                ".Ep 03.mkv.mkvo-remux.tmp",
+                ".Other.mkv.mkvo-remux.tmp",
+                "Ep 01.eng.2.srt",
+                "Ep 01.mkv",
+                "Ep 03.mkv",
+            ]
+        );
+    }
+
     /// The whole point of the setting for a container user: several shares
     /// inside the one mount they bound in.
     #[tokio::test]

@@ -223,6 +223,9 @@ impl MkvoRuntime {
         match self.inner.dependencies.journal.list_incomplete().await? {
             Some(journals) => {
                 report.journal_enumeration_supported = true;
+                if persist {
+                    self.clean_stale_temporaries(&journals).await;
+                }
                 for journal in journals {
                     if self
                         .inner
@@ -274,4 +277,66 @@ impl MkvoRuntime {
         }
         Ok(report)
     }
+
+    /// Removes the temporaries an interrupted job left next to an intact original, and
+    /// keeps (with a warning) any that may be the only copy. Reads only the folders the
+    /// journals claim.
+    async fn clean_stale_temporaries(&self, journals: &[mkvo_application::JournalRecord]) {
+        let file_system = &self.inner.dependencies.file_system;
+        for journal in journals {
+            let claimed: BTreeSet<_> = journal
+                .resources
+                .iter()
+                .map(|claim| mkvo_domain::path_key(&claim.path))
+                .collect();
+            let folders: BTreeSet<_> = journal
+                .resources
+                .iter()
+                .filter_map(|claim| claim.path.parent())
+                .collect();
+            for folder in folders {
+                let Ok(listed) = file_system.list_files(folder).await else {
+                    continue;
+                };
+                for name in listed.iter().filter_map(|path| path.file_name()?.to_str()) {
+                    let Some((original, extraction)) = temporary_original(name) else {
+                        continue;
+                    };
+                    let original = folder.join(original);
+                    let key = mkvo_domain::path_key(&original);
+                    if !claimed.contains(&key) {
+                        continue;
+                    }
+                    let temporary = folder.join(name);
+                    // An extraction temporary is keyed by the subtitle it replaces, not the item.
+                    let completed = !extraction
+                        && journal.items.iter().any(|item| {
+                            item.status == mkvo_application::JournalItemStatus::Completed
+                                && mkvo_domain::path_key(Path::new(&item.key)) == key
+                        });
+                    if completed || !file_system.exists(&original).await.unwrap_or(false) {
+                        tracing::warn!(
+                            path = %temporary.display(),
+                            "an interrupted job left this file and it may be the only copy; it was kept"
+                        );
+                    } else if let Err(error) = file_system.remove_file(&temporary).await {
+                        tracing::warn!(path = %temporary.display(), %error, "an interrupted job left this file and it could not be removed");
+                    } else {
+                        tracing::info!(path = %temporary.display(), "removed a file an interrupted job left behind");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The file a remux or extraction temporary was written for, and whether it is an extraction.
+fn temporary_original(name: &str) -> Option<(&str, bool)> {
+    let inner = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    if let Some(original) = inner.strip_suffix(".mkvo-remux") {
+        return Some((original, false));
+    }
+    let (original, track) = inner.rsplit_once(".mkvo-extract-")?;
+    (!track.is_empty() && track.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((original, true))
 }
