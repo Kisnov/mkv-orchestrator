@@ -2150,6 +2150,7 @@ pub(super) mod execution_tests {
 
     use super::*;
     use crate::{MemorySecretStore, RuntimeConfig, RuntimeDependencies};
+    use mkvo_domain::ResourceClaim;
 
     struct NoScan;
 
@@ -2928,5 +2929,190 @@ pub(super) mod execution_tests {
             "The file is being analyzed.\nThe changes are written to the file.\n"
         ));
         assert!(!ended("mkvextract", "Progress: 100%\n"));
+    }
+
+    /// A share where one folder never answers and another cannot be listed.
+    struct UnreachableFolders(Arc<dyn FileSystem>);
+
+    #[async_trait]
+    impl FileSystem for UnreachableFolders {
+        async fn exists(&self, path: &Path) -> Result<bool, PortError> {
+            self.0.exists(path).await
+        }
+
+        async fn is_directory(&self, path: &Path) -> Result<bool, PortError> {
+            self.0.is_directory(path).await
+        }
+
+        async fn fingerprint(&self, path: &Path) -> Result<FileFingerprint, PortError> {
+            self.0.fingerprint(path).await
+        }
+
+        async fn move_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            self.0.move_file(source, target).await
+        }
+
+        async fn remove_file(&self, path: &Path) -> Result<(), PortError> {
+            self.0.remove_file(path).await
+        }
+
+        async fn probe_access(
+            &self,
+            path: &Path,
+            access: RequiredAccess,
+        ) -> Result<FileAccessState, PortError> {
+            self.0.probe_access(path, access).await
+        }
+
+        async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            self.0.replace_file(source, target).await
+        }
+
+        async fn list_files(&self, directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+            if directory.ends_with("stalled") {
+                std::future::pending::<()>().await;
+            }
+            if directory.ends_with("unlistable") {
+                return Err(PortError::Other("the share went away".to_owned()));
+            }
+            self.0.list_files(directory).await
+        }
+    }
+
+    fn running_journal(
+        key: &str,
+        claimed: &[PathBuf],
+        items: &[(PathBuf, mkvo_application::JournalItemStatus)],
+    ) -> mkvo_application::JournalRecord {
+        mkvo_application::JournalRecord {
+            idempotency_key: IdempotencyKey::parse(key).expect("key"),
+            plan_id: mkvo_domain::PlanId::new(),
+            step: 1,
+            status: mkvo_application::JournalStatus::Running,
+            resources: claimed.iter().cloned().map(ResourceClaim::write).collect(),
+            items: items
+                .iter()
+                .map(|(path, status)| mkvo_application::JournalItemOutcome {
+                    key: path.to_string_lossy().into_owned(),
+                    status: *status,
+                    detail: None,
+                })
+                .collect(),
+            detail: None,
+            updated_utc: Utc::now(),
+        }
+    }
+
+    fn names_in(folder: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(folder)
+            .expect("folder")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn startup_removes_only_temporaries_whose_original_is_intact() {
+        use mkvo_application::JournalItemStatus::{Completed, Pending};
+
+        let library = library_with(ScriptedTools(writes_output), |dependencies| {
+            dependencies.file_system =
+                Arc::new(UnreachableFolders(dependencies.file_system.clone()));
+        });
+        let root = library.directory.path();
+        let write = |path: PathBuf| {
+            std::fs::create_dir_all(path.parent().expect("folder")).expect("folder");
+            std::fs::write(&path, "data").expect("file");
+            path
+        };
+        let tv = root.join("tv");
+        let at = |name: &str| tv.join(name);
+        // Ep 01 was being remuxed; Ep 02 lost its original in the replace; Ep 03 completed;
+        // Ep 05 is in use by a job started after startup.
+        for name in [
+            "Ep 01.mkv",
+            ".Ep 01.mkv.mkvo-remux.tmp",
+            ".Ep 02.mkv.mkvo-remux.tmp",
+            "Ep 03.mkv",
+            ".Ep 03.mkv.mkvo-remux.tmp",
+            "Ep 05.mkv",
+            ".Ep 05.mkv.mkvo-remux.tmp",
+            "Ep 01.eng.2.srt",
+            ".Ep 01.eng.2.srt.mkvo-extract-2.tmp",
+            ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
+            ".Other.mkv.mkvo-remux.tmp",
+        ] {
+            write(at(name));
+        }
+        let stalled = write(root.join("stalled/A.mkv"));
+        let unlistable = write(root.join("unlistable/B.mkv"));
+        let claimed: Vec<_> = [
+            "Ep 01.mkv",
+            "Ep 02.mkv",
+            "Ep 03.mkv",
+            "Ep 05.mkv",
+            "Ep 01.eng.2.srt",
+            "Ep 02.eng.2.srt",
+        ]
+        .map(at)
+        .into_iter()
+        .chain([stalled.clone(), unlistable.clone()])
+        .collect();
+        let journal = running_journal(
+            "killed-remux",
+            &claimed,
+            &[
+                (at("Ep 01.mkv"), Pending),
+                (at("Ep 02.mkv"), Pending),
+                (at("Ep 03.mkv"), Completed),
+                (at("Ep 05.mkv"), Pending),
+            ],
+        );
+        let (held, hold) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let jobs = library.runtime.jobs().clone();
+        let leased = at("Ep 05.mkv");
+        let live_job = tokio::spawn(async move {
+            jobs.with_resource_lease(
+                &[ResourceClaim::write(leased)],
+                CancellationToken::new(),
+                || async {
+                    held.send(()).expect("held");
+                    released.await.expect("released");
+                    Ok(())
+                },
+            )
+            .await
+        });
+        hold.await.expect("lease");
+
+        library
+            .runtime
+            .clean_stale_temporaries(vec![journal], std::time::Duration::from_millis(200))
+            .await;
+        release.send(()).expect("release");
+        live_job.await.expect("job").expect("lease");
+
+        assert_eq!(
+            names_in(&tv),
+            [
+                ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
+                ".Ep 02.mkv.mkvo-remux.tmp",
+                ".Ep 03.mkv.mkvo-remux.tmp",
+                ".Ep 05.mkv.mkvo-remux.tmp",
+                ".Other.mkv.mkvo-remux.tmp",
+                "Ep 01.eng.2.srt",
+                "Ep 01.mkv",
+                "Ep 03.mkv",
+                "Ep 05.mkv",
+            ]
+        );
     }
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 
 impl MkvoRuntime {
@@ -224,7 +226,13 @@ impl MkvoRuntime {
             Some(journals) => {
                 report.journal_enumeration_supported = true;
                 if persist {
-                    self.clean_stale_temporaries(&journals).await;
+                    // In the background: a share that does not answer must not hold up startup.
+                    let (runtime, journals) = (self.clone(), journals.clone());
+                    tokio::spawn(async move {
+                        runtime
+                            .clean_stale_temporaries(journals, STALE_FOLDER_TIMEOUT)
+                            .await;
+                    });
                 }
                 for journal in journals {
                     if self
@@ -280,55 +288,115 @@ impl MkvoRuntime {
 
     /// Removes the temporaries an interrupted job left next to an intact original, and
     /// keeps (with a warning) any that may be the only copy. Reads only the folders the
-    /// journals claim.
-    async fn clean_stale_temporaries(&self, journals: &[mkvo_application::JournalRecord]) {
-        let file_system = &self.inner.dependencies.file_system;
-        for journal in journals {
-            let claimed: BTreeSet<_> = journal
-                .resources
-                .iter()
-                .map(|claim| mkvo_domain::path_key(&claim.path))
-                .collect();
-            let folders: BTreeSet<_> = journal
+    /// journals claim, each once and for at most `folder_timeout`.
+    pub(crate) async fn clean_stale_temporaries(
+        &self,
+        journals: Vec<mkvo_application::JournalRecord>,
+        folder_timeout: Duration,
+    ) {
+        let mut folders =
+            std::collections::BTreeMap::<_, (&Path, Vec<&mkvo_application::JournalRecord>)>::new();
+        for journal in &journals {
+            for folder in journal
                 .resources
                 .iter()
                 .filter_map(|claim| claim.path.parent())
+            {
+                let (_, claimants) = folders
+                    .entry(mkvo_domain::path_key(folder))
+                    .or_insert((folder, Vec::new()));
+                if !claimants
+                    .iter()
+                    .any(|claimant| std::ptr::eq(*claimant, journal))
+                {
+                    claimants.push(journal);
+                }
+            }
+        }
+        for (folder, claimants) in folders.values() {
+            let cleaned = self.clean_stale_folder(folder, claimants);
+            if tokio::time::timeout(folder_timeout, cleaned).await.is_err() {
+                tracing::warn!(folder = %folder.display(), "timed out looking for files an interrupted job left behind");
+            }
+        }
+    }
+
+    async fn clean_stale_folder(
+        &self,
+        folder: &Path,
+        journals: &[&mkvo_application::JournalRecord],
+    ) {
+        let file_system = &self.inner.dependencies.file_system;
+        let Ok(listed) = file_system.list_files(folder).await else {
+            return;
+        };
+        for name in listed.iter().filter_map(|path| path.file_name()?.to_str()) {
+            let Some((original, extraction)) = temporary_original(name) else {
+                continue;
+            };
+            let original = folder.join(original);
+            let key = mkvo_domain::path_key(&original);
+            let claimants: Vec<_> = journals
+                .iter()
+                .filter(|journal| {
+                    journal
+                        .resources
+                        .iter()
+                        .any(|claim| mkvo_domain::path_key(&claim.path) == key)
+                })
                 .collect();
-            for folder in folders {
-                let Ok(listed) = file_system.list_files(folder).await else {
-                    continue;
-                };
-                for name in listed.iter().filter_map(|path| path.file_name()?.to_str()) {
-                    let Some((original, extraction)) = temporary_original(name) else {
-                        continue;
-                    };
-                    let original = folder.join(original);
-                    let key = mkvo_domain::path_key(&original);
-                    if !claimed.contains(&key) {
-                        continue;
-                    }
-                    let temporary = folder.join(name);
-                    // An extraction temporary is keyed by the subtitle it replaces, not the item.
-                    let completed = !extraction
-                        && journal.items.iter().any(|item| {
-                            item.status == mkvo_application::JournalItemStatus::Completed
-                                && mkvo_domain::path_key(Path::new(&item.key)) == key
-                        });
-                    if completed || !file_system.exists(&original).await.unwrap_or(false) {
-                        tracing::warn!(
-                            path = %temporary.display(),
-                            "an interrupted job left this file and it may be the only copy; it was kept"
-                        );
-                    } else if let Err(error) = file_system.remove_file(&temporary).await {
-                        tracing::warn!(path = %temporary.display(), %error, "an interrupted job left this file and it could not be removed");
-                    } else {
-                        tracing::info!(path = %temporary.display(), "removed a file an interrupted job left behind");
-                    }
+            if claimants.is_empty() {
+                continue;
+            }
+            let temporary = folder.join(name);
+            // An extraction temporary is keyed by the subtitle it replaces, not the item.
+            let completed = !extraction
+                && claimants
+                    .iter()
+                    .flat_map(|journal| &journal.items)
+                    .any(|item| {
+                        item.status == mkvo_application::JournalItemStatus::Completed
+                            && mkvo_domain::path_key(Path::new(&item.key)) == key
+                    });
+            if completed {
+                tracing::warn!(path = %temporary.display(), "an interrupted job left this file; it was kept");
+                continue;
+            }
+            // A job started since startup may be writing this very file: take its lease first.
+            let claims = [
+                mkvo_domain::ResourceClaim::write(temporary.clone()),
+                mkvo_domain::ResourceClaim::write(original.clone()),
+            ];
+            let removal =
+                self.jobs()
+                    .with_resource_lease(&claims, CancellationToken::new(), || async {
+                        if !file_system.exists(&original).await.unwrap_or(false) {
+                            return Ok(false);
+                        }
+                        file_system.remove_file(&temporary).await?;
+                        Ok(true)
+                    });
+            match tokio::time::timeout(STALE_LEASE_WAIT, removal).await {
+                Err(_) => {
+                    tracing::info!(path = %temporary.display(), "a running job is using this file; it was left alone");
+                }
+                Ok(Ok(true)) => {
+                    tracing::info!(path = %temporary.display(), "removed a file an interrupted job left behind");
+                }
+                Ok(Ok(false)) => tracing::warn!(
+                    path = %temporary.display(),
+                    "an interrupted job left this file and it may be the only copy; it was kept"
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(path = %temporary.display(), %error, "an interrupted job left this file and it could not be removed");
                 }
             }
         }
     }
 }
+
+const STALE_FOLDER_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_LEASE_WAIT: Duration = Duration::from_millis(100);
 
 /// The file a remux or extraction temporary was written for, and whether it is an extraction.
 fn temporary_original(name: &str) -> Option<(&str, bool)> {
