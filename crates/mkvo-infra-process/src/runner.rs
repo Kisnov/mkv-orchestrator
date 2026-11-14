@@ -24,6 +24,11 @@ const READ_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 // A killed tool stuck in I/O on a dead network share may never exit.
 const KILL_GRACE: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+// taskkill only asks; the wait for the tool to go comes after it.
+#[cfg(windows)]
+const TASKKILL_GRACE: Duration = Duration::from_secs(2);
 
 // Everything else, such as the server password and provider API keys, stays out of child tools.
 #[cfg(windows)]
@@ -211,7 +216,6 @@ impl ProcessRunner {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
         }
         if let Some(current_dir) = &spec.current_dir {
@@ -276,6 +280,10 @@ impl ProcessRunner {
 }
 
 async fn terminate(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(id) = child.id() {
+        kill_descendants(id).await;
+    }
     if let Err(error) = child.start_kill() {
         tracing::debug!(%error, "external tool was already stopped or could not be killed");
     }
@@ -284,6 +292,29 @@ async fn terminate(child: &mut tokio::process::Child) {
         .is_err()
     {
         tracing::warn!("external tool did not exit after being killed");
+    }
+}
+
+/// Kills the tool and everything it started: a launcher such as a Chocolatey
+/// shim leaves the real tool running when only the launcher is killed.
+#[cfg(windows)]
+async fn kill_descendants(id: u32) {
+    use std::os::windows::process::CommandExt;
+    let Some(system_root) = std::env::var_os("SystemRoot") else {
+        return;
+    };
+    let mut taskkill = Command::new(PathBuf::from(system_root).join(r"System32\taskkill.exe"));
+    taskkill
+        .args(["/T", "/F", "/PID", &id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    taskkill.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    match tokio::time::timeout(TASKKILL_GRACE, taskkill.status()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::debug!(%error, "could not run taskkill"),
+        Err(_) => tracing::warn!("taskkill did not finish"),
     }
 }
 
@@ -482,8 +513,38 @@ mod tests {
 
         assert!(matches!(error, ProcessError::Inactive(_)));
         assert!(started.elapsed() < Duration::from_secs(5));
-        // On Windows `ping` outlives the killed shell and keeps the output pipes open.
+        // Do not wait for the stopped shell's runtime tasks.
         runtime.shutdown_background();
+    }
+
+    /// What a launcher such as a Chocolatey shim does: the real tool is a grandchild.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_a_tool_also_stops_what_it_started() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join("late.cmd"),
+            "ping -n 3 127.0.0.1 >NUL\r\necho late> marker\r\n",
+        )
+        .expect("script");
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let error = ProcessRunner
+            .run(
+                shell("cmd /C late.cmd").current_dir(directory.path()),
+                cancellation,
+            )
+            .await
+            .expect_err("cancelled");
+
+        assert!(matches!(error, ProcessError::Cancelled));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!directory.path().join("marker").exists());
     }
 
     #[tokio::test]

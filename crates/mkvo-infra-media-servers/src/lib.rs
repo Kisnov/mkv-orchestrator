@@ -310,9 +310,10 @@ impl MediaServerClient for MediaServerDiscoveryClient {
                 let mut items = Vec::new();
                 let mut start = 0;
                 loop {
-                    // A fixed sort keeps the pages from overlapping.
+                    // A fixed sort keeps the pages from overlapping; neither server sorts by Id,
+                    // so DateCreated separates items that share a name.
                     let relative = format!(
-                        "Items?{scope}Recursive=true&IncludeItemTypes=Series%2CMovie&Fields=Path%2CProductionYear%2CImageTags&EnableImages=true&SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={EMBY_PAGE_SIZE}"
+                        "Items?{scope}Recursive=true&IncludeItemTypes=Series%2CMovie&Fields=Path%2CProductionYear%2CImageTags&EnableImages=true&SortBy=SortName%2CDateCreated&SortOrder=Ascending&StartIndex={start}&Limit={EMBY_PAGE_SIZE}"
                     );
                     let document: Value = self
                         .get(server, &relative, &cancellation)
