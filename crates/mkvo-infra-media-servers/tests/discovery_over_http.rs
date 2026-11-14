@@ -421,6 +421,7 @@ struct Catalog {
     reports_total: bool,
     max_page: usize,
     requests: Arc<Mutex<Vec<(usize, usize)>>>,
+    sort_by: Arc<Mutex<Vec<String>>>,
 }
 
 impl Catalog {
@@ -430,6 +431,7 @@ impl Catalog {
             reports_total,
             max_page,
             requests: Arc::default(),
+            sort_by: Arc::default(),
         }
     }
 
@@ -462,6 +464,11 @@ async fn catalog_page(
         .lock()
         .expect("request log")
         .push((start, limit));
+    catalog
+        .sort_by
+        .lock()
+        .expect("sort log")
+        .extend(query.get("SortBy").cloned());
     let end = catalog
         .item_count
         .min(start.saturating_add(limit.min(catalog.max_page)));
@@ -521,6 +528,18 @@ async fn a_library_larger_than_ten_thousand_items_is_not_truncated() {
     assert_eq!(requests.len(), 21);
     assert_eq!(requests[0], (0, 500));
     assert_eq!(requests[20], (10_000, 500));
+}
+
+/// Items sharing a name (a remake, a US and a UK version) need a second key, or a
+/// page boundary between them can skip one and repeat the other.
+#[tokio::test]
+async fn pages_are_sorted_past_the_name() {
+    let catalog = Catalog::new(10, true, usize::MAX);
+
+    discover_catalog(&catalog).await;
+
+    let sorts = catalog.sort_by.lock().expect("sort log").clone();
+    assert_eq!(sorts, ["SortName,DateCreated"]);
 }
 
 #[tokio::test]
