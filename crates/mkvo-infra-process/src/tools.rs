@@ -101,6 +101,7 @@ impl ToolRegistryBuilder {
                 search_directories: self.search_directories,
             })),
             versions: Arc::new(RwLock::new(HashMap::new())),
+            resolved: Arc::default(),
         }
     }
 }
@@ -141,6 +142,9 @@ pub struct ToolRegistry {
     /// and every apply, and the answer only changes when the binary does -- so
     /// it is measured once per binary rather than once per operation.
     versions: Arc<RwLock<HashMap<ToolKind, (ToolIdentity, ToolStatus)>>>,
+    /// Paths already searched for, kept while the file is still there, with
+    /// the configuration generation they were found under.
+    resolved: Arc<RwLock<(u64, HashMap<ToolKind, PathBuf>)>>,
 }
 
 impl ToolRegistry {
@@ -165,16 +169,49 @@ impl ToolRegistry {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *configuration = next;
+        drop(configuration);
+        let mut resolved = self
+            .resolved
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolved.0 += 1;
+        resolved.1.clear();
     }
 
     pub fn resolve(&self, kind: ToolKind) -> Option<ResolvedTool> {
+        let (generation, remembered) = {
+            let resolved = self
+                .resolved
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (resolved.0, resolved.1.get(&kind).cloned())
+        };
+        // Re-resolved from the candidate, so a repointed link is followed to the new binary.
+        if let Some(path) = remembered.and_then(|candidate| existing_file(&candidate)) {
+            return Some(ResolvedTool { kind, path });
+        }
+        let candidate = self.search(kind)?;
+        let path = existing_file(&candidate)?;
+        let mut resolved = self
+            .resolved
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reconfigure during the search makes this answer stale.
+        if resolved.0 == generation {
+            resolved.1.insert(kind, candidate);
+        }
+        Some(ResolvedTool { kind, path })
+    }
+
+    /// The first configured or conventional location holding the tool, as spelled there.
+    fn search(&self, kind: ToolKind) -> Option<PathBuf> {
         let configuration = self
             .configuration
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(path) = configuration.explicit.get(&kind) {
-            return existing_file(path).map(|path| ResolvedTool { kind, path });
+            return Some(path.clone()).filter(|path| path.is_file());
         }
 
         let executable = kind.executable_name();
@@ -183,12 +220,13 @@ impl ToolRegistry {
             .iter()
             .chain(common_tool_directories().iter())
         {
-            if let Some(path) = existing_file(&directory.join(&executable)) {
-                return Some(ResolvedTool { kind, path });
+            let candidate = directory.join(&executable);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
 
-        find_on_path(&executable).map(|path| ResolvedTool { kind, path })
+        find_on_path(&executable)
     }
 
     /// A cached version answer for this exact binary, if one was measured.
@@ -289,7 +327,7 @@ fn find_on_path(executable: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
         .map(|directory| directory.join(executable))
-        .find_map(|candidate| existing_file(&candidate))
+        .find(|candidate| candidate.is_file())
 }
 
 fn common_tool_directories() -> Vec<PathBuf> {
@@ -464,6 +502,94 @@ mod version_cache_tests {
             registry.cached_status(ToolKind::MkvMerge, &tool_identity(&tool)),
             None,
             "a replaced binary must be measured again"
+        );
+    }
+
+    /// Every probe resolves its tool, so the search over every directory and
+    /// `PATH` runs once per tool, until the result vanishes or settings change.
+    #[test]
+    fn a_resolved_tool_is_remembered_until_it_vanishes() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (first, second) = (directory.path().join("a"), directory.path().join("b"));
+        std::fs::create_dir_all(&first).expect("first dir");
+        std::fs::create_dir_all(&second).expect("second dir");
+        let name = ToolKind::MkvMerge.executable_name();
+        std::fs::write(second.join(&name), b"binary").expect("write tool");
+        let registry = ToolRegistry::builder()
+            .search_directory(&first)
+            .search_directory(&second)
+            .build();
+        let found = |registry: &ToolRegistry| registry.resolve(ToolKind::MkvMerge).unwrap().path;
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&second).unwrap()));
+
+        // A copy appearing earlier in the search order is not looked for again.
+        std::fs::write(first.join(&name), b"binary").expect("write earlier tool");
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&second).unwrap()));
+
+        std::fs::remove_file(second.join(&name)).expect("remove tool");
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&first).unwrap()));
+    }
+
+    fn link_directory(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("mklink")
+                .status;
+            assert!(status.success(), "junction");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+    }
+
+    /// Scoop and similar keep every version and repoint a `current` link, so
+    /// an upgrade leaves the old binary in place: the link must be followed again.
+    #[test]
+    fn a_remembered_tool_follows_its_link_to_an_upgrade() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let name = ToolKind::MkvMerge.executable_name();
+        let (old, new) = (directory.path().join("v1"), directory.path().join("v2"));
+        for version in [&old, &new] {
+            std::fs::create_dir_all(version).expect("version dir");
+            std::fs::write(version.join(&name), b"binary").expect("write tool");
+        }
+        let current = directory.path().join("current");
+        link_directory(&old, &current);
+        let registry = ToolRegistry::builder().search_directory(&current).build();
+        let found = |registry: &ToolRegistry| registry.resolve(ToolKind::MkvMerge).unwrap().path;
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&old).unwrap()));
+
+        #[cfg(windows)]
+        std::fs::remove_dir(&current).expect("remove link");
+        #[cfg(unix)]
+        std::fs::remove_file(&current).expect("remove link");
+        link_directory(&new, &current);
+        assert!(found(&registry).starts_with(std::fs::canonicalize(&new).unwrap()));
+    }
+
+    #[test]
+    fn reconfiguring_forgets_resolved_tools() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (first, second) = (directory.path().join("a"), directory.path().join("b"));
+        std::fs::create_dir_all(&first).expect("first dir");
+        std::fs::create_dir_all(&second).expect("second dir");
+        let name = ToolKind::MkvMerge.executable_name();
+        std::fs::write(first.join(&name), b"binary").expect("write first");
+        std::fs::write(second.join(&name), b"binary").expect("write second");
+        let registry = ToolRegistry::builder().search_directory(&first).build();
+        registry.resolve(ToolKind::MkvMerge).unwrap();
+
+        registry.reconfigure(std::iter::empty(), [second.clone()]);
+        assert!(
+            registry
+                .resolve(ToolKind::MkvMerge)
+                .unwrap()
+                .path
+                .starts_with(std::fs::canonicalize(&second).unwrap())
         );
     }
 

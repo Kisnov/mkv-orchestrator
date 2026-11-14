@@ -112,9 +112,9 @@ impl RemuxPlanner {
         if request.options.preserve_source
             && matches!(request.mode, RemuxMode::Remux | RemuxMode::MuxSubtitles)
             && (output_suffix.is_empty()
-                || !output_suffix
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')))
+                || !output_suffix.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+                }))
         {
             return Err(ApplicationError::InvalidRequest(
                 "remux output suffix must contain only letters, numbers, dots, dashes, or underscores"
@@ -137,9 +137,7 @@ impl RemuxPlanner {
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
                     .to_owned(),
-                RemuxMode::Remux | RemuxMode::MuxSubtitles
-                    if request.options.preserve_source =>
-                {
+                RemuxMode::Remux | RemuxMode::MuxSubtitles if request.options.preserve_source => {
                     preserved_output_for(file, output_suffix)
                 }
                 RemuxMode::Remux | RemuxMode::MuxSubtitles => file.path.clone(),
@@ -235,9 +233,7 @@ impl RemuxPlanner {
                     Some(final_output.clone()),
                 ));
             }
-            if request.mode == RemuxMode::Remux
-                && selected_track_ids.len() == file.tracks.len()
-            {
+            if request.mode == RemuxMode::Remux && selected_track_ids.len() == file.tracks.len() {
                 conflicts.push(PlanConflict::informational(
                     PlanConflictKind::NoChange,
                     "Requested filters do not remove any tracks from this file",
@@ -311,29 +307,31 @@ impl RemuxPlanner {
             .items
             .iter()
             .flat_map(|item| {
-                std::iter::once(if same_path(&item.source, &item.final_output)
-                    || item.delete_source_after_success
-                {
-                    ResourceClaim::write(item.source.clone())
-                } else {
-                    ResourceClaim::read(item.source.clone())
-                })
-                    .chain(std::iter::once(ResourceClaim::write(
-                        item.temporary_output.clone(),
-                    )))
-                    .chain(std::iter::once(ResourceClaim::write(
-                        item.final_output.clone(),
-                    )))
-                    .chain(
-                        item.external_subtitles
-                            .iter()
-                            .map(|subtitle| ResourceClaim::read(subtitle.path.clone())),
-                    )
-                    .chain(
-                        item.extract_tracks
-                            .iter()
-                            .map(|track| ResourceClaim::write(track.output.clone())),
-                    )
+                std::iter::once(
+                    if same_path(&item.source, &item.final_output)
+                        || item.delete_source_after_success
+                    {
+                        ResourceClaim::write(item.source.clone())
+                    } else {
+                        ResourceClaim::read(item.source.clone())
+                    },
+                )
+                .chain(std::iter::once(ResourceClaim::write(
+                    item.temporary_output.clone(),
+                )))
+                .chain(std::iter::once(ResourceClaim::write(
+                    item.final_output.clone(),
+                )))
+                .chain(
+                    item.external_subtitles
+                        .iter()
+                        .map(|subtitle| ResourceClaim::read(subtitle.path.clone())),
+                )
+                .chain(
+                    item.extract_tracks
+                        .iter()
+                        .map(|track| ResourceClaim::write(track.output.clone())),
+                )
             })
             .collect();
         let context = PlanContext {
@@ -388,16 +386,17 @@ fn selected_tracks(file: &MediaFile, options: &RemuxOptions) -> Vec<u64> {
 }
 
 fn temporary_output_for(file: &MediaFile, mode: RemuxMode) -> PathBuf {
-    let stem = file
+    let name = file
         .path
-        .file_stem()
+        .file_name()
         .map_or_else(String::new, |value| value.to_string_lossy().into_owned());
     let suffix = match mode {
         RemuxMode::ExtractSubtitles => "extract",
         RemuxMode::ConvertToMkv | RemuxMode::MuxSubtitles | RemuxMode::Remux => "remux",
     };
+    // Hidden and without a media extension, so watchers and media servers ignore it.
     file.path
-        .with_file_name(format!("{stem}.mkvo-{suffix}.tmp.mkv"))
+        .with_file_name(format!(".{name}.mkvo-{suffix}.tmp"))
 }
 
 fn preserved_output_for(file: &MediaFile, suffix: &str) -> PathBuf {
@@ -414,27 +413,29 @@ fn preserved_output_for(file: &MediaFile, suffix: &str) -> PathBuf {
 }
 
 fn mark_duplicate_outputs(items: &mut [RemuxPlanItem]) {
-    let mut outputs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut outputs: BTreeMap<String, Vec<(usize, PathBuf)>> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
-        if !same_path(&item.source, &item.final_output) {
+        // An extraction's final output is the source folder, which it does not write.
+        if item.mode != RemuxMode::ExtractSubtitles && !same_path(&item.source, &item.final_output)
+        {
             outputs
                 .entry(path_key(&item.final_output))
                 .or_default()
-                .push(index);
+                .push((index, item.final_output.clone()));
         }
         for extraction in &item.extract_tracks {
             outputs
                 .entry(path_key(&extraction.output))
                 .or_default()
-                .push(index);
+                .push((index, extraction.output.clone()));
         }
     }
-    for indices in outputs.values().filter(|indices| indices.len() > 1) {
-        for &index in indices {
+    for writers in outputs.into_values().filter(|writers| writers.len() > 1) {
+        for (index, output) in writers {
             items[index].conflicts.push(PlanConflict::blocking(
                 PlanConflictKind::DuplicateTarget,
                 "Multiple actions write the same output",
-                Some(items[index].final_output.clone()),
+                Some(output),
             ));
         }
     }
@@ -528,10 +529,21 @@ mod tests {
 
         let plan = RemuxPlanner.build_plan(request).unwrap();
         let item = &plan.payload.items[0];
-        assert_eq!(item.final_output, PathBuf::from("show/Episode 01.filtered.mkv"));
+        assert_eq!(
+            item.final_output,
+            PathBuf::from("show/Episode 01.filtered.mkv")
+        );
         assert!(item.can_apply());
-        assert!(plan.context.resources.contains(&ResourceClaim::read("show/Episode 01.mkv")));
-        assert!(plan.context.resources.contains(&ResourceClaim::write("show/Episode 01.filtered.mkv")));
+        assert!(
+            plan.context
+                .resources
+                .contains(&ResourceClaim::read("show/Episode 01.mkv"))
+        );
+        assert!(
+            plan.context
+                .resources
+                .contains(&ResourceClaim::write("show/Episode 01.filtered.mkv"))
+        );
     }
 
     #[test]
@@ -558,10 +570,12 @@ mod tests {
 
         let plan = RemuxPlanner.build_plan(request).unwrap();
         assert!(!plan.payload.items[0].can_apply());
-        assert!(plan.payload.items[0]
-            .conflicts
-            .iter()
-            .any(|conflict| conflict.kind == PlanConflictKind::ExistingTarget));
+        assert!(
+            plan.payload.items[0]
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.kind == PlanConflictKind::ExistingTarget)
+        );
     }
 
     #[test]
@@ -590,6 +604,91 @@ mod tests {
         );
         assert!(plan.payload.items[0].delete_source_after_success);
         assert!(plan.payload.items[0].can_apply());
+    }
+
+    #[test]
+    fn extracting_from_two_episodes_in_one_folder_plans_both() {
+        let files = vec![media("show/Ep 01.mkv"), media("show/Ep 02.mkv")];
+        let extractions = files
+            .iter()
+            .map(|file| {
+                let track = TrackExtraction {
+                    track_id: 1,
+                    kind: TrackKind::Subtitle,
+                    output: file.path.with_extension("eng.1.srt"),
+                };
+                (file.path.clone(), vec![track])
+            })
+            .collect();
+        let request = RemuxPlanRequest {
+            source_access: BTreeMap::new(),
+            mode: RemuxMode::ExtractSubtitles,
+            files,
+            options: RemuxOptions::default(),
+            external_subtitles: BTreeMap::new(),
+            extractions,
+            existing_paths: BTreeSet::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            tool_fingerprints: BTreeMap::new(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        };
+
+        let plan = RemuxPlanner.build_plan(request).unwrap();
+        for item in &plan.payload.items {
+            assert!(item.can_apply(), "{:?}", item.conflicts);
+        }
+    }
+
+    #[test]
+    fn colliding_extractions_name_the_subtitle() {
+        let subtitle = PathBuf::from("show/Ep.eng.1.srt");
+        let files = vec![media("show/Ep 01.mkv"), media("show/Ep 02.mkv")];
+        let extractions = files
+            .iter()
+            .map(|file| {
+                let track = TrackExtraction {
+                    track_id: 1,
+                    kind: TrackKind::Subtitle,
+                    output: subtitle.clone(),
+                };
+                (file.path.clone(), vec![track])
+            })
+            .collect();
+        let request = RemuxPlanRequest {
+            source_access: BTreeMap::new(),
+            mode: RemuxMode::ExtractSubtitles,
+            files,
+            options: RemuxOptions::default(),
+            external_subtitles: BTreeMap::new(),
+            extractions,
+            existing_paths: BTreeSet::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            tool_fingerprints: BTreeMap::new(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        };
+
+        let plan = RemuxPlanner.build_plan(request).unwrap();
+        for item in &plan.payload.items {
+            let conflict = item
+                .conflicts
+                .iter()
+                .find(|conflict| conflict.kind == PlanConflictKind::DuplicateTarget)
+                .expect("duplicate");
+            assert_eq!(conflict.path.as_deref(), Some(subtitle.as_path()));
+        }
+    }
+
+    #[test]
+    fn temporary_output_is_hidden_non_media_and_unique_per_source() {
+        let matroska = temporary_output_for(&media("show/a.mkv"), RemuxMode::Remux);
+        let mp4 = temporary_output_for(&media("show/a.mp4"), RemuxMode::ConvertToMkv);
+
+        assert_eq!(matroska, PathBuf::from("show/.a.mkv.mkvo-remux.tmp"));
+        assert_eq!(mp4, PathBuf::from("show/.a.mp4.mkvo-remux.tmp"));
     }
 
     #[test]
@@ -853,11 +952,10 @@ mod tests {
                     assert_eq!(item.selected_track_ids, [0, 1, 4]);
                     assert!(!item.preserve_chapters);
                     assert!(!item.preserve_attachments);
+                    // Unlike the legacy app, the temporary file is hidden from media scanners.
                     assert_eq!(
                         portable(&item.temporary_output),
-                        case["expected"]["actions"][0]["tempOutputPath"]
-                            .as_str()
-                            .unwrap()
+                        "${ROOT}/Shows/Example/Season 01/.Example - S01E01.mkv.mkvo-remux.tmp"
                     );
                 }
                 "sidecar-discovery-tagging-and-existing-track-skip" => {
@@ -883,7 +981,7 @@ mod tests {
                     );
                     assert_eq!(
                         portable(&conversion.temporary_output),
-                        "${ROOT}/Movies/Example Movie.mkvo-remux.tmp.mkv"
+                        "${ROOT}/Movies/.Example Movie.mp4.mkvo-remux.tmp"
                     );
                     assert!(conversion.delete_source_after_success);
                     assert!(conversion.can_apply());

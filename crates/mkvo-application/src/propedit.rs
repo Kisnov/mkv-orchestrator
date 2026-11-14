@@ -304,7 +304,8 @@ fn episode_title_for_file(file: &MediaFile, file_stem: &str) -> String {
         while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
             cursor += 1;
         }
-        if cursor == season_start || cursor >= bytes.len() || !matches!(bytes[cursor], b'e' | b'E') {
+        if cursor == season_start || cursor >= bytes.len() || !matches!(bytes[cursor], b'e' | b'E')
+        {
             continue;
         }
         cursor += 1;
@@ -342,7 +343,9 @@ fn add_container_edit(
                 value: file_stem.to_owned(),
             });
         }
-        TextEdit::FromEpisodeTitle if !episode_title.is_empty() && current != Some(episode_title) => {
+        TextEdit::FromEpisodeTitle
+            if !episode_title.is_empty() && current != Some(episode_title) =>
+        {
             mutations.push(PropertyMutation::SetContainerTitle {
                 value: episode_title.to_owned(),
             });
@@ -466,7 +469,9 @@ fn add_track_name_edit(
                 value: file_stem.to_owned(),
             });
         }
-        TextEdit::FromEpisodeTitle if !episode_title.is_empty() && current != Some(episode_title) => {
+        TextEdit::FromEpisodeTitle
+            if !episode_title.is_empty() && current != Some(episode_title) =>
+        {
             mutations.push(PropertyMutation::SetTrackName {
                 selector,
                 value: episode_title.to_owned(),
@@ -501,7 +506,9 @@ fn valid_language(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use mkvo_domain::{ContainerMetadata, EpisodeIdentity, FileFingerprint, MediaStatus, MediaTrack};
+    use mkvo_domain::{
+        ContainerMetadata, EpisodeIdentity, FileFingerprint, MediaStatus, MediaTrack,
+    };
 
     use super::*;
 
@@ -590,37 +597,55 @@ mod tests {
 
     #[test]
     fn channel_names_resolve_per_file_and_keep_unknown_channel_names() {
-        let files = [Some(6), Some(8), Some(2), None].into_iter().map(|channels| {
-            let mut file = media();
-            file.tracks[1].channels = channels;
-            file
-        }).collect();
-        let plan = PropertyEditPlanner.build_plan(PropertyEditPlanRequest {
-            files,
-            source_access: BTreeMap::new(),
-            container_title: TextEdit::Keep,
-            video_track_name: TextEdit::Keep,
-            track_edits: vec![TrackEditIntent {
-                kind: TrackKind::Audio,
-                ordinal: 1,
-                name: TextEdit::FromTrackChannels,
-                language: None,
-                default: None,
-                forced: None,
-            }],
-            authorized_roots: Vec::new(),
-            settings_fingerprint: "settings".to_owned(),
-            tool_fingerprints: BTreeMap::new(),
-            expires_in_seconds: 60,
-            idempotency_key: IdempotencyKey::generate(),
-        }).unwrap();
-        let names: Vec<_> = plan.payload.items.iter().map(|item| {
-            item.mutations.iter().find_map(|mutation| match mutation {
-                PropertyMutation::SetTrackName { value, .. } => Some(value.as_str()),
-                _ => None,
+        let files = [Some(6), Some(8), Some(2), None]
+            .into_iter()
+            .map(|channels| {
+                let mut file = media();
+                file.tracks[1].channels = channels;
+                file
             })
-        }).collect();
-        assert_eq!(names, [Some("5.1 Surround"), Some("7.1 Surround"), Some("2.0 Stereo"), None]);
+            .collect();
+        let plan = PropertyEditPlanner
+            .build_plan(PropertyEditPlanRequest {
+                files,
+                source_access: BTreeMap::new(),
+                container_title: TextEdit::Keep,
+                video_track_name: TextEdit::Keep,
+                track_edits: vec![TrackEditIntent {
+                    kind: TrackKind::Audio,
+                    ordinal: 1,
+                    name: TextEdit::FromTrackChannels,
+                    language: None,
+                    default: None,
+                    forced: None,
+                }],
+                authorized_roots: Vec::new(),
+                settings_fingerprint: "settings".to_owned(),
+                tool_fingerprints: BTreeMap::new(),
+                expires_in_seconds: 60,
+                idempotency_key: IdempotencyKey::generate(),
+            })
+            .unwrap();
+        let names: Vec<_> = plan
+            .payload
+            .items
+            .iter()
+            .map(|item| {
+                item.mutations.iter().find_map(|mutation| match mutation {
+                    PropertyMutation::SetTrackName { value, .. } => Some(value.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("5.1 Surround"),
+                Some("7.1 Surround"),
+                Some("2.0 Stereo"),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -629,10 +654,7 @@ mod tests {
         audio.codec = "aac".to_owned();
         audio.channels = Some(6);
 
-        assert_eq!(
-            metadata_track_name(&audio, Some("eng")),
-            "AAC English 5.1"
-        );
+        assert_eq!(metadata_track_name(&audio, Some("eng")), "AAC English 5.1");
     }
 
     #[test]
@@ -673,15 +695,29 @@ mod tests {
         };
 
         let plan = PropertyEditPlanner.build_plan(request).unwrap();
-        let values = plan.payload.items.iter().map(|item| {
-            item.mutations.iter().filter_map(|mutation| match mutation {
-                PropertyMutation::SetContainerTitle { value }
-                | PropertyMutation::SetTrackName { value, .. } => Some(value.as_str()),
-                _ => None,
-            }).collect::<Vec<_>>()
-        }).collect::<Vec<_>>();
+        let values = plan
+            .payload
+            .items
+            .iter()
+            .map(|item| {
+                item.mutations
+                    .iter()
+                    .filter_map(|mutation| match mutation {
+                        PropertyMutation::SetContainerTitle { value }
+                        | PropertyMutation::SetTrackName { value, .. } => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(values, [["Winter Is Coming", "Winter Is Coming"], ["The Kingsroad", "The Kingsroad"]]);
+        assert_eq!(
+            values,
+            [
+                ["Winter Is Coming", "Winter Is Coming"],
+                ["The Kingsroad", "The Kingsroad"]
+            ]
+        );
     }
 
     #[test]

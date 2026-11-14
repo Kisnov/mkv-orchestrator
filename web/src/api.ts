@@ -11,6 +11,7 @@ import type {
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemEntry,
   FileSystemResponse,
   LibraryArtworkRequest,
@@ -37,6 +38,8 @@ import type {
   PropEditSkippedRow,
   PropEditTemplateResponse,
   PropEditTrackConfigRow,
+  RecentJob,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchRestoreMove,
@@ -54,6 +57,7 @@ import type {
   ThemeDefinition,
   ToolStatus,
   TrackRow,
+  WatchHealth,
   WebMediaServer,
   WebMediaServerLibraryPath,
   WebMediaServerPathMapping,
@@ -106,6 +110,7 @@ export type AttachmentRow = {
 export type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemEntry,
   FileSystemResponse,
   LibraryArtworkRequest,
@@ -132,6 +137,8 @@ export type {
   PropEditSkippedRow,
   PropEditTemplateResponse,
   PropEditTrackConfigRow,
+  RecentJob,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchRestoreMove,
@@ -149,6 +156,7 @@ export type {
   ThemeDefinition,
   ToolStatus,
   TrackRow,
+  WatchHealth,
   WebMediaServer,
   WebMediaServerLibraryPath,
   WebMediaServerPathMapping,
@@ -204,8 +212,9 @@ export function authorizeBrowsedRoot(path: string): Promise<void> {
   return getBackendClient().authorizeBrowsedRoot(path);
 }
 
-export function setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-  return getBackendClient().setFileSelection(paths);
+export function setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+  const client = getBackendClient();
+  return replaceWorkingSet ? client.setFileSelection(paths, true) : client.setFileSelection(paths);
 }
 
 export function clearCurrentScanFiles(): Promise<CurrentScanResponse> {
@@ -312,6 +321,14 @@ export function cancelOperationJob(id: string): Promise<OperationJobResponse> {
   return getBackendClient().cancelOperationJob(id);
 }
 
+export function listRecentJobs(limit?: number): Promise<RecentJobsResponse> {
+  return getBackendClient().listRecentJobs(limit);
+}
+
+export function getWatchHealth(): Promise<WatchHealth> {
+  return getBackendClient().getWatchHealth();
+}
+
 export function loadPropEditTemplate(request: { files: MediaFileRow[]; templatePath?: string }): Promise<PropEditTemplateResponse> {
   return getBackendClient().loadPropEditTemplate(request);
 }
@@ -334,6 +351,10 @@ export function getLibraryCatalog(request: LibraryCatalogRequest): Promise<Libra
 
 export function getLibraryArtwork(request: LibraryArtworkRequest): Promise<LibraryArtworkResponse> {
   return getBackendClient().getLibraryArtwork(request);
+}
+
+export function libraryArtworkUrl(request: LibraryArtworkRequest, version: number): string | undefined {
+  return getBackendClient().libraryArtworkUrl(request, version);
 }
 
 export function getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse> {

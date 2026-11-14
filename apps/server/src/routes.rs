@@ -7,10 +7,10 @@ use axum::{
     response::{IntoResponse, Sse, sse::Event},
     routing::{any, get, post, put},
 };
-use futures::stream;
+use futures::{StreamExt, stream};
 use mkvo_contracts::{
-    FileSelectionRequest, LibraryArtworkRequest, LibraryCatalogRequest, LibraryLocalArtworkRequest,
-    ScanRequest, WebSettingsRequest,
+    FileSelectionRequest, JobEvent, JobEventEnvelope, LibraryArtworkRequest, LibraryCatalogRequest,
+    LibraryLocalArtworkRequest, ScanRequest, WebSettingsRequest,
 };
 use mkvo_runtime::{
     RuntimeError,
@@ -43,7 +43,7 @@ pub(crate) fn api_router(state: AppState) -> Router {
         .route("/api/scans", post(start_scan))
         .route("/api/scans/{id}", get(get_scan_job))
         .route("/api/scans/{id}/cancel", post(cancel_scan))
-        .route("/api/scans/{id}/events", get(job_events))
+        .route("/api/scans/{id}/events", get(scan_events))
         .route(
             "/api/files/current",
             get(get_current_scan_files).delete(clear_current_scan_files),
@@ -85,10 +85,14 @@ pub(crate) fn api_router(state: AppState) -> Router {
             "/api/operations/{id}/cancel",
             post(cancel_operation_job),
         )
-        .route("/api/operations/{id}/events", get(job_events))
+        .route("/api/operations/{id}/events", get(operation_events))
         .route("/api/library/audit", post(run_library_audit))
         .route("/api/library/catalog", post(get_library_catalog))
         .route("/api/library/artwork", post(get_library_artwork))
+        .route(
+            "/api/library/artwork/{server_id}/{item_id}",
+            get(get_library_artwork_image),
+        )
         .route("/api/library/local-artwork", post(get_library_local_artwork))
         .route("/api/watch/health", get(get_watch_health))
         .route("/api/jobs/recent", get(list_recent_jobs))
@@ -313,14 +317,67 @@ async fn cancel_operation_job(
     Ok(Json(state.runtime.cancel_operation_job(&id).await?))
 }
 
-async fn job_events(
+async fn scan_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, HttpError> {
+    // Subscribed before the state is read, so no change falls between the two.
+    let receiver = state.runtime.subscribe_job_events(&id).await?;
+    let job = state.runtime.get_scan_job(&id).await?;
+    job_events(
+        Event::default().json_data(&job),
+        job.status.is_terminal(),
+        receiver,
+    )
+}
+
+async fn operation_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, HttpError> {
     let receiver = state.runtime.subscribe_job_events(&id).await?;
-    let events = stream::unfold(receiver, |mut receiver| async move {
+    let job = state.runtime.get_operation_job(&id).await?;
+    job_events(
+        Event::default().json_data(&job),
+        job.status.is_terminal(),
+        receiver,
+    )
+}
+
+fn job_events(
+    snapshot: Result<Event, axum::Error>,
+    ended: bool,
+    receiver: broadcast::Receiver<JobEventEnvelope>,
+) -> Result<impl IntoResponse, HttpError> {
+    let snapshot = snapshot
+        .map_err(|error| RuntimeError::internal(error.to_string()))?
+        .event("snapshot");
+    Ok(
+        Sse::new(job_event_stream(snapshot, ended, receiver)).keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        ),
+    )
+}
+
+/// The snapshot, then the job's events until the one that ends it. The first
+/// events may repeat changes the snapshot already shows.
+pub(crate) fn job_event_stream(
+    snapshot: Event,
+    ended: bool,
+    receiver: broadcast::Receiver<JobEventEnvelope>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    let live = stream::unfold((!ended).then_some(receiver), |receiver| async move {
+        let mut receiver = receiver?;
         match receiver.recv().await {
             Ok(envelope) => {
+                let ended = matches!(
+                    envelope.event,
+                    JobEvent::Completed { .. }
+                        | JobEvent::Failed { .. }
+                        | JobEvent::Canceled { .. }
+                );
                 let sequence = envelope.sequence.to_string();
                 let event = Event::default()
                     .event("job")
@@ -331,20 +388,16 @@ async fn job_events(
                             .event("serialization-error")
                             .data(error.to_string())
                     });
-                Some((Ok::<Event, Infallible>(event), receiver))
+                Some((Ok::<Event, Infallible>(event), (!ended).then_some(receiver)))
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => Some((
                 Ok(Event::default().event("lagged").data(skipped.to_string())),
-                receiver,
+                Some(receiver),
             )),
             Err(broadcast::error::RecvError::Closed) => None,
         }
     });
-    Ok(Sse::new(events).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    stream::once(async { Ok(snapshot) }).chain(live)
 }
 
 async fn get_watch_health(State(state): State<AppState>) -> Result<impl IntoResponse, HttpError> {
@@ -397,6 +450,30 @@ async fn get_library_artwork(
     Json(request): Json<LibraryArtworkRequest>,
 ) -> Result<impl IntoResponse, HttpError> {
     Ok(Json(state.runtime.get_library_artwork(request).await?))
+}
+
+/// The poster itself, so the browser can load, cache and drop it like any image.
+async fn get_library_artwork_image(
+    State(state): State<AppState>,
+    Path((server_id, item_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, HttpError> {
+    let artwork = state
+        .runtime
+        .get_library_artwork_bytes(LibraryArtworkRequest { server_id, item_id })
+        .await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, artwork.content_type),
+            // The page versions the URL when a library is rebuilt.
+            (header::CACHE_CONTROL, "private, max-age=86400".to_owned()),
+            // A media server's SVG must not run script on this origin.
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'".to_owned(),
+            ),
+        ],
+        artwork.bytes,
+    ))
 }
 
 async fn get_library_local_artwork(

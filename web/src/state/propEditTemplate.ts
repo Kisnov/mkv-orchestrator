@@ -26,7 +26,7 @@ import { useMediaLibrary } from "./MediaLibraryContext";
  */
 export function propEditTemplateKey(templatePath: string, files: MediaFileRow[]) {
   const signature = files
-    .map((file) => `${file.path}|${file.tracks.map((track) => `${track.type}:${track.id}:${track.language}:${track.name}`).join(",")}`)
+    .map((file) => `${file.path}|${file.tracks.map((track) => `${track.type}:${track.id}:${track.language}:${track.name}:${track.default}:${track.forced}`).join(",")}`)
     .join("\u0000");
   return ["propedit-template", templatePath, signature] as const;
 }
@@ -75,15 +75,4 @@ export function PropEditTemplateWarmer(): null {
   }, [enabled, key]);
 
   return null;
-}
-
-/**
- * Drops cached templates after an edit lands.
- *
- * An apply changes the files on disk while the rows already in hand still
- * describe how they used to look, so the key alone would not notice.
- */
-export function useInvalidatePropEditTemplate() {
-  const queryClient = useQueryClient();
-  return () => queryClient.invalidateQueries({ queryKey: ["propedit-template"] });
 }

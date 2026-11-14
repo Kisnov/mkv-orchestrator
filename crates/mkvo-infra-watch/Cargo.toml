@@ -12,6 +12,7 @@ chrono.workspace = true
 mkvo-application = { path = "../mkvo-application" }
 mkvo-domain = { path = "../mkvo-domain" }
 notify.workspace = true
+same-file.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

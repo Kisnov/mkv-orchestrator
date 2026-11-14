@@ -35,16 +35,34 @@ pub fn normalized_path(path: &Path) -> PathBuf {
     PathBuf::from(normalized_path_text(path))
 }
 
+/// Identity key for a path: one string per file, whatever its spelling.
+///
+/// Everywhere: the extended-length prefix is dropped, `\` and `/` are the same
+/// separator and a trailing one is ignored, since stored plans and settings may
+/// carry Windows spellings. Case is folded only on Windows and macOS, whose
+/// filesystems ignore it; elsewhere `Ep.mkv` and `ep.mkv` are two files.
+#[must_use]
+pub fn path_key(path: &Path) -> String {
+    let key = normalized_path_text(path).replace('\\', "/");
+    let key = key.trim_end_matches('/');
+    if cfg!(any(windows, target_os = "macos")) {
+        key.to_lowercase()
+    } else {
+        key.to_owned()
+    }
+}
+
+/// [`path_key`] with case folded on every platform: equal for two names that
+/// would collide on a case-insensitive share, whatever the host is.
+#[must_use]
+pub fn case_folded_path_key(path: &Path) -> String {
+    path_key(path).to_lowercase()
+}
+
 /// Compare two paths by identity rather than by spelling.
 #[must_use]
 pub fn same_path(left: &Path, right: &Path) -> bool {
-    let left = normalized_path_text(left);
-    let right = normalized_path_text(right);
-    if cfg!(windows) {
-        left.eq_ignore_ascii_case(&right)
-    } else {
-        left == right
-    }
+    path_key(left) == path_key(right)
 }
 
 #[cfg(test)]
@@ -64,6 +82,31 @@ mod tests {
             Path::new(r"\\?\C:\media\a.mkv"),
             Path::new(r"C:\media\a.mkv")
         ));
+    }
+
+    #[test]
+    fn a_key_ignores_the_prefix_the_separator_and_a_trailing_one() {
+        assert_eq!(
+            path_key(Path::new(r"\\?\C:\media\show\")),
+            path_key(Path::new("C:/media/show"))
+        );
+        assert_eq!(
+            path_key(Path::new(r"\\?\UNC\nas\media\a.mkv")),
+            path_key(Path::new("//nas/media/a.mkv"))
+        );
+        assert_eq!(path_key(Path::new("/mnt/media/")), "/mnt/media");
+    }
+
+    /// Folding case where the filesystem keeps it made `Ep.mkv` and `ep.mkv`
+    /// one file on a Linux NAS.
+    #[test]
+    fn case_is_part_of_the_key_only_where_the_filesystem_keeps_it() {
+        let folds = cfg!(any(windows, target_os = "macos"));
+        let upper = Path::new("/media/Show/Ep.mkv");
+        let lower = Path::new("/media/show/ep.mkv");
+        assert_eq!(path_key(upper) == path_key(lower), folds);
+        assert_eq!(same_path(upper, lower), folds);
+        assert_eq!(case_folded_path_key(upper), case_folded_path_key(lower));
     }
 
     #[test]

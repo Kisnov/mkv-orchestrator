@@ -2,6 +2,7 @@ import type { LogExport } from "./client";
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemResponse,
   LibraryArtworkRequest,
   LibraryArtworkResponse,
@@ -19,6 +20,7 @@ import type {
   PropEditPreviewRequest,
   PropEditPreviewResponse,
   PropEditTemplateResponse,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchUndoPreviewResponse,
@@ -29,6 +31,7 @@ import type {
   RenameSearchResult,
   ScanJobResponse,
   ScanRequest,
+  WatchHealth,
   WebSettings,
   WebSettingsRequest
 } from "../api";
@@ -64,6 +67,10 @@ type ErrorPayload = {
 };
 
 const TERMINAL_JOB_STATUSES = new Set(["Completed", "Failed", "Skipped", "Canceled"]);
+const REQUEST_TIMEOUT_MS = 60_000;
+// Calls the server answers only after doing the work, and posters, which
+// queue behind the browser's per-host connection limit.
+const LONG_REQUEST_TIMEOUT_MS = 30 * 60_000;
 
 function resolveErrorMessage(payload: ErrorPayload | undefined, fallback: string): string {
   if (typeof payload?.message === "string" && payload.message.trim()) {
@@ -102,8 +109,15 @@ export class HttpBackendClient implements BackendClient {
     return `${this.baseUrl}${path}`;
   }
 
-  private async request<T>(path: string, init?: RequestInit, contract?: ContractName): Promise<T> {
+  private async request<T>(
+    path: string,
+    init?: RequestInit,
+    contract?: ContractName,
+    timeoutMs = REQUEST_TIMEOUT_MS
+  ): Promise<T> {
     let response: Response;
+    let text: string;
+    const timeout = AbortSignal.timeout(timeoutMs);
     try {
       const headers = new Headers(init?.headers);
       if (!headers.has("Accept")) {
@@ -111,14 +125,19 @@ export class HttpBackendClient implements BackendClient {
       }
       response = await this.fetchImpl(this.url(path), {
         credentials: "same-origin",
+        signal: timeout,
         ...init,
         headers
       });
+      text = await response.text();
     } catch (error) {
+      // Some browsers reject a body read cut off by the timeout with a plain AbortError.
+      if ((error as { name?: unknown } | null)?.name === "TimeoutError" || timeout.aborted) {
+        throw new ApiError("The MKVO server took too long to answer.", { code: "TIMEOUT", cause: error });
+      }
       throw normalizeApiError(error, `Unable to reach the MKVO server at ${this.url(path)}.`);
     }
 
-    const text = await response.text();
     let payload: unknown;
     if (text) {
       try {
@@ -154,12 +173,18 @@ export class HttpBackendClient implements BackendClient {
     return payload as T;
   }
 
-  private json<T>(path: string, method: string, body?: unknown, contract?: ContractName): Promise<T> {
+  private json<T>(
+    path: string,
+    method: string,
+    body?: unknown,
+    contract?: ContractName,
+    timeoutMs?: number
+  ): Promise<T> {
     return this.request<T>(path, {
       method,
       headers: body === undefined ? undefined : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body)
-    }, contract);
+    }, contract, timeoutMs);
   }
 
   getStatus(): Promise<AppStatus> {
@@ -191,8 +216,10 @@ export class HttpBackendClient implements BackendClient {
     return this.json<CurrentScanResponse>("/api/files/current", "DELETE", undefined, "CurrentScanResponse");
   }
 
-  setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-    return this.json<CurrentScanResponse>("/api/files/selection", "PUT", { paths }, "CurrentScanResponse");
+  setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+    // Replacing the working set may read files the backend has not cached.
+    const timeout = replaceWorkingSet ? LONG_REQUEST_TIMEOUT_MS : undefined;
+    return this.json<FileSelectionResponse>("/api/files/selection", "PUT", { paths, replaceWorkingSet }, "FileSelectionResponse", timeout);
   }
 
   // The server only ever lists inside its configured roots, so anything the
@@ -210,31 +237,31 @@ export class HttpBackendClient implements BackendClient {
   }
 
   testMediaServerConnection(request: MediaServerConnectionRequest): Promise<MediaServerTestResponse> {
-    return this.json<MediaServerTestResponse>("/api/media-servers/test", "POST", request, "MediaServerTestResponse");
+    return this.json<MediaServerTestResponse>("/api/media-servers/test", "POST", request, "MediaServerTestResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   syncMediaServerLibraries(id: string): Promise<MediaServerSyncResponse> {
-    return this.json<MediaServerSyncResponse>(`/api/media-servers/${encodeURIComponent(id)}/sync`, "POST", undefined, "MediaServerSyncResponse");
+    return this.json<MediaServerSyncResponse>(`/api/media-servers/${encodeURIComponent(id)}/sync`, "POST", undefined, "MediaServerSyncResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   searchRenameMetadata(request: RenameSearchRequest): Promise<{ results: RenameSearchResult[] }> {
-    return this.json<{ results: RenameSearchResult[] }>("/api/rename/search", "POST", request, "RenameSearchResponse");
+    return this.json<{ results: RenameSearchResult[] }>("/api/rename/search", "POST", request, "RenameSearchResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   loadRenameScopes(request: RenameScopesRequest): Promise<{ scopes: RenameScopeRow[] }> {
-    return this.json<{ scopes: RenameScopeRow[] }>("/api/rename/scopes", "POST", request, "RenameScopesResponse");
+    return this.json<{ scopes: RenameScopeRow[] }>("/api/rename/scopes", "POST", request, "RenameScopesResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   testRenameProvider(request: RenameProviderTestRequest): Promise<RenameProviderTestResponse> {
-    return this.json<RenameProviderTestResponse>("/api/rename/test-provider", "POST", request, "RenameProviderTestResponse");
+    return this.json<RenameProviderTestResponse>("/api/rename/test-provider", "POST", request, "RenameProviderTestResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   buildRenamePreview(request: RenamePreviewRequest): Promise<RenamePreviewResponse> {
-    return this.json<RenamePreviewResponse>("/api/rename/preview", "POST", request, "RenamePreviewResponse");
+    return this.json<RenamePreviewResponse>("/api/rename/preview", "POST", request, "RenamePreviewResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   applyRenamePreview(request: RenameApplyRequest): Promise<RenameApplyResponse> {
-    return this.json<RenameApplyResponse>("/api/rename/apply", "POST", request, "RenameApplyResponse");
+    return this.json<RenameApplyResponse>("/api/rename/apply", "POST", request, "RenameApplyResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   getRenameBatches(): Promise<RenameBatchListResponse> {
@@ -242,11 +269,11 @@ export class HttpBackendClient implements BackendClient {
   }
 
   previewRenameBatchUndo(id: string): Promise<RenameBatchUndoPreviewResponse> {
-    return this.request<RenameBatchUndoPreviewResponse>(`/api/rename/batches/${encodeURIComponent(id)}/preview`, undefined, "RenameBatchUndoPreviewResponse");
+    return this.request<RenameBatchUndoPreviewResponse>(`/api/rename/batches/${encodeURIComponent(id)}/preview`, undefined, "RenameBatchUndoPreviewResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   undoRenameBatch(id: string): Promise<RenameBatchUndoResponse> {
-    return this.json<RenameBatchUndoResponse>(`/api/rename/batches/${encodeURIComponent(id)}/undo`, "POST", undefined, "RenameBatchUndoResponse");
+    return this.json<RenameBatchUndoResponse>(`/api/rename/batches/${encodeURIComponent(id)}/undo`, "POST", undefined, "RenameBatchUndoResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   clearRenameBatches(): Promise<RenameBatchListResponse> {
@@ -254,11 +281,11 @@ export class HttpBackendClient implements BackendClient {
   }
 
   buildMuxPreview(request: MuxPreviewRequest): Promise<MuxPreviewResponse> {
-    return this.json<MuxPreviewResponse>("/api/mux/preview", "POST", request, "MuxPreviewResponse");
+    return this.json<MuxPreviewResponse>("/api/mux/preview", "POST", request, "MuxPreviewResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   startMuxApply(request: MuxPreviewRequest): Promise<OperationJobResponse> {
-    return this.json<OperationJobResponse>("/api/mux/apply", "POST", request, "OperationJobResponse");
+    return this.json<OperationJobResponse>("/api/mux/apply", "POST", request, "OperationJobResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   getOperationJob(id: string): Promise<OperationJobResponse> {
@@ -269,16 +296,24 @@ export class HttpBackendClient implements BackendClient {
     return this.json<OperationJobResponse>(`/api/operations/${encodeURIComponent(id)}/cancel`, "POST", undefined, "OperationJobResponse");
   }
 
+  listRecentJobs(limit?: number): Promise<RecentJobsResponse> {
+    return this.request<RecentJobsResponse>(`/api/jobs/recent${limit ? `?limit=${limit}` : ""}`, undefined, "RecentJobsResponse");
+  }
+
+  getWatchHealth(): Promise<WatchHealth> {
+    return this.request<WatchHealth>("/api/watch/health", undefined, "WatchHealth");
+  }
+
   loadPropEditTemplate(request: PropEditTemplateRequest): Promise<PropEditTemplateResponse> {
-    return this.json<PropEditTemplateResponse>("/api/propedit/template", "POST", request, "PropEditTemplateResponse");
+    return this.json<PropEditTemplateResponse>("/api/propedit/template", "POST", request, "PropEditTemplateResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   buildPropEditPreview(request: PropEditPreviewRequest): Promise<PropEditPreviewResponse> {
-    return this.json<PropEditPreviewResponse>("/api/propedit/preview", "POST", request, "PropEditPreviewResponse");
+    return this.json<PropEditPreviewResponse>("/api/propedit/preview", "POST", request, "PropEditPreviewResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   startPropEditApply(request: PropEditPreviewRequest): Promise<OperationJobResponse> {
-    return this.json<OperationJobResponse>("/api/propedit/apply", "POST", request, "OperationJobResponse");
+    return this.json<OperationJobResponse>("/api/propedit/apply", "POST", request, "OperationJobResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   buildLibraryAudit(files: MediaFileRow[]): Promise<LibraryAuditResponse> {
@@ -286,20 +321,25 @@ export class HttpBackendClient implements BackendClient {
       "/api/library/audit",
       "POST",
       { paths: files.map((file) => file.path) },
-      "LibraryAuditResponse"
+      "LibraryAuditResponse",
+      LONG_REQUEST_TIMEOUT_MS
     );
   }
 
   getLibraryCatalog(request: LibraryCatalogRequest): Promise<LibraryCatalogResponse> {
-    return this.json<LibraryCatalogResponse>("/api/library/catalog", "POST", request, "LibraryCatalogResponse");
+    return this.json<LibraryCatalogResponse>("/api/library/catalog", "POST", request, "LibraryCatalogResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   getLibraryArtwork(request: LibraryArtworkRequest): Promise<LibraryArtworkResponse> {
-    return this.json<LibraryArtworkResponse>("/api/library/artwork", "POST", request, "LibraryArtworkResponse");
+    return this.json<LibraryArtworkResponse>("/api/library/artwork", "POST", request, "LibraryArtworkResponse", LONG_REQUEST_TIMEOUT_MS);
+  }
+
+  libraryArtworkUrl(request: LibraryArtworkRequest, version: number): string {
+    return this.url(`/api/library/artwork/${encodeURIComponent(request.serverId)}/${encodeURIComponent(request.itemId)}?v=${version}`);
   }
 
   getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse> {
-    return this.json<LibraryArtworkResponse>("/api/library/local-artwork", "POST", request, "LibraryArtworkResponse");
+    return this.json<LibraryArtworkResponse>("/api/library/local-artwork", "POST", request, "LibraryArtworkResponse", LONG_REQUEST_TIMEOUT_MS);
   }
 
   getOperationLogs(): Promise<{ entries: OperationLogEntry[] }> {
@@ -345,7 +385,12 @@ export class HttpBackendClient implements BackendClient {
           }
         }
       } catch (error) {
-        onError?.(normalizeApiError(error));
+        const apiError = normalizeApiError(error);
+        onError?.(apiError);
+        if (apiError.status === 401) {
+          stopped = true;
+          return;
+        }
       }
 
       if (!stopped) {

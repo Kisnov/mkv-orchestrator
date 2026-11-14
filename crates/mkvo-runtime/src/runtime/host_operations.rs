@@ -22,10 +22,11 @@ impl MkvoRuntime {
 
     pub async fn cancel_operation_job(&self, id: &str) -> RuntimeResult<OperationJobResponse> {
         let id = parse_job_id(id)?;
-        let snapshot = self.inner.jobs.cancel(id).await?;
-        if snapshot.kind == JobKind::Scan {
+        let job = self.inner.jobs.get(id).await?;
+        if job.is_none_or(|job| job.kind == JobKind::Scan) {
             return Err(RuntimeError::not_found(format!("operation job {id}")));
         }
+        let snapshot = self.inner.jobs.cancel(id).await?;
         Ok(OperationJobResponse::from_snapshot(&snapshot))
     }
 

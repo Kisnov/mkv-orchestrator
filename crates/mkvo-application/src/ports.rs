@@ -3,11 +3,14 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mkvo_contracts::{JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, ToolStatus};
+use mkvo_contracts::{
+    JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, RecentJob, ToolStatus,
+};
+pub use mkvo_contracts::{WatchBackendKind, WatchHealth};
 use mkvo_domain::{
     AppSettings, EpisodeMetadata, FileFingerprint, IdempotencyKey, MediaFile, MediaServerKind,
-    MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchId,
-    RenameBatchRecord, ResourceClaim, StoredPlan, WatchSettings,
+    MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchEntry,
+    RenameBatchId, RenameBatchRecord, ResourceClaim, StoredPlan, WatchSettings,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -22,6 +25,17 @@ pub struct MediaEnumerationRequest {
     pub supported_extensions: BTreeSet<String>,
 }
 
+/// One result of a streamed enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnumeratedMedia {
+    File(FileFingerprint),
+    /// A folder or file that could not be read.
+    Skipped {
+        path: PathBuf,
+        reason: String,
+    },
+}
+
 #[async_trait]
 pub trait MediaCatalog: Send + Sync {
     async fn enumerate(
@@ -29,6 +43,20 @@ pub trait MediaCatalog: Send + Sync {
         request: &MediaEnumerationRequest,
         cancel: CancellationToken,
     ) -> Result<Vec<FileFingerprint>, PortError>;
+
+    /// Send entries as they are found, and what cannot be read as `Skipped`
+    /// instead of failing.
+    async fn enumerate_streaming(
+        &self,
+        request: &MediaEnumerationRequest,
+        cancel: CancellationToken,
+        entries: tokio::sync::mpsc::UnboundedSender<EnumeratedMedia>,
+    ) -> Result<(), PortError> {
+        for file in self.enumerate(request, cancel).await? {
+            let _ = entries.send(EnumeratedMedia::File(file));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -49,6 +77,21 @@ pub trait MetadataCache: Send + Sync {
     async fn remove_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, PortError>;
     async fn count(&self) -> Result<u64, PortError>;
     async fn list_under(&self, root: &Path) -> Result<Vec<MediaFile>, PortError>;
+    /// Record that these entries were seen at `seen_at`.
+    async fn mark_seen(&self, paths: &[PathBuf], seen_at: DateTime<Utc>) -> Result<(), PortError>;
+    /// Remove the entries under `root` that were last seen before `cutoff`.
+    async fn remove_unseen_under(
+        &self,
+        root: &Path,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, PortError>;
+    /// Store several probe results at once.
+    async fn upsert_many(&self, files: &[MediaFile]) -> Result<(), PortError> {
+        for file in files {
+            self.upsert(file).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -77,6 +120,16 @@ pub trait FileSystem: Send + Sync {
         path: &Path,
         access: RequiredAccess,
     ) -> Result<FileAccessState, PortError>;
+
+    /// Put `source` in place of the existing `target` with a single rename,
+    /// once `source` is safely on disk.
+    async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError>;
+
+    /// The files directly inside `directory`. A file system that cannot list
+    /// reports none, and a rename then moves no sidecars.
+    async fn list_files(&self, _directory: &Path) -> Result<Vec<PathBuf>, PortError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -170,16 +223,32 @@ pub trait JobRepository: Send + Sync {
         &self,
         key: &IdempotencyKey,
     ) -> Result<Option<JobSnapshot>, PortError>;
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError>;
+    /// The most recently updated jobs, without their result payloads.
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError>;
+    /// Jobs that have not reached a terminal status.
+    async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError>;
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError>;
+    /// Delete the history that finished before `cutoff`: terminal jobs with
+    /// their events and journals, finished journals of operations that had no
+    /// job, and operation logs. With or without a cutoff, also clear what
+    /// older builds stored and nothing reads: job events other than the one
+    /// that ended the job, and the file lists inside scan results. Returns
+    /// the rows deleted. A store that keeps no history has nothing to delete.
+    async fn prune_history(&self, _cutoff: Option<DateTime<Utc>>) -> Result<u64, PortError> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
 pub trait RenameHistoryRepository: Send + Sync {
     async fn add(&self, record: &RenameBatchRecord) -> Result<(), PortError>;
+    /// Add one more moved file to a batch already stored with `add`.
+    async fn append(&self, id: RenameBatchId, entry: &RenameBatchEntry) -> Result<(), PortError>;
     async fn get(&self, id: RenameBatchId) -> Result<Option<RenameBatchRecord>, PortError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<RenameBatchRecord>, PortError>;
     async fn mark_undone(&self, id: RenameBatchId, at: DateTime<Utc>) -> Result<(), PortError>;
+    /// Forget the batches applied before `before`; they can no longer be undone.
+    async fn remove_before(&self, before: DateTime<Utc>) -> Result<u64, PortError>;
     async fn clear(&self) -> Result<u64, PortError>;
 }
 
@@ -251,25 +320,6 @@ pub trait MediaServerClient: Send + Sync {
         item_id: &str,
         cancel: CancellationToken,
     ) -> Result<MediaServerArtwork, PortError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WatchBackendKind {
-    Native,
-    Polling,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WatchHealth {
-    pub running: bool,
-    pub backend: WatchBackendKind,
-    pub watched_roots: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_event_utc: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

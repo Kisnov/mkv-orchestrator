@@ -39,8 +39,12 @@ type MediaLibraryContextValue = {
   updateFilesAfterRename: (renames: Array<{ oldPath: string; newPath: string; newFileName: string; status?: string }>) => void;
 };
 
-const MediaLibraryContext = createContext<MediaLibraryContextValue | null>(null);
-const storageKey = "mkvo.web.scannedFiles";
+type MediaLibraryData = Pick<MediaLibraryContextValue, "files" | "isWorkingView" | "selectedPaths" | "selectionError" | "templateFilePath">;
+type MediaLibraryActions = Omit<MediaLibraryContextValue, keyof MediaLibraryData>;
+
+// Two contexts, so a page that only acts is not re-rendered by every file or selection change.
+const MediaLibraryDataContext = createContext<MediaLibraryData | null>(null);
+const MediaLibraryActionsContext = createContext<MediaLibraryActions | null>(null);
 const templateStorageKey = "mkvo.web.templateFilePath";
 // Selection outlives the tab: it is a deliberate user action, and losing it
 // after a restart means re-picking files across a large library.
@@ -81,16 +85,16 @@ function isPathWithinSource(filePath: string, sourcePath: string): boolean {
  * to the authoritative answer anyway.
  */
 export function MediaLibraryProvider({ children }: { children: ReactNode }) {
-  const [files, setFilesState] = useState<MediaFileRow[]>(() =>
-    readStored<MediaFileRow[]>(sessionStorage, storageKey, [])
-  );
+  // Only paths are kept in the tab. The files come back from the backend
+  // working set, which MediaLibrarySynchronizer reads on every load.
+  const [files, setFilesState] = useState<MediaFileRow[]>([]);
   const [selectedPaths, setSelectedPathsState] = useState<string[]>(() =>
     readStored<string[]>(localStorage, selectionStorageKey, [])
   );
   // What the adopted set was stamped with, so a repeat of the same answer does
   // not keep replacing local state on every refetch.
   // This is synchronization bookkeeping, not render state. Keeping it in a
-  // ref also lets syncFromBackend remain stable: Dashboard depends on that
+  // ref also lets syncFromBackend remain stable: Scan depends on that
   // callback, and recreating it whenever files changed caused the cached empty
   // scan response to overwrite a newly completed scan after Clear UI Cache.
   const removedPaths = useRef(new Set(readStored<string[]>(sessionStorage, "mkvo.web.removedPaths", [])));
@@ -107,8 +111,12 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   });
 
-  useEffect(() => write(sessionStorage, storageKey, files), [files]);
   useEffect(() => write(localStorage, selectionStorageKey, selectedPaths), [selectedPaths]);
+  // Lets toggleSelectedPath stay stable while reading the latest selection.
+  const selectedPathsRef = useRef(selectedPaths);
+  useEffect(() => {
+    selectedPathsRef.current = selectedPaths;
+  }, [selectedPaths]);
 
   useEffect(() => {
     try {
@@ -118,13 +126,13 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   }, [templateFilePath]);
 
-  const pushSelection = useCallback((paths: string[]): void => {
+  // One selection request at a time, in order; `send` answers with the selection the backend stored.
+  const queueSelection = useCallback((send: () => Promise<string[]>): void => {
     selectionPush.current = selectionPush.current
       .catch(() => undefined)
       .then(async () => {
         try {
-          const response = await setFileSelection(paths);
-          setSelectedPathsState(response.selectedPaths);
+          setSelectedPathsState(await send());
           setSelectionError(null);
         } catch (error) {
           const message = error instanceof Error ? error.message : "The selection could not be saved.";
@@ -138,6 +146,9 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
         }
       });
   }, []);
+  const pushSelection = useCallback((paths: string[]): void => {
+    queueSelection(async () => (await setFileSelection(paths)).selectedPaths);
+  }, [queueSelection]);
 
   const syncFromBackend = useCallback((scan: CurrentScanResponse, sourcePaths?: string[]) => {
     if (scan.updatedUtc && adoptedUpdatedUtc.current && scan.updatedUtc <= adoptedUpdatedUtc.current) {
@@ -177,7 +188,6 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     setTemplateFilePath("");
     setSelectionError(null);
     try {
-      sessionStorage.removeItem(storageKey);
       sessionStorage.removeItem(templateStorageKey);
       localStorage.removeItem(selectionStorageKey);
     } catch {
@@ -185,15 +195,14 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const value = useMemo<MediaLibraryContextValue>(() => ({
-    files,
+  const actions = useMemo<MediaLibraryActions>(() => ({
     removeFilesFromView: (paths) => {
       for (const path of paths) removedPaths.current.add(pathKey(path));
       write(sessionStorage, "mkvo.web.removedPaths", [...removedPaths.current]);
       setFilesState((current) => current.filter((file) => !removedPaths.current.has(pathKey(file.path))));
     },
     setFiles: (nextFiles) => {
-      // A direct replacement is a new Dashboard scan or an explicit clear and
+      // A direct replacement is a new scan or an explicit clear and
       // therefore ends a scoped Library handoff.
       workingViewPaths.current = null;
       setIsWorkingView(false);
@@ -223,27 +232,35 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
       setFilesState(nextFiles);
       setSelectedPathsState(nextSelectedPaths);
       setTemplateFilePath(nextTemplatePath || nextFiles[0]?.path || "");
-      pushSelection(nextSelectedPaths);
+      // A Library scan leaves the backend working set alone, so these files are installed there first.
+      queueSelection(async () => {
+        const adopted = (await setFileSelection(nextFiles.map((file) => file.path), true)).selectedPaths;
+        const readable = new Set(adopted.map(pathKey));
+        if (readable.size < nextFiles.length) {
+          // The backend left out what it could not read, so those rows cannot be operated on.
+          workingViewPaths.current = readable;
+          setFilesState((current) => current.filter((file) => readable.has(pathKey(file.path))));
+          setTemplateFilePath((current) => readable.has(pathKey(current)) ? current : adopted[0] ?? "");
+        }
+        const wanted = nextSelectedPaths.filter((path) => readable.has(pathKey(path)));
+        return wanted.length < adopted.length ? (await setFileSelection(wanted)).selectedPaths : adopted;
+      });
     },
-    isWorkingView,
-    selectedPaths,
-    selectionError,
     setSelectedPaths: (paths) => {
       setSelectedPathsState(paths);
       pushSelection(paths);
     },
     toggleSelectedPath: (path) => {
-      setSelectedPathsState((current) => {
-        const next = current.some((selected) => pathKey(selected) === pathKey(path))
-          ? current.filter((selected) => pathKey(selected) !== pathKey(path))
-          : [...current, path];
-        pushSelection(next);
-        return next;
-      });
+      const selectedPaths = selectedPathsRef.current;
+      const next = selectedPaths.some((selected) => pathKey(selected) === pathKey(path))
+        ? selectedPaths.filter((selected) => pathKey(selected) !== pathKey(path))
+        : [...selectedPaths, path];
+      selectedPathsRef.current = next;
+      setSelectedPathsState(next);
+      pushSelection(next);
     },
     hydrateSelection: (paths) => setSelectedPathsState(paths),
     syncFromBackend,
-    templateFilePath,
     setTemplateFilePath,
     clearLibraryCache,
     updateFilesAfterRename: (renames) => {
@@ -275,26 +292,43 @@ export function MediaLibraryProvider({ children }: { children: ReactNode }) {
         return rename ? rename.newPath : current;
       });
     }
-  }), [files, selectedPaths, selectionError, templateFilePath, isWorkingView, pushSelection, syncFromBackend, clearLibraryCache]);
+  }), [pushSelection, queueSelection, syncFromBackend, clearLibraryCache]);
+  const data = useMemo<MediaLibraryData>(
+    () => ({ files, isWorkingView, selectedPaths, selectionError, templateFilePath }),
+    [files, isWorkingView, selectedPaths, selectionError, templateFilePath]
+  );
 
   return (
-    <MediaLibraryContext.Provider value={value}>
-      {children}
-    </MediaLibraryContext.Provider>
+    <MediaLibraryActionsContext.Provider value={actions}>
+      <MediaLibraryDataContext.Provider value={data}>
+        {children}
+      </MediaLibraryDataContext.Provider>
+    </MediaLibraryActionsContext.Provider>
   );
 }
 
-export function useMediaLibrary() {
-  const context = useContext(MediaLibraryContext);
-  if (!context) {
+export function useMediaLibrary(): MediaLibraryContextValue {
+  const data = useContext(MediaLibraryDataContext);
+  const actions = useMediaLibraryActions();
+  if (!data) {
     throw new Error("useMediaLibrary must be used inside MediaLibraryProvider");
   }
 
-  return context;
+  return useMemo(() => ({ ...data, ...actions }), [data, actions]);
+}
+
+/** The actions alone: they never change, so using them causes no re-render. */
+export function useMediaLibraryActions(): MediaLibraryActions {
+  const actions = useContext(MediaLibraryActionsContext);
+  if (!actions) {
+    throw new Error("useMediaLibrary must be used inside MediaLibraryProvider");
+  }
+
+  return actions;
 }
 
 export function MediaLibrarySynchronizer() {
-  const { syncFromBackend } = useMediaLibrary();
+  const { syncFromBackend } = useMediaLibraryActions();
   const currentScan = useQuery({ queryKey: ["current-scan-files"], queryFn: getCurrentScanFiles });
   useEffect(() => { if (currentScan.data) syncFromBackend(currentScan.data); }, [currentScan.data, syncFromBackend]);
   return null;

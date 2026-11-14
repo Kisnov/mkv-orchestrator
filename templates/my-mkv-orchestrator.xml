@@ -1,21 +1,21 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>MKV Orchestrator</Name>
-  <Repository>ghcr.io/bamcel/mkv-orchestrator:latest</Repository>
-  <Registry>https://github.com/bamcel/mkv-orchestrator/pkgs/container/mkv-orchestrator</Registry>
+  <Repository>ghcr.io/kisnov/mkv-orchestrator:latest</Repository>
+  <Registry>https://github.com/Kisnov/mkv-orchestrator/pkgs/container/mkv-orchestrator</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
   <Support>https://github.com/bamcel/mkv-orchestrator/issues</Support>
-  <Project>https://github.com/bamcel/mkv-orchestrator</Project>
+  <Project>https://github.com/Kisnov/mkv-orchestrator</Project>
   <Overview>MKV Orchestrator is a media operations console for scanning MKV/MP4 files, reviewing media and track metadata, renaming files from TVDB/TMDB metadata, mux/remux planning, track property edits, and library overview workflows. The container includes MKVToolNix and FFmpeg/FFprobe. Mount your Unraid shares into /media and optionally /downloads; configure provider API keys in the web Settings page or through the optional masked environment variables below.</Overview>
   <Description>Manage MKV and MP4 libraries from a browser with metadata scanning, provider-backed renaming, mux/remux planning, track property editing, and library workflows. MKVToolNix and FFmpeg/FFprobe are included.</Description>
   <Category>MediaApp:Video Tools:Utilities</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/bamcel/mkv-orchestrator/main/templates/my-mkv-orchestrator.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/bamcel/mkv-orchestrator/main/web/src/assets/mkvo-icon-purple.png</Icon>
-  <ExtraParams/>
+  <TemplateURL>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/templates/my-mkv-orchestrator.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Kisnov/mkv-orchestrator/main/web/src/assets/mkvo-icon-purple.png</Icon>
+  <ExtraParams>--cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges:true</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DonateText/>
@@ -25,15 +25,18 @@
   <Config Name="Media Path" Target="/media" Default="/mnt/user/" Mode="rw" Description="Primary media library path mounted into the container." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/</Config>
   <Config Name="Downloads Path" Target="/downloads" Default="/mnt/user/" Mode="rw" Description="Optional downloads or staging path mounted into the container." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/</Config>
   <Config Name="Config Path" Target="/config" Default="/mnt/user/appdata/mkv-orchestrator" Mode="rw" Description="Persistent MKV Orchestrator settings, logs, and cache data." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/mkv-orchestrator</Config>
-  <Config Name="Require Login" Target="MKVO_AUTH_ENABLED" Default="false|true" Mode="" Description="False grants full access to everyone who can reach MKVO, including reverse-proxy visitors. True requires administrator sign-in. Recreate the container after changing login settings." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+  <Config Name="Require Login" Target="MKVO_AUTH_ENABLED" Default="true|false" Mode="" Description="True requires administrator sign-in. False grants full access to everyone who can reach MKVO, including reverse-proxy visitors, and the container refuses to start unless Allow No Login is also true. Recreate the container after changing login settings." Type="Variable" Display="always" Required="false" Mask="false">true</Config>
   <Config Name="Administrator Username" Target="MKVO_USERNAME" Default="admin" Mode="" Description="Case-sensitive administrator username. Blank uses admin. Credentials are preserved while login is disabled." Type="Variable" Display="always" Required="false" Mask="false">admin</Config>
-  <Config Name="Administrator Password" Target="MKVO_PASSWORD" Default="" Mode="" Description="Administrator password. Leave blank to generate and preserve a password in /config/admin-password.txt. Retrieve it privately from that file; it is never shown in logs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="Administrator Password" Target="MKVO_PASSWORD" Default="" Mode="" Description="Administrator password, at least 12 characters. Leave blank to generate one in /config/admin-password.txt (appdata folder); read it from that file, it is never shown in logs." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="Allow No Login" Target="MKVO_ALLOW_NO_LOGIN" Default="false|true" Mode="" Description="Only for Require Login false on a trusted network: confirms that everyone who can reach MKVO may rename, remux and delete your media without signing in." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Allowed Host Names" Target="MKVO_ALLOWED_HOSTS" Default="" Mode="" Description="Extra host names, comma separated, for a reverse proxy that rewrites Host or for reaching MKVO by name with login off. IP addresses and localhost always work." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
   <Config Name="Media Root" Target="MKVO_MEDIA_ROOT" Default="/media" Mode="" Description="Default root used by the Dashboard browser." Type="Variable" Display="advanced" Required="true" Mask="false">/media</Config>
   <Config Name="Source Roots" Target="MKVO_SOURCE_ROOTS" Default="downloads=/downloads" Mode="" Description="Additional named source roots. /media is added automatically; use name=/container/path entries separated by commas." Type="Variable" Display="advanced" Required="false" Mask="false">downloads=/downloads</Config>
   <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns files created by MKVO. Unraid default: 99 (nobody)." Type="Variable" Display="always" Required="false" Mask="false">99</Config>
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID that owns files created by MKVO. Unraid default: 100 (users)." Type="Variable" Display="always" Required="false" Mask="false">100</Config>
   <Config Name="UMASK" Target="UMASK" Default="022" Mode="" Description="File creation mask for new files." Type="Variable" Display="advanced" Required="false" Mask="false">022</Config>
   <Config Name="Secure Cookies" Target="MKVO_SECURE_COOKIES" Default="false|true" Mode="" Description="Enable only when accessing MKVO over HTTPS. Leave false for plain HTTP LAN access." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Log Level" Target="RUST_LOG" Default="info" Mode="" Description="Log detail. info shows startup messages, including where to find the administrator password; error shows only failures." Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
   <Config Name="Scan Workers" Target="MKVO_SCAN_WORKERS" Default="6" Mode="" Description="Maximum concurrent file metadata scans." Type="Variable" Display="advanced" Required="false" Mask="false">6</Config>
   <Config Name="Edit Workers" Target="MKVO_EDIT_WORKERS" Default="2" Mode="" Description="Maximum concurrent mkvpropedit track property edits." Type="Variable" Display="advanced" Required="false" Mask="false">2</Config>
   <Config Name="TVDB API Key" Target="MKVO_TVDB_API_KEY" Default="" Mode="" Description="Optional container-managed TVDB API key. It appears as configured in MKVO Settings after the container restarts, but its value remains masked." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>

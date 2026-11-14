@@ -1,7 +1,9 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { StrictMode, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 
-import { MediaLibraryProvider, useMediaLibrary } from "./MediaLibraryContext";
+import { MediaLibraryProvider, MediaLibrarySynchronizer, useMediaLibrary, useMediaLibraryActions } from "./MediaLibraryContext";
 import { createMockBackendClient } from "../backend/mockClient";
 import { setBackendClient } from "../backend/runtime";
 import type { MediaFileRow } from "../api";
@@ -58,6 +60,45 @@ describe("working set persistence", () => {
 
     // A fresh provider stands in for the reloaded page.
     const second = library();
+    expect(second.result.current.selectedPaths).toEqual(["/media/b.mkv"]);
+  });
+
+  /// The file list used to be written to sessionStorage on every change: the
+  /// whole library, serialized again for each checkbox. The backend holds it.
+  it("restores the files after a reload from the backend, not from the tab", async () => {
+    const scanned = [file("/media/a.mkv"), file("/media/b.mkv")];
+    setBackendClient(
+      createMockBackendClient({
+        getCurrentScanFiles: () => Promise.resolve({
+          updatedUtc: "2026-11-13T10:00:00Z",
+          files: scanned,
+          selectedPaths: ["/media/b.mkv"],
+          summary: { ...emptySummary, total: 2, mkv: 2 }
+        })
+      })
+    );
+    // A fresh page: its own query cache, provider and synchronizer.
+    const page = () => {
+      const queryClient = new QueryClient();
+      return renderHook(() => useMediaLibrary(), {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={queryClient}>
+            <MediaLibraryProvider>
+              <MediaLibrarySynchronizer />
+              {children}
+            </MediaLibraryProvider>
+          </QueryClientProvider>
+        )
+      });
+    };
+
+    const first = page();
+    await waitFor(() => expect(first.result.current.files).toEqual(scanned));
+    expect(JSON.stringify({ ...sessionStorage })).not.toContain("fileName");
+    first.unmount();
+
+    const second = page();
+    await waitFor(() => expect(second.result.current.files).toEqual(scanned));
     expect(second.result.current.selectedPaths).toEqual(["/media/b.mkv"]);
   });
 
@@ -144,6 +185,43 @@ describe("working set persistence", () => {
     await waitFor(() => expect(setFileSelection).toHaveBeenCalledWith(["/media/a.mkv"]));
   });
 
+  /// A Library scan no longer puts its files in the backend working set, so a
+  /// title sent to the Dashboard has to be installed there before it is selected.
+  it("makes a handed-off title the backend working set", async () => {
+    const setFileSelection = vi.fn((paths: string[]) => Promise.resolve({ selectedPaths: paths }));
+    setBackendClient(createMockBackendClient({ setFileSelection }));
+    const title = [file("/media/tv/Show/01.mkv"), file("/media/tv/Show/02.mkv")];
+
+    const { result } = library();
+    act(() => result.current.setWorkingView(title, [title[1].path], title[1].path));
+
+    await waitFor(() => expect(setFileSelection).toHaveBeenCalledTimes(2));
+    expect(setFileSelection.mock.calls).toEqual([
+      [title.map((item) => item.path), true],
+      [[title[1].path]]
+    ]);
+    expect(result.current.selectedPaths).toEqual([title[1].path]);
+  });
+
+  /// A file deleted since the Library last looked is left out by the backend.
+  /// Selecting it anyway would be rejected and leave a row no operation can use.
+  it("drops handed-off files the backend could not read", async () => {
+    const title = [file("/media/tv/Show/01.mkv"), file("/media/tv/Show/gone.mkv")];
+    const setFileSelection = vi.fn((paths: string[], replaceWorkingSet?: boolean) => replaceWorkingSet
+      ? Promise.resolve({ selectedPaths: [title[0].path] })
+      : Promise.reject(new Error(`${paths.length} selected path(s) are not in the current scan`)));
+    setBackendClient(createMockBackendClient({ setFileSelection }));
+
+    const { result } = library();
+    act(() => result.current.setWorkingView(title, title.map((item) => item.path), title[1].path));
+
+    await waitFor(() => expect(result.current.files).toEqual([title[0]]));
+    expect(result.current.selectedPaths).toEqual([title[0].path]);
+    expect(result.current.templateFilePath).toBe(title[0].path);
+    expect(result.current.selectionError).toBeNull();
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+  });
+
   /// The backend is authoritative, so what it reports wins over whatever this
   /// tab happened to have cached.
   it("adopts the backend selection without echoing it back", async () => {
@@ -161,6 +239,30 @@ describe("working set persistence", () => {
 
     expect(result.current.selectedPaths).toEqual(["/media/b.mkv"]);
     expect(setFileSelection).not.toHaveBeenCalled();
+  });
+
+  /// StrictMode invokes state updaters twice, so the push must not live in one.
+  it("pushes a toggled selection once under StrictMode", async () => {
+    const setFileSelection = vi.fn().mockResolvedValue({
+      updatedUtc: null,
+      files: [],
+      summary: emptySummary,
+      selectedPaths: ["/media/a.mkv"]
+    });
+    setBackendClient(createMockBackendClient({ setFileSelection }));
+
+    const { result } = renderHook(() => useMediaLibrary(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <StrictMode><MediaLibraryProvider>{children}</MediaLibraryProvider></StrictMode>
+      )
+    });
+    act(() => result.current.setFiles([file("/media/a.mkv")]));
+    act(() => result.current.toggleSelectedPath("/media/a.mkv"));
+    // Pushes are chained, so a duplicate only goes out after the first settles.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(setFileSelection).toHaveBeenCalledTimes(1);
+    expect(setFileSelection).toHaveBeenCalledWith(["/media/a.mkv"]);
   });
 
   it("toggles a path on and off", () => {
@@ -318,4 +420,36 @@ it("keeps manually removed files excluded when newer operation results arrive", 
   act(() => result.current.syncFromBackend({ files: [{ ...first, codec: "HEVC" }, removed], selectedPaths: [first.path, removed.path], summary: emptySummary, updatedUtc: "2026-09-17T02:00:00Z" }));
   expect(result.current.files).toEqual([{ ...first, codec: "HEVC" }]);
   expect(result.current.selectedPaths).toEqual([first.path]);
+});
+
+describe("consumers that only act", () => {
+  it("do not re-render when the files or the selection change", () => {
+    setBackendClient(createMockBackendClient({ setFileSelection: () => new Promise(() => undefined) }));
+    let actorRenders = 0;
+    const both = renderHook(() => {
+      const actions = useMediaLibraryActions();
+      return { actions, library: useMediaLibrary() };
+    }, {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <MediaLibraryProvider>
+          <Actor />
+          {children}
+        </MediaLibraryProvider>
+      )
+    });
+    function Actor() {
+      useMediaLibraryActions();
+      actorRenders += 1;
+      return null;
+    }
+    const firstActions = both.result.current.actions;
+
+    act(() => both.result.current.library.setFiles([file("/media/a.mkv"), file("/media/b.mkv")]));
+    act(() => both.result.current.library.toggleSelectedPath("/media/a.mkv"));
+    act(() => both.result.current.library.toggleSelectedPath("/media/b.mkv"));
+
+    expect(both.result.current.library.selectedPaths).toEqual(["/media/a.mkv", "/media/b.mkv"]);
+    expect(both.result.current.actions).toBe(firstActions);
+    expect(actorRenders).toBe(1);
+  });
 });

@@ -1,4 +1,7 @@
-use std::{path::Path, time::SystemTime};
+use std::{
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -25,12 +28,14 @@ impl MediaProbePort for MediaScanAdapter {
         let scanned = crate::MediaProbe::inspect(self, path, cancel)
             .await
             .map_err(probe_port_error)?;
-        scanned_to_domain(scanned).map_err(|error| PortError::InvalidData(error.to_string()))
+        let metadata = tokio::fs::metadata(&scanned.path)
+            .await
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        Ok(scanned_to_domain(scanned, &metadata))
     }
 }
 
-fn scanned_to_domain(scanned: ScannedMedia) -> Result<MediaFile, std::io::Error> {
-    let metadata = std::fs::metadata(&scanned.path)?;
+fn scanned_to_domain(scanned: ScannedMedia, metadata: &std::fs::Metadata) -> MediaFile {
     let modified_at: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
     let status = if scanned.warning.is_some() {
         MediaStatus::Warning
@@ -49,7 +54,7 @@ fn scanned_to_domain(scanned: ScannedMedia) -> Result<MediaFile, std::io::Error>
         Some(value) => ContainerKind::Other(value.to_owned()),
         None => ContainerKind::Unknown,
     };
-    Ok(MediaFile {
+    MediaFile {
         path: scanned.path.clone(),
         original_file_name: scanned
             .path
@@ -119,7 +124,7 @@ fn scanned_to_domain(scanned: ScannedMedia) -> Result<MediaFile, std::io::Error>
         episode: None,
         provider_match: None,
         status,
-    })
+    }
 }
 
 fn hdr_label(transfer: Option<&str>, primaries: Option<&str>) -> Option<String> {
@@ -191,6 +196,24 @@ fn tool_kind(value: &str) -> Option<ToolKind> {
         .find(|kind| kind.command_name().eq_ignore_ascii_case(value))
 }
 
+// A remux can run for hours, so only a long silence counts as a dead share or a hung tool.
+const TOOL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+fn tool_spec(invocation: &ToolInvocation) -> ProcessSpec {
+    let mut spec = ProcessSpec::new(&invocation.executable).args(&invocation.arguments);
+    // Without outputs the tool edits a file in place: killing it mid-write is worse than waiting.
+    if !invocation.expected_outputs.is_empty() {
+        spec = spec.inactivity_timeout(
+            TOOL_INACTIVITY_TIMEOUT,
+            invocation.expected_outputs.iter().cloned(),
+        );
+    }
+    if let Some(directory) = &invocation.working_directory {
+        spec = spec.current_dir(directory);
+    }
+    spec
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProcessToolExecutor {
     runner: ProcessRunner,
@@ -214,19 +237,23 @@ impl ToolExecutor for ProcessToolExecutor {
                 "tool executable is blank".to_owned(),
             ));
         }
-        let mut spec = ProcessSpec::new(&invocation.executable).args(&invocation.arguments);
-        if let Some(directory) = &invocation.working_directory {
-            spec = spec.current_dir(directory);
-        }
         let output = self
             .runner
-            .run(spec, cancel)
+            .run(tool_spec(invocation), cancel)
             .await
             .map_err(|error| match error {
                 crate::ProcessError::Cancelled => PortError::Canceled,
                 crate::ProcessError::TimedOut(timeout) => {
                     PortError::unavailable(format!("tool timed out after {timeout:?}"), true)
                 }
+                crate::ProcessError::Inactive(timeout) => PortError::unavailable(
+                    format!(
+                        "{} was stopped: it printed and wrote nothing for {} minutes",
+                        invocation.tool,
+                        timeout.as_secs() / 60
+                    ),
+                    true,
+                ),
                 _ => PortError::Other(error.to_string()),
             })?;
         let validated_outputs = invocation
@@ -250,6 +277,24 @@ impl ToolExecutor for ProcessToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_that_edits_in_place_is_never_stopped_for_inactivity() {
+        let mut invocation = ToolInvocation {
+            tool: "mkvpropedit".to_owned(),
+            executable: "mkvpropedit".into(),
+            arguments: Vec::new(),
+            working_directory: None,
+            expected_outputs: Vec::new(),
+        };
+        assert_eq!(tool_spec(&invocation).inactivity_timeout, None);
+
+        invocation.expected_outputs.push("output.tmp".into());
+        assert_eq!(
+            tool_spec(&invocation).inactivity_timeout,
+            Some(TOOL_INACTIVITY_TIMEOUT)
+        );
+    }
 
     #[test]
     fn logical_tool_names_are_case_insensitive() {

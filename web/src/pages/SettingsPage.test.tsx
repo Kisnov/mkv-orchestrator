@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "react-router-dom";
 
 import { SettingsPage } from "./SettingsPage";
 import { renderWithBackend } from "../test/render";
-import type { WebSettings } from "../generated/contracts";
+import type { WebMediaServer, WebSettings } from "../generated/contracts";
 
 function settings(overrides: Partial<WebSettings> = {}): WebSettings {
   return {
@@ -370,6 +371,30 @@ describe("Settings library folders", () => {
     ]);
   });
 
+  /// With index keys, removing the first row handed its inputs to the second
+  /// row, so focus and a half-typed value jumped to the wrong folder.
+  it("keeps each Quick Access row's own inputs when another is removed", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({
+        defaultRoot: "/media",
+        libraryRoots: [
+          { name: "Anime", path: "/media/anime" },
+          { name: "TV", path: "/media/tv" }
+        ]
+      })),
+      saveWebSettings: vi.fn().mockResolvedValue(settings())
+    });
+
+    await user.click(await screen.findByRole("button", { name: /^general$/i }));
+    const tvName = await screen.findByDisplayValue("TV");
+    await user.click(screen.getByRole("button", { name: /remove quick access folder 1/i }));
+
+    expect(tvName).toBeInTheDocument();
+    expect(tvName).toHaveValue("TV");
+  });
+
   it("reorders Quick Access folders and automatically saves their order", async () => {
     const user = userEvent.setup();
     const saveWebSettings = vi.fn().mockResolvedValue(settings());
@@ -598,6 +623,388 @@ describe("Settings appearance", () => {
 
     expect(document.documentElement.style.getPropertyValue("--color-border")).toBe("#12AB34");
     expect((screen.getByLabelText(/theme json/i) as HTMLTextAreaElement).value).toContain('"Border": "#12AB34"');
+  });
+});
+
+function mediaServer(overrides: Partial<WebMediaServer> = {}): WebMediaServer {
+  return {
+    id: "0198c1d2-0000-7000-8000-000000000001",
+    name: "Home",
+    type: "jellyfin",
+    serverUrl: "http://jellyfin.local:8096",
+    hasApiKey: true,
+    isDefault: true,
+    lastSyncedUtc: null,
+    libraries: [],
+    ...overrides
+  };
+}
+
+describe("Settings media servers", () => {
+  /// A saved key is never returned, so the field reloads blank. Sending that
+  /// blank string made the backend test with no credential at all.
+  it("tests a saved server without sending a blank key", async () => {
+    const user = userEvent.setup();
+    const testMediaServerConnection = vi.fn().mockResolvedValue({ success: true, status: "Connection succeeded.", libraryCount: 0 });
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      testMediaServerConnection
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    await user.click(screen.getByRole("button", { name: "Test Home" }));
+
+    await waitFor(() => expect(testMediaServerConnection).toHaveBeenCalled());
+    const request = testMediaServerConnection.mock.calls[0][0];
+    expect(request.id).toBe(mediaServer().id);
+    expect(request.apiKey).toBeUndefined();
+  });
+
+  it("tests with a key that was just typed", async () => {
+    const user = userEvent.setup();
+    const testMediaServerConnection = vi.fn().mockResolvedValue({ success: true, status: "Connection succeeded.", libraryCount: 0 });
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      saveWebSettings: vi.fn().mockResolvedValue(settings({ mediaServers: [mediaServer()] })),
+      testMediaServerConnection
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "new-key" } });
+    await user.click(screen.getByRole("button", { name: "Test Home" }));
+
+    await waitFor(() => expect(testMediaServerConnection).toHaveBeenCalled());
+    expect(testMediaServerConnection.mock.calls[0][0].apiKey).toBe("new-key");
+  });
+
+  /// The backend reports the type in lower case. With capitalised option
+  /// values nothing matched and the browser showed the first option, Emby.
+  it("shows the saved server type instead of the first option", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] }))
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+
+    expect(screen.getByLabelText("Type")).toHaveDisplayValue("Jellyfin");
+  });
+
+  it("makes the first remaining server the default when the default is deleted", async () => {
+    const user = userEvent.setup();
+    const other = mediaServer({ id: "0198c1d2-0000-7000-8000-000000000002", name: "Attic", isDefault: false });
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({ mediaServers: [{ ...other, isDefault: true }] }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer(), other] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Delete Home" }));
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalled());
+    expect(saveWebSettings.mock.calls[0][0].mediaServers).toEqual([
+      expect.objectContaining({ id: other.id, isDefault: true })
+    ]);
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+describe("Settings autosave", () => {
+  /// The response to a save used to be poured back into every field, so
+  /// whatever was typed while it was in flight disappeared.
+  it("keeps what was typed while a save was in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred<WebSettings>();
+    const saveWebSettings = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementation((request) => Promise.resolve(settings({ tvdbLanguage: request.tvdbLanguage })));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings
+    });
+    await openProvidersTab(user);
+    const language = screen.getByLabelText("Metadata Language");
+
+    fireEvent.change(language, { target: { value: "jpn" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    fireEvent.change(language, { target: { value: "kor" } });
+    first.resolve(settings({ tvdbLanguage: "jpn" }));
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    expect(language).toHaveValue("kor");
+    expect(saveWebSettings.mock.calls[1][0].tvdbLanguage).toBe("kor");
+  });
+
+  it("never has two saves in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred<WebSettings>();
+    const saveWebSettings = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(settings());
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings
+    });
+    await openProvidersTab(user);
+    const language = screen.getByLabelText("Metadata Language");
+
+    fireEvent.change(language, { target: { value: "jpn" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    fireEvent.change(language, { target: { value: "kor" } });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(saveWebSettings).toHaveBeenCalledTimes(1);
+
+    first.resolve(settings({ tvdbLanguage: "jpn" }));
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2));
+    expect(saveWebSettings.mock.calls[1][0].tvdbLanguage).toBe("kor");
+  });
+});
+
+describe("Settings rendering", () => {
+  /// The custom themes were read and parsed from localStorage on every render,
+  /// that is on every keystroke in any field.
+  it("does not read localStorage while typing", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings: vi.fn().mockResolvedValue(settings())
+    });
+    await user.click(await screen.findByRole("button", { name: /^appearance$/i }));
+    const name = await screen.findByLabelText("Custom Theme Name");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    try {
+      await user.type(name, " two");
+      expect(getItem).not.toHaveBeenCalled();
+    } finally {
+      getItem.mockRestore();
+    }
+  });
+});
+
+describe("Settings media server saves", () => {
+  /// secrets.json is plain JSON with owner-only permissions; it is not encrypted.
+  it("says truthfully how keys are stored", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings())
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+
+    expect(screen.getByText(/stored unencrypted in secrets\.json/i)).toBeInTheDocument();
+    expect(screen.queryByText(/encrypted before/i)).not.toBeInTheDocument();
+  });
+
+  /// A typed key used to stay in the form and ride along with every later
+  /// save, so changing the URL afterwards stored it for the new URL too.
+  it("clears a key from its field once it is stored, so a new URL does not get it", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockImplementation((request) => Promise.resolve(settings({
+      mediaServers: [mediaServer({ serverUrl: request.mediaServers[0].serverUrl, hasApiKey: true })]
+    })));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: false })] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const key = screen.getByLabelText("API key / token");
+
+    fireEvent.change(key, { target: { value: "new-key" } });
+    await waitFor(() => expect(key).toHaveValue(""), { timeout: 2500 });
+    expect(key).toHaveAttribute("placeholder", "••••••••••••");
+    expect(saveWebSettings.mock.calls[0][0].mediaServers[0].apiKey).toBe("new-key");
+
+    const url = screen.getByLabelText("Server URL");
+    fireEvent.focus(url);
+    fireEvent.change(url, { target: { value: "http://other.local:8096" } });
+    fireEvent.blur(url);
+    await waitFor(() => expect(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].serverUrl).toBe("http://other.local:8096"), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].apiKey).toBeUndefined();
+  });
+
+  it("has Dashboard check a media server again once a new key is saved", async () => {
+    const user = userEvent.setup();
+    const check = vi.fn(() => Promise.resolve("rejected"));
+    function DashboardCheck() {
+      useQuery({ queryKey: ["media-server-check", "server-1"], queryFn: check, staleTime: Number.POSITIVE_INFINITY });
+      return null;
+    }
+    renderWithBackend(<><SettingsPage /><DashboardCheck /></>, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: true })] })),
+      saveWebSettings: (request) => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: true })], maxScanWorkers: request.maxScanWorkers ?? 4 }))
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    expect(check).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(screen.getByLabelText("API key / token"), { target: { value: "new-key" } });
+    await waitFor(() => expect(check).toHaveBeenCalledTimes(2), { timeout: 2500 });
+  });
+
+  it("keeps a key that was edited while its save was in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred<WebSettings>();
+    const saveWebSettings = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(settings({ mediaServers: [mediaServer()] }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ hasApiKey: false })] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const key = screen.getByLabelText("API key / token");
+
+    fireEvent.change(key, { target: { value: "new" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    fireEvent.change(key, { target: { value: "new-key" } });
+    first.resolve(settings({ mediaServers: [mediaServer()] }));
+
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls[1][0].mediaServers[0].apiKey).toBe("new-key");
+  });
+
+  it("clears a provider key from its field once it is stored", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings()),
+      saveWebSettings: vi.fn().mockResolvedValue(settings({ hasTvdbApiKey: true }))
+    });
+    await openProvidersTab(user);
+    const key = screen.getByLabelText("TVDB API Key");
+
+    fireEvent.change(key, { target: { value: "tvdb-key" } });
+
+    await waitFor(() => expect(key).toHaveValue(""), { timeout: 2500 });
+    expect(key).toHaveAttribute("placeholder", "••••••••••••");
+  });
+
+  /// The backend drops a stored key when the URL changes, so the form says so
+  /// before and after the save instead of leaving masking dots behind.
+  it("warns that a new URL needs the key again", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockResolvedValue(settings({
+      mediaServers: [mediaServer({ serverUrl: "http://other.local:8096", hasApiKey: false })]
+    }));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer()] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+
+    fireEvent.change(screen.getByLabelText("Server URL"), { target: { value: "http://other.local:8096" } });
+    expect(screen.getByText(/a new url needs the api key again/i)).toBeInTheDocument();
+
+    expect(await screen.findByText(/enter the api key for home again/i, undefined, { timeout: 2500 })).toBeInTheDocument();
+    expect(screen.getByLabelText("API key / token")).toHaveAttribute("placeholder", "API key or token");
+  });
+
+  /// Editing 192.168.1.10 passes through 192.168.1.1, a valid URL. Saved after a
+  /// pause, it made the backend delete the key for good.
+  it("holds back a URL change until the field is left", async () => {
+    const user = userEvent.setup();
+    const saveWebSettings = vi.fn().mockImplementation((request) => Promise.resolve(settings({
+      watchFolders: request.watchFolders,
+      mediaServers: [mediaServer({ serverUrl: request.mediaServers[0].serverUrl })]
+    })));
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ serverUrl: "http://192.168.1.10:8096" })] })),
+      saveWebSettings
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const url = screen.getByLabelText("Server URL");
+
+    fireEvent.focus(url);
+    fireEvent.change(url, { target: { value: "http://192.168.1.1:8096" } });
+    expect(screen.getByText(/a new url needs the api key again/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Watch folders"), { target: { value: "/media/tv" } });
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(1), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls[0][0].watchFolders).toEqual(["/media/tv"]);
+    expect(saveWebSettings.mock.calls[0][0].mediaServers[0].serverUrl).toBe("http://192.168.1.10:8096");
+
+    fireEvent.blur(url);
+    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    expect(saveWebSettings.mock.calls[1][0].mediaServers[0].serverUrl).toBe("http://192.168.1.1:8096");
+  });
+
+  /// The warning must agree with the backend, which drops the key: paths are
+  /// case-sensitive, a default port is no change.
+  it("compares URLs the way the backend does", async () => {
+    const user = userEvent.setup();
+    renderWithBackend(<SettingsPage />, {
+      getStatus: () => Promise.resolve(status),
+      getWebSettings: () => Promise.resolve(settings({ mediaServers: [mediaServer({ serverUrl: "http://jellyfin.local/Jellyfin" })] }))
+    });
+    await user.click(await screen.findByRole("button", { name: /^library$/i }));
+    await user.click(screen.getByRole("button", { name: "Edit Home" }));
+    const url = screen.getByLabelText("Server URL");
+
+    fireEvent.change(url, { target: { value: "HTTP://Jellyfin.local:80/Jellyfin/" } });
+    expect(screen.queryByText(/a new url needs the api key again/i)).not.toBeInTheDocument();
+    fireEvent.change(url, { target: { value: "http://jellyfin.local/jellyfin" } });
+    expect(screen.getByText(/a new url needs the api key again/i)).toBeInTheDocument();
+  });
+
+  /// Without `crypto.randomUUID` (plain HTTP on a LAN address) the new server
+  /// got an id the backend replaced, so Sync could not find it after saving.
+  it("syncs a server added where crypto.randomUUID is missing", async () => {
+    const user = userEvent.setup();
+    const realCrypto = globalThis.crypto;
+    vi.stubGlobal("crypto", { getRandomValues: realCrypto.getRandomValues.bind(realCrypto) });
+    try {
+      const saveWebSettings = vi.fn().mockImplementation((request) => Promise.resolve(settings({
+        mediaServers: request.mediaServers.map((server: { id: string }) => mediaServer({
+          id: uuidPattern.test(server.id) ? server.id : "0198c1d2-0000-7000-8000-0000000000ff"
+        }))
+      })));
+      const syncMediaServerLibraries = vi.fn((id: string) => Promise.resolve({
+        server: mediaServer({ id }),
+        libraries: [],
+        status: "Sync complete for Home: 0 library path(s)."
+      }));
+      renderWithBackend(<SettingsPage />, {
+        getStatus: () => Promise.resolve(status),
+        getWebSettings: () => Promise.resolve(settings()),
+        saveWebSettings,
+        syncMediaServerLibraries
+      });
+      await user.click(await screen.findByRole("button", { name: /^library$/i }));
+      await user.click(screen.getByRole("button", { name: "Add server" }));
+      await user.clear(screen.getByLabelText("Name"));
+      await user.type(screen.getByLabelText("Name"), "Home");
+      fireEvent.change(screen.getByLabelText("Server URL"), { target: { value: "http://jellyfin.local:8096" } });
+      await user.click(screen.getByRole("button", { name: "Add Server" }));
+      await user.click(screen.getByRole("button", { name: "Sync libraries for Home" }));
+
+      await waitFor(() => expect(syncMediaServerLibraries).toHaveBeenCalled());
+      expect(syncMediaServerLibraries.mock.calls[0][0]).toMatch(uuidPattern);
+      expect(syncMediaServerLibraries.mock.calls[0][0]).toBe(saveWebSettings.mock.calls.at(-1)?.[0].mediaServers[0].id);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

@@ -1,9 +1,8 @@
 name: Publish Docker image
 
+# Called by the CI workflow once every CI job has passed; it has no trigger of its own.
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
+  workflow_call:
 
 permissions:
   contents: read
@@ -27,11 +26,13 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
+          # GHCR only accepts lowercase names; metadata-action lowercases the owner.
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
 
       - uses: docker/build-push-action@v6
         with:

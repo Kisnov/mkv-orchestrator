@@ -147,6 +147,58 @@ impl JobSnapshot {
     }
 }
 
+/// A job as listed in recent activity: its snapshot without the result
+/// payload and log, so a list of them stays small.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentJob {
+    pub id: JobId,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub created_utc: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_utc: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_utc: Option<DateTime<Utc>>,
+    pub completed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub total: u64,
+    pub current_file: String,
+    pub current_file_percent: u8,
+    /// The last line the job logged, such as its completion message.
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<&JobSnapshot> for RecentJob {
+    fn from(job: &JobSnapshot) -> Self {
+        Self {
+            id: job.id,
+            kind: job.kind,
+            status: job.status,
+            created_utc: job.created_utc,
+            started_utc: job.started_utc,
+            completed_utc: job.completed_utc,
+            completed: job.completed,
+            failed: job.failed,
+            skipped: job.skipped,
+            total: job.total,
+            current_file: job.current_file.clone(),
+            current_file_percent: job.current_file_percent,
+            summary: job.lines.last().cloned().unwrap_or_default(),
+            error: job.error.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentJobsResponse {
+    pub jobs: Vec<RecentJob>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSummary {

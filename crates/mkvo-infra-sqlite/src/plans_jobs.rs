@@ -90,22 +90,125 @@ impl SqliteStore {
         self.query_job("id", id)
     }
 
-    pub fn list_recent_jobs(&self, limit: usize) -> StoreResult<Vec<StoredJob>> {
+    pub fn count_job_events(&self, job_id: &str) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM job_events WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| StoreError::NumericOverflow)
+    }
+
+    /// Delete one batch of job events that are not the last of their job.
+    ///
+    /// Only the event that ends a job is stored now. Older builds stored one
+    /// or more per scanned file, so this walks the index, not the payloads.
+    pub fn delete_superseded_job_events(&self, limit: usize) -> StoreResult<u64> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
         let connection = self.connection()?;
-        let mut statement =
-            connection.prepare("SELECT id FROM jobs ORDER BY updated_at_ms DESC LIMIT ?1")?;
-        let ids = statement
-            .query_map([limit], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        drop(connection);
-        ids.into_iter()
-            .map(|id| {
-                self.get_job(&id)?
-                    .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
-            })
-            .collect()
+        let removed = connection.execute(
+            "DELETE FROM job_events WHERE rowid IN (
+                SELECT event.rowid FROM job_events event
+                WHERE event.sequence <
+                    (SELECT MAX(sequence) FROM job_events WHERE job_id = event.job_id)
+                LIMIT ?1)",
+            [limit],
+        )?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
+    /// Delete the last events left by jobs that never reported how they ended.
+    /// Run it after `strip_scan_file_lists`, when every payload is small.
+    pub fn delete_unended_job_events(&self) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let removed = connection.execute(
+            "DELETE FROM job_events WHERE json_extract(payload_json, '$.event.type')
+             NOT IN ('completed', 'failed', 'canceled')",
+            [],
+        )?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
+    /// Delete one batch of jobs that finished before `cutoff_ms`, each with
+    /// its events and its journal. Jobs that never finished stay whatever
+    /// their age: startup recovery reads them.
+    pub fn delete_finished_jobs(&self, cutoff_ms: i64, limit: usize) -> StoreResult<u64> {
+        let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let jobs = {
+            let mut statement = transaction.prepare(
+                "SELECT id, idempotency_key FROM jobs
+                 WHERE state IN ('\"Completed\"', '\"Failed\"', '\"Skipped\"', '\"Canceled\"')
+                 AND updated_at_ms < ?1 LIMIT ?2",
+            )?;
+            let rows = statement.query_map([cutoff_ms, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut removed = 0;
+        for (id, idempotency_key) in jobs {
+            removed += transaction.execute(
+                "DELETE FROM mutation_journal WHERE idempotency_key = ?1",
+                [idempotency_key],
+            )?;
+            removed += transaction.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
+    /// Delete operation logs older than `cutoff_ms`, and the journals of
+    /// operations without a job (renames) that finished before it. A journal
+    /// that never finished stays: someone still has to look at it.
+    pub fn delete_finished_journals_and_logs(&self, cutoff_ms: i64) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut removed = transaction.execute(
+            "DELETE FROM mutation_journal
+             WHERE updated_at_ms < ?1 AND status NOT IN ('\"prepared\"', '\"running\"')
+             AND idempotency_key NOT IN
+             (SELECT idempotency_key FROM jobs WHERE idempotency_key IS NOT NULL)",
+            [cutoff_ms],
+        )?;
+        removed += transaction.execute(
+            "DELETE FROM operation_logs WHERE timestamp_ms < ?1",
+            [cutoff_ms],
+        )?;
+        transaction.commit()?;
+        u64::try_from(removed).map_err(|_| StoreError::NumericOverflow)
+    }
+
+    /// Rewrite one batch of scan results and completion events that still
+    /// carry the file list older builds stored in them.
+    pub fn strip_scan_file_lists(&self, limit: usize) -> StoreResult<u64> {
+        let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut stripped = transaction.execute(
+            "UPDATE job_events SET payload_json =
+                json_remove(payload_json, '$.event.result.files', '$.event.result.rows')
+             WHERE rowid IN (
+                SELECT event.rowid FROM job_events event
+                JOIN jobs ON jobs.id = event.job_id
+                WHERE jobs.kind = '\"scan\"'
+                AND json_type(event.payload_json, '$.event.result.files') IS NOT NULL
+                LIMIT ?1)",
+            [limit],
+        )?;
+        stripped += transaction.execute(
+            "UPDATE jobs SET result_json =
+                json_remove(result_json, '$.result.files', '$.result.rows')
+             WHERE id IN (
+                SELECT id FROM jobs
+                WHERE kind = '\"scan\"' AND json_type(result_json, '$.result.files') IS NOT NULL
+                LIMIT ?1)",
+            [limit],
+        )?;
+        transaction.commit()?;
+        u64::try_from(stripped).map_err(|_| StoreError::NumericOverflow)
     }
 
     pub fn find_job_by_idempotency_key(&self, key: &str) -> StoreResult<Option<StoredJob>> {

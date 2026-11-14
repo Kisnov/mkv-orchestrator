@@ -11,7 +11,11 @@ export function useOverlayAccessibility() {
       const overlays = [...document.querySelectorAll<HTMLElement>('[role="dialog"], .fixed.inset-0 > section, [role="menu"]')];
       const next = overlays.filter((element) => element.getClientRects().length > 0).at(-1) ?? null;
       if (next === current) return;
-      if (!next) { if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true }); current = null; return; }
+      if (!next) {
+        // Focus lost to the page while the dialog opened goes back to the page's marked control.
+        const back = previousFocus?.isConnected && previousFocus !== document.body ? previousFocus : document.querySelector<HTMLElement>("[data-dialog-return]");
+        back?.focus({ preventScroll: true }); current = null; return;
+      }
       if (!current) previousFocus = document.activeElement as HTMLElement;
       current = next;
       if (next.getAttribute("role") !== "menu") {
@@ -22,7 +26,7 @@ export function useOverlayAccessibility() {
           next.setAttribute("aria-label", heading?.textContent?.trim() || "Operation details");
         }
       }
-      controls(next)[0]?.focus({ preventScroll: true });
+      (next.querySelector<HTMLElement>("[data-autofocus]") ?? controls(next)[0])?.focus({ preventScroll: true });
     };
     function dismiss() {
       if (!current) return;

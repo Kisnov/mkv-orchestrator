@@ -6,8 +6,7 @@ use futures::{StreamExt, stream};
 use mkvo_application::{
     ApplicationError, FileAccessState, JobSpec, LibraryAuditService, PropertyEditPlanRequest,
     PropertyEditPlanner, RemuxOptions, RemuxPlanRequest, RemuxPlanner, RenamePlanRequest,
-    RenamePlanner, RequiredAccess, TextEdit, ToolInvocation, TrackEditIntent,
-    match_by_list_order,
+    RenamePlanner, RequiredAccess, TextEdit, ToolInvocation, TrackEditIntent, match_by_list_order,
 };
 use mkvo_contracts::{
     JobCompletion, JobKind, JobLogLevel, LibraryAuditResponse, LibraryAuditRow,
@@ -43,8 +42,8 @@ mod rename_workflow;
 mod response_mappers;
 mod shared_workflow;
 use execution_support::{
-    append_propedit_arguments, append_track_selection, backup_path, extraction_temp_path,
-    require_plan_fields, runtime_application_error, validate_idempotent_job,
+    append_propedit_arguments, append_track_selection, extraction_temp_path, require_plan_fields,
+    runtime_application_error, validate_idempotent_job,
 };
 use rename_presentation::{
     file_name, path_key, remux_mode_label, remux_tool_name, same_path, track_kind_label,
@@ -300,7 +299,7 @@ fn build_extractions(
                 .filter(|track| track.kind == TrackKind::Subtitle)
                 .filter(|track| {
                     languages.is_empty()
-                        || languages.contains(&"all".to_owned())
+                        || languages.contains("all")
                         || languages
                             .contains(&track.language_or_undetermined().to_ascii_lowercase())
                 })
@@ -604,6 +603,16 @@ mod tests {
             self.files.write().await.remove(path);
             Ok(())
         }
+
+        async fn replace_file(&self, source: &Path, target: &Path) -> Result<(), PortError> {
+            let mut files = self.files.write().await;
+            let mut fingerprint = files
+                .remove(source)
+                .ok_or_else(|| PortError::NotFound(source.display().to_string()))?;
+            fingerprint.path = target.to_path_buf();
+            files.insert(target.to_path_buf(), fingerprint);
+            Ok(())
+        }
     }
 
     struct FakeTools;
@@ -735,8 +744,14 @@ mod tests {
             file.tracks.push(track);
         }
         let files = [file];
-        assert_eq!(build_extractions(&files, "all", false)[&files[0].path].len(), 3);
-        assert_eq!(build_extractions(&files, "eng", false)[&files[0].path].len(), 1);
+        assert_eq!(
+            build_extractions(&files, "all", false)[&files[0].path].len(),
+            3
+        );
+        assert_eq!(
+            build_extractions(&files, "eng", false)[&files[0].path].len(),
+            1
+        );
     }
 
     fn mux_request(plan: Option<&RemuxPlan>) -> MuxPreviewRequest {
@@ -848,7 +863,10 @@ mod tests {
         assert_eq!(edits[0].default, Some(true));
         assert_eq!(edits[0].forced, None);
         request.audio_tracks[0].name_from_channels = Some(true);
-        assert_eq!(build_track_edits(&request)[0].name, TextEdit::FromTrackChannels);
+        assert_eq!(
+            build_track_edits(&request)[0].name,
+            TextEdit::FromTrackChannels
+        );
         request.audio_tracks[0].name_from_channels = None;
         request.audio_tracks[0].name_from_codec_channels = Some(true);
         assert_eq!(
@@ -948,6 +966,7 @@ mod tests {
             .build_plan(RenamePlanRequest {
                 source_access: BTreeMap::new(),
                 existing_parents: BTreeSet::new(),
+                unlisted_folders: BTreeSet::new(),
                 files: vec![source],
                 template: "Renamed".to_owned(),
                 provider: None,

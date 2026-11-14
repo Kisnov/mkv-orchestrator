@@ -46,6 +46,16 @@ pub struct RenamePlanItem {
     pub new_file_name: String,
     #[serde(default)]
     pub conflicts: Vec<PlanConflict>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<RenameSidecar>,
+}
+
+/// A subtitle, `.nfo` or image named after a video, which is renamed with it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSidecar {
+    pub source: PathBuf,
+    pub target: PathBuf,
 }
 
 impl RenamePlanItem {
@@ -66,6 +76,9 @@ pub struct RenameTokens {
     pub season: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub episode: Option<u32>,
+    /// The last episode of a file that holds several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_episode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absolute: Option<u32>,
     pub episode_title: String,
@@ -93,6 +106,9 @@ pub struct RenameBatchEntry {
     pub original_fingerprint: FileFingerprint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed_fingerprint: Option<FileFingerprint>,
+    /// The sidecars that moved with the file; absent in batches stored before they did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<RenameSidecar>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

@@ -1,4 +1,9 @@
+use futures::{StreamExt, stream};
+
 use super::*;
+
+/// Files re-read at once after an operation; the scan workers' default.
+const REFRESH_PROBES: usize = 4;
 
 impl MkvoRuntime {
     pub async fn get_status(&self) -> RuntimeResult<AppStatus> {
@@ -77,14 +82,9 @@ impl MkvoRuntime {
 
     async fn scan_locations(&self) -> (Option<PathBuf>, Vec<LibraryRoot>) {
         self.settings_service()
-            .load()
+            .load_settings()
             .await
-            .map(|loaded| {
-                (
-                    loaded.settings.scan.default_root,
-                    loaded.settings.scan.library_roots,
-                )
-            })
+            .map(|settings| (settings.scan.default_root, settings.scan.library_roots))
             .unwrap_or_default()
     }
 
@@ -109,7 +109,7 @@ impl MkvoRuntime {
             && let Some(requested) = path.as_deref()
             && let Some(UncTarget::Server(server)) = classify_unc(requested)
         {
-            return server_listing(&server);
+            return server_listing(&server).await;
         }
 
         let requested = match path.filter(|value| !value.trim().is_empty()) {
@@ -209,9 +209,8 @@ impl MkvoRuntime {
         if request.max_workers.is_none() {
             request.max_workers = Some(
                 self.settings_service()
-                    .load()
+                    .load_settings()
                     .await?
-                    .settings
                     .workers
                     .max_scan_workers,
             );
@@ -231,6 +230,7 @@ impl MkvoRuntime {
             .map_err(|error| RuntimeError::internal(error.to_string()))?;
         let key = IdempotencyKey::generate();
         let scan = Arc::clone(&self.inner.scan);
+        let jobs = Arc::clone(&self.inner.jobs);
         let current = Arc::clone(&self.inner.current_scan);
         // Scanning is the most-run operation, so it has to reach the operation
         // log too; otherwise the Logs page stays empty through normal use.
@@ -255,12 +255,22 @@ impl MkvoRuntime {
                     .scan(&request, context.cancellation_token(), &context)
                     .await?;
                 let state = scan_result_state(&outcome);
-                {
+                let summary = outcome.summary;
+                if request.keep_working_set {
+                    // Attached before the scan is named, so an audit finds the files.
+                    jobs.attach(context.job_id(), Arc::new(outcome.files)).await;
+                    current.write().await.overview_job = Some(context.job_id());
+                } else {
                     let mut current = current.write().await;
                     current.updated_utc = Some(Utc::now());
-                    current.apply_scan(outcome.files.clone(), outcome.summary);
+                    let replaced_job = current.scan_job.replace(context.job_id());
+                    let replaced = current.apply_scan(outcome.files, summary);
+                    // The earlier scan's client may not have asked for its
+                    // files yet. Moved, not copied.
+                    if let Some(job) = replaced_job {
+                        jobs.attach(job, Arc::new(replaced)).await;
+                    }
                 }
-                let summary = outcome.summary;
                 let detail = format!(
                     "{} file(s): {} MKV, {} MP4, {} cached, {} failed",
                     summary.total, summary.mkv, summary.mp4, summary.cached, summary.failed
@@ -317,10 +327,11 @@ impl MkvoRuntime {
 
     pub async fn cancel_scan(&self, id: &str) -> RuntimeResult<ScanJobResponse> {
         let id = parse_job_id(id)?;
-        let snapshot = self.inner.jobs.cancel(id).await?;
-        if snapshot.kind != JobKind::Scan {
+        let job = self.inner.jobs.get(id).await?;
+        if job.is_none_or(|job| job.kind != JobKind::Scan) {
             return Err(RuntimeError::not_found(format!("scan job {id}")));
         }
+        let snapshot = self.inner.jobs.cancel(id).await?;
         self.scan_job_response(&snapshot).await
     }
 
@@ -343,7 +354,10 @@ impl MkvoRuntime {
     pub async fn set_file_selection(
         &self,
         request: mkvo_contracts::FileSelectionRequest,
-    ) -> RuntimeResult<CurrentScanResponse> {
+    ) -> RuntimeResult<mkvo_contracts::FileSelectionResponse> {
+        if request.replace_working_set {
+            return Ok(self.replace_working_set(&request.paths).await);
+        }
         let mut state = self.inner.current_scan.write().await;
         let available: BTreeSet<String> = state
             .files
@@ -370,7 +384,81 @@ impl MkvoRuntime {
         }
 
         state.selected = selected;
-        Ok(current_scan_response(&state))
+        Ok(mkvo_contracts::FileSelectionResponse {
+            selected_paths: state.selected_display_paths(),
+        })
+    }
+
+    /// Make exactly these files the working set, all of them selected.
+    ///
+    /// A title sent from the Library arrives here. Its scan left the working
+    /// set alone, so a file the set does not hold is read: from the probe
+    /// cache when that is current. One that cannot be read is left out.
+    async fn replace_working_set(&self, paths: &[String]) -> mkvo_contracts::FileSelectionResponse {
+        let key = mkvo_application::paths::path_key;
+        let wanted: BTreeSet<String> = paths.iter().map(|path| key(Path::new(path))).collect();
+        let held: BTreeSet<String> = {
+            let state = self.inner.current_scan.read().await;
+            let keys = state.files.iter().map(|file| key(&file.path));
+            keys.filter(|key| wanted.contains(key)).collect()
+        };
+        let missing: Vec<_> = paths
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| !held.contains(&key(path)))
+            .collect();
+        let read: Vec<MediaFile> = stream::iter(missing)
+            .map(|path| self.read_file(path))
+            .buffer_unordered(REFRESH_PROBES)
+            .filter_map(|file| async move { file })
+            .collect()
+            .await;
+
+        let mut state = self.inner.current_scan.write().await;
+        // Nothing of it could be read: keep the working set rather than empty it.
+        if read.is_empty()
+            && !state
+                .files
+                .iter()
+                .any(|file| wanted.contains(&key(&file.path)))
+        {
+            return mkvo_contracts::FileSelectionResponse {
+                selected_paths: state.selected_display_paths(),
+            };
+        }
+        let replaced = state.keep_only(&wanted, read);
+        // The scan that produced them may not have been asked for its files yet.
+        if let Some(job) = state.scan_job.take() {
+            self.inner.jobs.attach(job, Arc::new(replaced)).await;
+        }
+        state.updated_utc = Some(Utc::now());
+        mkvo_contracts::FileSelectionResponse {
+            selected_paths: state.selected_display_paths(),
+        }
+    }
+
+    /// One file as a scan would report it, or `None` when it cannot be read.
+    async fn read_file(&self, path: PathBuf) -> Option<MediaFile> {
+        let dependencies = &self.inner.dependencies;
+        let read = async {
+            let path = dependencies.paths.authorize_read(&path).await?;
+            let fingerprint = dependencies.file_system.fingerprint(&path).await?;
+            if let Some(cached) = dependencies.cache.get_valid(&fingerprint).await? {
+                return Ok(cached);
+            }
+            let cancel = CancellationToken::new();
+            let mut file = dependencies.probe.inspect(&path, cancel).await?;
+            file.fingerprint = fingerprint;
+            if let Err(error) = dependencies.cache.upsert(&file).await {
+                tracing::warn!(path = %path.display(), %error, "file could not be cached");
+            }
+            Ok::<_, mkvo_application::PortError>(file)
+        };
+        read.await
+            .inspect_err(|error| {
+                tracing::debug!(path = %path.display(), %error, "file could not be read");
+            })
+            .ok()
     }
 
     /// Move the working set with files a rename just moved on disk.
@@ -397,6 +485,30 @@ impl MkvoRuntime {
         self.refresh_working_set(&targets).await;
     }
 
+    /// Follow renames without probing: each pair is a file's old path and its
+    /// fingerprint under the new one, and its content is what it was.
+    pub(crate) async fn move_working_set_files(
+        &self,
+        renamed: &[(PathBuf, mkvo_domain::FileFingerprint)],
+    ) {
+        let renames: Vec<_> = renamed
+            .iter()
+            .map(|(source, target)| (source.clone(), target.path.clone()))
+            .collect();
+        let targets: std::collections::BTreeMap<_, _> = renamed
+            .iter()
+            .map(|(_, target)| (target.path.as_path(), target))
+            .collect();
+        let mut state = self.inner.current_scan.write().await;
+        state.apply_renames(&renames);
+        for file in &mut state.files {
+            if let Some(target) = targets.get(file.path.as_path()) {
+                file.fingerprint = (*target).clone();
+            }
+        }
+        state.updated_utc = Some(Utc::now());
+    }
+
     /// Re-read files an operation just changed, so the working set describes
     /// them as they are now rather than as they were when scanned.
     ///
@@ -410,23 +522,26 @@ impl MkvoRuntime {
             return;
         }
 
-        let mut probed = Vec::with_capacity(paths.len());
-        for path in paths {
-            match self
-                .inner
-                .dependencies
-                .probe
-                .inspect(path, CancellationToken::new())
-                .await
-            {
-                Ok(file) => probed.push(file),
-                Err(error) => tracing::debug!(
-                    path = %path.display(),
-                    %error,
-                    "file could not be re-read after an operation"
-                ),
-            }
-        }
+        let probed: Vec<MediaFile> = stream::iter(paths.to_vec())
+            .map(|path| {
+                let probe = Arc::clone(&self.inner.dependencies.probe);
+                async move {
+                    let inspected = probe.inspect(&path, CancellationToken::new()).await;
+                    inspected
+                        .inspect_err(|error| {
+                            tracing::debug!(
+                                path = %path.display(),
+                                %error,
+                                "file could not be re-read after an operation"
+                            );
+                        })
+                        .ok()
+                }
+            })
+            .buffer_unordered(REFRESH_PROBES)
+            .filter_map(|file| async move { file })
+            .collect()
+            .await;
 
         for file in &probed {
             if let Err(error) = self.inner.dependencies.cache.upsert(file).await {
@@ -439,41 +554,626 @@ impl MkvoRuntime {
         }
 
         let mut state = self.inner.current_scan.write().await;
-        for file in probed {
-            if let Some(existing) = state
-                .files
-                .iter_mut()
-                .find(|candidate| same_path(&candidate.path, &file.path))
-            {
-                *existing = file;
-            } else {
-                state.files.push(file);
-            }
-        }
-        state
-            .files
-            .sort_by(|left, right| left.path.cmp(&right.path));
-        state.reconcile_selection();
+        state.merge(probed);
         state.updated_utc = Some(Utc::now());
     }
 
     pub async fn clear_current_scan_files(&self) -> RuntimeResult<CurrentScanResponse> {
         let mut state = self.inner.current_scan.write().await;
-        *state = CurrentScanState::default();
+        let cleared = std::mem::take(&mut *state);
+        state.overview_job = cleared.overview_job;
+        if let Some(job) = cleared.scan_job {
+            self.inner.jobs.attach(job, Arc::new(cleared.files)).await;
+        }
         Ok(current_scan_response(&state))
     }
 
     async fn scan_job_response(&self, snapshot: &JobSnapshot) -> RuntimeResult<ScanJobResponse> {
         let state = scan_state_from_snapshot(snapshot).unwrap_or_default();
+        // The job keeps the counts. The files come from the working set while
+        // it is still this scan's, and afterwards from what was handed to the
+        // job, which lasts until the job leaves memory. The lock is held
+        // across both lookups so a hand-over cannot fall between them.
+        let current = self.inner.current_scan.read().await;
+        let files = if snapshot.status != JobStatus::Completed {
+            Vec::new()
+        } else if current.scan_job == Some(snapshot.id) {
+            current.files.iter().map(MediaFileRow::from).collect()
+        } else {
+            let handed_over = self.inner.jobs.attachment::<Vec<MediaFile>>(snapshot.id);
+            handed_over
+                .await
+                .map(|files| files.iter().map(MediaFileRow::from).collect())
+                .unwrap_or_default()
+        };
         Ok(ScanJobResponse::from_snapshot(
             snapshot,
-            if state.rows.is_empty() {
-                state.files.iter().map(MediaFileRow::from).collect()
-            } else {
-                state.rows
-            },
+            files,
             state.skipped,
             state.summary,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use mkvo_application::{MediaProbe, PortError};
+    use mkvo_domain::{MediaTrack, TrackKind};
+    use mkvo_infra_sqlite::SqliteStore;
+
+    use super::super::tests::media_at;
+    use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// Stands in for mkvmerge: every file has the same three audio tracks,
+    /// Japanese until `english` says the files were changed on disk.
+    #[derive(Default)]
+    struct Probe {
+        english: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl MediaProbe for Probe {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            let english = self.english.load(std::sync::atomic::Ordering::SeqCst);
+            let language = if english { "eng" } else { "jpn" };
+            let mut file = media_at(&path.to_string_lossy());
+            file.tracks = (0..3)
+                .map(|id| MediaTrack {
+                    mkvmerge_id: id,
+                    propedit_track_number: 1,
+                    kind: TrackKind::Audio,
+                    codec: "AAC".to_owned(),
+                    codec_id: None,
+                    language: Some(language.to_owned()),
+                    name: Some("Stereo".to_owned()),
+                    resolution: None,
+                    bit_depth: None,
+                    hdr: None,
+                    channels: Some(2),
+                    sampling_frequency_hz: None,
+                    default: false,
+                    forced: false,
+                    enabled: true,
+                })
+                .collect();
+            Ok(file)
+        }
+    }
+
+    /// A probe that takes a moment and counts how many run at once.
+    #[derive(Default)]
+    struct SlowProbe {
+        running: std::sync::atomic::AtomicUsize,
+        most_at_once: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MediaProbe for SlowProbe {
+        async fn inspect(
+            &self,
+            path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<MediaFile, PortError> {
+            use std::sync::atomic::Ordering;
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(media_at(&path.to_string_lossy()))
+        }
+    }
+
+    struct Host {
+        _directory: tempfile::TempDir,
+        library: PathBuf,
+        database: PathBuf,
+        runtime: MkvoRuntime,
+    }
+
+    fn host(files: usize) -> Host {
+        host_with(files, Arc::new(Probe::default()))
+    }
+
+    /// A real database and a real folder of `files` MKVs; only the probe is faked.
+    fn host_with(files: usize, probe: Arc<dyn MediaProbe>) -> Host {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let config = directory.path().join("config");
+        std::fs::create_dir_all(&library).unwrap();
+        for index in 0..files {
+            std::fs::write(library.join(format!("episode-{index:04}.mkv")), b"mkv").unwrap();
+        }
+        let composed = MkvoRuntimeBuilder::new(&library, &config)
+            .app_name("test")
+            .disable_legacy_migration()
+            .authorized_root(&library, true)
+            .build()
+            .unwrap();
+        let mut dependencies = composed.inner.dependencies.clone();
+        dependencies.probe = probe;
+        Host {
+            _directory: directory,
+            library,
+            database: config.join("mkvo.db"),
+            runtime: MkvoRuntime::from_parts(composed.inner.config.clone(), dependencies),
+        }
+    }
+
+    async fn start(host: &Host, folder: &Path) -> JobId {
+        let request = ScanRequest {
+            source_path: Some(display_path(folder)),
+            ..ScanRequest::default()
+        };
+        host.runtime.start_scan(request).await.unwrap().id
+    }
+
+    async fn finished(host: &Host, id: JobId) -> ScanJobResponse {
+        for _ in 0..4_000 {
+            let job = host.runtime.get_scan_job(&id.to_string()).await.unwrap();
+            if job.status.is_terminal() {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("scan did not finish");
+    }
+
+    async fn scan(host: &Host) -> ScanJobResponse {
+        let id = start(host, &host.library).await;
+        finished(host, id).await
+    }
+
+    /// The status is answered from memory a moment before the final state
+    /// and its event reach the database.
+    async fn saved(host: &Host, id: JobId) -> SqliteStore {
+        let store = SqliteStore::open(&host.database).unwrap();
+        let id = id.to_string();
+        for _ in 0..400 {
+            let completed = store
+                .get_job(&id)
+                .unwrap()
+                .is_some_and(|row| row.state == "\"Completed\"");
+            if completed && store.count_job_events(&id).unwrap() > 0 {
+                return store;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("scan {id} was not stored as Completed with its final event");
+    }
+
+    /// The scan status still answers with every file, but what the scan
+    /// leaves in the database must not depend on how many there were.
+    #[tokio::test]
+    async fn what_a_scan_stores_does_not_grow_with_the_library() {
+        let mut stored = Vec::new();
+        for files in [3, 300] {
+            let host = host(files);
+            let job = scan(&host).await;
+            assert_eq!(job.status, JobStatus::Completed);
+            assert_eq!(job.files.len(), files);
+            assert_eq!(job.summary.total, files as u64);
+
+            let store = saved(&host, job.id).await;
+            let id = job.id.to_string();
+            let row = store.get_job(&id).unwrap().unwrap();
+            assert_eq!(row.state, "\"Completed\"");
+            stored.push((
+                serde_json::to_string(&row.result).unwrap().len(),
+                store.count_job_events(&id).unwrap(),
+            ));
+        }
+        let [(small_row, small_events), (large_row, large_events)] = stored[..] else {
+            unreachable!()
+        };
+        assert_eq!((small_events, large_events), (1, 1), "job_events rows");
+        assert!(
+            large_row < small_row + 256,
+            "the job row grew from {small_row} to {large_row} bytes"
+        );
+    }
+
+    /// Every checkbox click is one of these, so it must not carry the library.
+    #[tokio::test]
+    async fn a_selection_update_answers_with_the_selection_only() {
+        let mut sizes = Vec::new();
+        for files in [3, 300] {
+            let host = host(files);
+            let first = scan(&host).await.files.swap_remove(0).path;
+            let request = mkvo_contracts::FileSelectionRequest {
+                paths: vec![first.clone()],
+                ..Default::default()
+            };
+            let response = host.runtime.set_file_selection(request).await.unwrap();
+            assert_eq!(response.selected_paths, [first]);
+            sizes.push(serde_json::to_string(&response).unwrap().len());
+        }
+        assert!(sizes[1] < sizes[0] + 64, "{sizes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_finished_scan_is_still_readable_after_a_restart() {
+        let host = host(3);
+        let job = scan(&host).await;
+        saved(&host, job.id).await;
+
+        let restarted = MkvoRuntime::from_parts(
+            host.runtime.inner.config.clone(),
+            host.runtime.inner.dependencies.clone(),
+        );
+        let after = restarted.get_scan_job(&job.id.to_string()).await.unwrap();
+        assert_eq!(after.status, JobStatus::Completed);
+        assert_eq!(after.summary, job.summary);
+        // The working set did not survive the restart, so there are no files.
+        assert!(after.files.is_empty());
+    }
+
+    /// Two clients, two scans. Whichever finishes first has lost the working
+    /// set to the other by the time its client asks, and an empty answer
+    /// there would be saved by the Library page as an empty library.
+    #[tokio::test]
+    async fn scans_that_finish_together_each_serve_their_own_files() {
+        let host = host(0);
+        let mut scans = Vec::new();
+        for (name, files) in [("anime", 2), ("films", 3)] {
+            let folder = host.library.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            for index in 0..files {
+                std::fs::write(folder.join(format!("{index}.mkv")), b"mkv").unwrap();
+            }
+            scans.push((start(&host, &folder).await, name, files));
+        }
+        for (id, _, _) in &scans {
+            finished(&host, *id).await;
+        }
+
+        let assert_own_files = || async {
+            for (id, name, files) in &scans {
+                let job = host.runtime.get_scan_job(&id.to_string()).await.unwrap();
+                assert_eq!(job.files.len(), *files, "{name}");
+                assert!(job.files.iter().all(|file| file.path.contains(name)));
+            }
+        };
+        assert_own_files().await;
+        // Clearing the working set must not empty an answer either.
+        host.runtime.clear_current_scan_files().await.unwrap();
+        assert_own_files().await;
+    }
+
+    /// `files` MKVs in a folder of their own under the library.
+    fn folder(host: &Host, name: &str, files: usize) -> PathBuf {
+        let folder = host.library.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        for index in 0..files {
+            std::fs::write(folder.join(format!("{index}.mkv")), b"mkv").unwrap();
+        }
+        folder
+    }
+
+    /// The Library's overview scan, which leaves the working set alone.
+    async fn overview(host: &Host, folder: &Path) -> ScanJobResponse {
+        let request = ScanRequest {
+            source_path: Some(display_path(folder)),
+            keep_working_set: true,
+            ..ScanRequest::default()
+        };
+        let id = host.runtime.start_scan(request).await.unwrap().id;
+        finished(host, id).await
+    }
+
+    /// The Dashboard's files and selection are the user's work in progress;
+    /// reading every library for the overview used to replace them.
+    #[tokio::test]
+    async fn a_library_overview_scan_leaves_the_working_set_alone() {
+        let host = host(0);
+        let dashboard = folder(&host, "dashboard", 2);
+        let library = folder(&host, "films", 3);
+        let id = start(&host, &dashboard).await;
+        let mut working = finished(&host, id).await.files;
+        let selection = mkvo_contracts::FileSelectionRequest {
+            paths: vec![working.swap_remove(0).path],
+            ..Default::default()
+        };
+        host.runtime.set_file_selection(selection).await.unwrap();
+        let before = host.runtime.get_current_scan_files().await.unwrap();
+
+        let scanned = overview(&host, &library).await;
+
+        assert_eq!(scanned.files.len(), 3);
+        assert!(scanned.files.iter().all(|file| file.path.contains("films")));
+        assert_eq!(host.runtime.get_current_scan_files().await.unwrap(), before);
+        assert_eq!(before.files.len(), 2);
+        assert_eq!(before.selected_paths.len(), 1);
+    }
+
+    /// The Library audits what it just scanned by path alone.
+    #[tokio::test]
+    async fn the_files_of_an_overview_scan_can_be_audited_by_path() {
+        let host = host(0);
+        let scanned = overview(&host, &folder(&host, "films", 3)).await;
+        let request = crate::compat::LibraryAuditRequest {
+            paths: scanned.files.into_iter().map(|file| file.path).collect(),
+            files: Vec::new(),
+        };
+
+        let audit = host.runtime.run_library_audit(request).await.unwrap();
+
+        assert_eq!(audit.summary.files, 3);
+    }
+
+    /// The Library saves an audit as its picture of the library, so one that
+    /// covers only some of the files asked for must not look like a result.
+    #[tokio::test]
+    async fn an_audit_of_files_no_longer_held_is_an_error() {
+        let host = host(0);
+        let scanned = overview(&host, &folder(&host, "films", 3)).await;
+        let request = crate::compat::LibraryAuditRequest {
+            paths: scanned.files.into_iter().map(|file| file.path).collect(),
+            files: Vec::new(),
+        };
+        let restarted = MkvoRuntime::from_parts(
+            host.runtime.inner.config.clone(),
+            host.runtime.inner.dependencies.clone(),
+        );
+        let after_restart = restarted.run_library_audit(request.clone()).await;
+        // A later Library scan takes the place of the one being audited.
+        overview(&host, &folder(&host, "series", 1)).await;
+        let after_another_scan = host.runtime.run_library_audit(request).await;
+
+        for error in [after_restart.unwrap_err(), after_another_scan.unwrap_err()] {
+            assert_eq!(error.code, mkvo_contracts::ApiErrorCode::Conflict);
+            assert!(
+                error.message.contains("Scan the library again"),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// A title sent to the Dashboard leaves copies in the working set. When
+    /// the Library rebuilds it later, the audit is of what was just read.
+    #[tokio::test]
+    async fn an_audit_reads_the_overview_scan_before_the_working_set() {
+        let probe = Arc::new(Probe::default());
+        let host = host_with(0, probe.clone());
+        let films = folder(&host, "films", 2);
+        let id = start(&host, &films).await;
+        finished(&host, id).await;
+
+        probe
+            .english
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let rebuild = ScanRequest {
+            source_path: Some(display_path(&films)),
+            keep_working_set: true,
+            force_refresh: true,
+            ..ScanRequest::default()
+        };
+        let id = host.runtime.start_scan(rebuild).await.unwrap().id;
+        let request = crate::compat::LibraryAuditRequest {
+            paths: finished(&host, id)
+                .await
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect(),
+            files: Vec::new(),
+        };
+        let audit = host.runtime.run_library_audit(request).await.unwrap();
+
+        let audio = &audit.items[0].standard_audio;
+        assert!(audio.contains("eng") && !audio.contains("jpn"), "{audio}");
+    }
+
+    /// Sending a title from the Library to the Dashboard: those files become
+    /// the working set, wherever the runtime has to get them from.
+    #[tokio::test]
+    async fn a_handoff_replaces_the_working_set_with_the_files_it_names() {
+        let host = host(0);
+        let dashboard = folder(&host, "dashboard", 2);
+        let id = start(&host, &dashboard).await;
+        finished(&host, id).await;
+        let mut title = overview(&host, &folder(&host, "films", 3)).await.files;
+        title.truncate(2);
+        let mut paths: Vec<_> = title.iter().map(|file| file.path.clone()).collect();
+        let handoff = mkvo_contracts::FileSelectionRequest {
+            paths: paths.clone(),
+            replace_working_set: true,
+        };
+        // After a restart nothing is in memory, and the files are read again.
+        let restarted = MkvoRuntime::from_parts(
+            host.runtime.inner.config.clone(),
+            host.runtime.inner.dependencies.clone(),
+        );
+
+        for runtime in [&host.runtime, &restarted] {
+            let adopted = runtime.set_file_selection(handoff.clone()).await.unwrap();
+            assert_eq!(adopted.selected_paths, paths);
+            let working = runtime.get_current_scan_files().await.unwrap();
+            let files: Vec<_> = working.files.into_iter().map(|file| file.path).collect();
+            assert_eq!(files, paths);
+            assert_eq!(working.selected_paths, paths);
+            assert_eq!(working.summary.total, 2);
+        }
+        // The scan that lost the working set still answers with its own files.
+        let earlier = host.runtime.get_scan_job(&id.to_string()).await.unwrap();
+        assert_eq!(earlier.files.len(), 2);
+        assert!(
+            earlier
+                .files
+                .iter()
+                .all(|file| file.path.contains("dashboard"))
+        );
+
+        // A file that is gone is left out, not an error.
+        paths.push(display_path(&dashboard.join("gone.mkv")));
+        let handoff = mkvo_contracts::FileSelectionRequest {
+            paths,
+            replace_working_set: true,
+        };
+        let adopted = host.runtime.set_file_selection(handoff).await.unwrap();
+        assert_eq!(adopted.selected_paths.len(), 2);
+    }
+
+    /// A title whose files all moved away must not empty the Dashboard.
+    #[tokio::test]
+    async fn a_handoff_with_nothing_readable_keeps_the_working_set() {
+        let host = host(0);
+        let dashboard = folder(&host, "dashboard", 2);
+        let id = start(&host, &dashboard).await;
+        finished(&host, id).await;
+        let before = host.runtime.get_current_scan_files().await.unwrap();
+
+        let adopted = host
+            .runtime
+            .set_file_selection(mkvo_contracts::FileSelectionRequest {
+                paths: vec![display_path(&dashboard.join("gone.mkv"))],
+                replace_working_set: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(adopted.selected_paths, before.selected_paths);
+        let after = host.runtime.get_current_scan_files().await.unwrap();
+        assert_eq!(after.files.len(), 2);
+        assert_eq!(after.updated_utc, before.updated_utc);
+    }
+
+    /// A job of `kind` that runs until the returned sender is dropped.
+    async fn held_job(host: &Host, kind: JobKind) -> (JobId, tokio::sync::oneshot::Sender<()>) {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let spec = JobSpec {
+            kind,
+            idempotency_key: IdempotencyKey::generate(),
+            request_fingerprint: "held".to_owned(),
+            plan_id: None,
+            total: 0,
+            resources: Vec::new(),
+        };
+        let task = |_| async move {
+            let _ = released.await;
+            Ok(JobCompletion::default())
+        };
+        let accepted = host.runtime.inner.jobs.start(spec, task).await.unwrap();
+        (accepted.id, release)
+    }
+
+    #[tokio::test]
+    async fn cancelling_through_the_other_kind_of_endpoint_cancels_nothing() {
+        let host = host(0);
+        let (scan, _hold_scan) = held_job(&host, JobKind::Scan).await;
+        let (remux, _hold_remux) = held_job(&host, JobKind::Remux).await;
+
+        let as_operation = host.runtime.cancel_operation_job(&scan.to_string()).await;
+        let as_scan = host.runtime.cancel_scan(&remux.to_string()).await;
+
+        for error in [as_operation.unwrap_err(), as_scan.unwrap_err()] {
+            assert_eq!(error.code, mkvo_contracts::ApiErrorCode::NotFound);
+        }
+        for id in [scan, remux] {
+            let job = host.runtime.inner.jobs.get(id).await.unwrap().unwrap();
+            assert!(
+                !matches!(job.status, JobStatus::Canceling | JobStatus::Canceled),
+                "{:?} was canceled",
+                job.kind
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn files_changed_by_an_operation_are_re_read_a_few_at_a_time() {
+        let probe = Arc::new(SlowProbe::default());
+        let host = host_with(0, probe.clone());
+        let paths: Vec<_> = (0..12)
+            .map(|index| host.library.join(format!("{index:02}.mkv")))
+            .collect();
+
+        host.runtime.refresh_working_set(&paths).await;
+
+        let most_at_once = probe.most_at_once.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=REFRESH_PROBES).contains(&most_at_once),
+            "{most_at_once}"
+        );
+        let working_set = host.runtime.get_current_scan_files().await.unwrap();
+        assert_eq!(working_set.files.len(), 12);
+        assert!(
+            working_set
+                .files
+                .is_sorted_by(|left, right| left.path <= right.path)
+        );
+    }
+
+    #[test]
+    fn a_long_skipped_list_is_stored_truncated() {
+        let outcome = mkvo_application::ScanOutcome {
+            skipped: (0..620)
+                .map(|index| mkvo_application::ScanSkip {
+                    path: PathBuf::from(format!("/library/{index}.mkv")),
+                    reason: "unreadable".to_owned(),
+                })
+                .collect(),
+            ..mkvo_application::ScanOutcome::default()
+        };
+        let state = scan_result_state(&outcome);
+        assert_eq!(state.skipped.len(), 501);
+        assert_eq!(state.skipped[500], "... and 120 more");
+    }
+
+    /// Older builds stored every file, twice, in the job result.
+    #[tokio::test]
+    async fn a_result_stored_by_an_older_build_still_loads() {
+        let host = host(0);
+        let file = media_at("/library/old.mkv");
+        let snapshot = JobSnapshot {
+            id: JobId::new(),
+            kind: JobKind::Scan,
+            status: JobStatus::Completed,
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            idempotency_key: IdempotencyKey::generate(),
+            request_fingerprint: "request".to_owned(),
+            plan_id: None,
+            created_utc: Utc::now(),
+            started_utc: None,
+            completed_utc: Some(Utc::now()),
+            completed: 1,
+            failed: 0,
+            skipped: 0,
+            total: 1,
+            current_file: String::new(),
+            current_file_percent: 0,
+            lines: Vec::new(),
+            result: Some(serde_json::json!({
+                "files": [&file],
+                "rows": [MediaFileRow::from(&file)],
+                "skipped": ["/library/broken.mkv: unreadable"],
+                "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
+            })),
+            error: None,
+            revision: 3,
+        };
+        host.runtime
+            .inner
+            .dependencies
+            .jobs
+            .insert(&snapshot)
+            .await
+            .unwrap();
+
+        let job = host
+            .runtime
+            .get_scan_job(&snapshot.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.summary.total, 1);
+        assert_eq!(job.skipped, ["/library/broken.mkv: unreadable"]);
+        assert!(job.files.is_empty());
     }
 }

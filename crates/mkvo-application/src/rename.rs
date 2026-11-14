@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use mkvo_domain::{
     EpisodeMetadata, IdempotencyKey, MediaFile, MetadataProvider, OperationKind, OperationPlan,
     PlanConflict, PlanConflictKind, PlanContext, RenamePlan, RenamePlanItem, RenamePlanPayload,
-    RenameTokens, ResourceClaim,
+    RenameSidecar, RenameTokens, ResourceClaim, case_folded_path_key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,10 @@ pub struct RenamePlanRequest {
     /// Target parent directories known to exist, by portable path.
     #[serde(default)]
     pub existing_parents: BTreeSet<String>,
+    /// Source folders that could not be listed, by portable path: sidecars
+    /// in them are unknown.
+    #[serde(default)]
+    pub unlisted_folders: BTreeSet<String>,
     #[serde(default)]
     pub authorized_roots: Vec<PathBuf>,
     pub settings_fingerprint: String,
@@ -96,11 +100,25 @@ impl RenamePlanner {
         } else {
             request.template.trim().to_owned()
         };
-        let existing: BTreeSet<_> = request
-            .existing_paths
-            .iter()
-            .map(|path| portable_path_key(path))
-            .collect();
+        // Keyed with case folded: a share may ignore case whatever the host does.
+        let mut existing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in &request.existing_paths {
+            existing
+                .entry(case_folded_path_key(path))
+                .or_default()
+                .push(portable_path_key(path));
+        }
+        // Whether a file other than `source` already has the name `target`.
+        let taken = |target: &Path, source: &Path| {
+            request.check_existing_files
+                && existing
+                    .get(&case_folded_path_key(target))
+                    .is_some_and(|holders| {
+                        let source = portable_path_key(source);
+                        holders.iter().any(|holder| *holder != source)
+                    })
+        };
+        let mut sidecars = sidecars_by_video(&request.files, &request.existing_paths);
         let mut items = Vec::with_capacity(request.files.len());
         for file in &request.files {
             let new_file_name = build_file_name(file, &template);
@@ -122,22 +140,45 @@ impl RenamePlanner {
                     Some(target.clone()),
                 ));
             }
-            if portable_path_key(&file.path) == portable_path_key(&target) {
+            // Compared as written: a change of case alone is still a rename.
+            let unchanged = file.path == target;
+            if unchanged {
                 conflicts.push(PlanConflict::informational(
                     PlanConflictKind::NoChange,
                     "Source already has the requested name",
                     Some(target.clone()),
                 ));
             }
-            if request.check_existing_files
-                && existing.contains(&portable_path_key(&target))
-                && portable_path_key(&file.path) != portable_path_key(&target)
-            {
+            if taken(&target, &file.path) {
                 conflicts.push(PlanConflict::blocking(
                     PlanConflictKind::ExistingTarget,
                     "Target file already exists",
                     Some(target.clone()),
                 ));
+            }
+            let new_stem = new_file_name
+                .strip_suffix(&extension_only)
+                .unwrap_or(&new_file_name);
+            let sidecars: Vec<_> = sidecars
+                .remove(&portable_path_key(&file.path))
+                .filter(|_| !unchanged)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(source, suffix)| RenameSidecar {
+                    target: target.with_file_name(format!("{new_stem}{suffix}")),
+                    source,
+                })
+                // One that already has its new name stays where it is.
+                .filter(|sidecar| sidecar.source != sidecar.target)
+                .collect();
+            for sidecar in &sidecars {
+                if taken(&sidecar.target, &sidecar.source) {
+                    conflicts.push(PlanConflict::blocking(
+                        PlanConflictKind::ExistingTarget,
+                        "A file with the new name of a subtitle, metadata or artwork file already exists",
+                        Some(sidecar.target.clone()),
+                    ));
+                }
             }
             if !request.authorized_roots.is_empty()
                 && !request
@@ -177,25 +218,43 @@ impl RenamePlanner {
                 source_fingerprint: file.fingerprint.clone(),
                 new_file_name,
                 conflicts,
+                sidecars,
             });
         }
 
-        let mut targets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut targets: BTreeMap<String, Vec<(usize, PathBuf)>> = BTreeMap::new();
         for (index, item) in items.iter().enumerate() {
-            if portable_path_key(&item.source) != portable_path_key(&item.target) {
-                targets
-                    .entry(portable_path_key(&item.target))
-                    .or_default()
-                    .push(index);
+            if item.source != item.target {
+                let moved = item.sidecars.iter().map(|sidecar| &sidecar.target);
+                for target in std::iter::once(&item.target).chain(moved) {
+                    targets
+                        .entry(case_folded_path_key(target))
+                        .or_default()
+                        .push((index, target.clone()));
+                }
             }
         }
-        for duplicate_indices in targets.values().filter(|indices| indices.len() > 1) {
-            for &index in duplicate_indices {
-                let target = items[index].target.clone();
+        for duplicates in targets.into_values().filter(|moves| moves.len() > 1) {
+            for (index, target) in duplicates {
                 items[index].conflicts.push(PlanConflict::blocking(
                     PlanConflictKind::DuplicateTarget,
                     "Multiple files render to the same target",
                     Some(target),
+                ));
+            }
+        }
+        // Added last: a row shows its first conflict, and a blocking one says more.
+        for item in items.iter_mut().filter(|item| item.source != item.target) {
+            let unlisted = item.source.parent().is_some_and(|folder| {
+                request
+                    .unlisted_folders
+                    .contains(&portable_path_key(folder))
+            });
+            if unlisted {
+                item.conflicts.push(PlanConflict::informational(
+                    PlanConflictKind::Other,
+                    "Ready, but the folder could not be read: subtitles, metadata and artwork keep their old names",
+                    Some(item.source.clone()),
                 ));
             }
         }
@@ -217,11 +276,13 @@ impl RenamePlanner {
                 .items
                 .iter()
                 .flat_map(|item| {
-                    [
-                        ResourceClaim::write(item.source.clone()),
-                        ResourceClaim::write(item.target.clone()),
-                    ]
+                    let moved = item
+                        .sidecars
+                        .iter()
+                        .flat_map(|sidecar| [&sidecar.source, &sidecar.target]);
+                    [&item.source, &item.target].into_iter().chain(moved)
                 })
+                .map(|path| ResourceClaim::write(path.clone()))
                 .collect(),
             attributes: BTreeMap::new(),
         };
@@ -238,6 +299,76 @@ impl RenamePlanner {
         )
         .map_err(|error| ApplicationError::Internal(error.to_string()))
     }
+}
+
+/// Extensions of the files that are renamed together with a video.
+const SIDECAR_EXTENSIONS: [&str; 14] = [
+    "ass", "idx", "jpeg", "jpg", "nfo", "png", "smi", "srt", "ssa", "sub", "sup", "tbn", "vtt",
+    "webp",
+];
+const SIDECAR_IMAGE_EXTENSIONS: [&str; 5] = ["jpeg", "jpg", "png", "tbn", "webp"];
+
+fn lowercase_extension(path: &Path) -> String {
+    path.extension()
+        .map_or_else(String::new, |value| value.to_string_lossy().to_lowercase())
+}
+
+/// What follows `stem` in `sidecar`'s name when it is named after it:
+/// `.en.srt` or `.nfo`, and for artwork also `-thumb.jpg`.
+fn sidecar_suffix(stem: &str, sidecar: &Path) -> Option<String> {
+    let name = sidecar.file_name()?.to_string_lossy();
+    let suffix = name.get(stem.len()..)?;
+    let named_after = name[..stem.len()].eq_ignore_ascii_case(stem)
+        && (suffix.starts_with('.')
+            || suffix.starts_with('-')
+                && SIDECAR_IMAGE_EXTENSIONS.contains(&lowercase_extension(sidecar).as_str()));
+    named_after.then(|| suffix.to_owned())
+}
+
+/// The sidecars next to each file, by the file's path key, each with the part
+/// of its name to keep. A sidecar goes with the longest stem it starts with,
+/// so `Show - 01.5.srt` stays with `Show - 01.5.mkv`.
+fn sidecars_by_video(
+    files: &[MediaFile],
+    existing: &BTreeSet<PathBuf>,
+) -> BTreeMap<String, Vec<(PathBuf, String)>> {
+    let mut folders: BTreeMap<String, (BTreeMap<String, &Path>, Vec<&Path>)> = BTreeMap::new();
+    let paths = files.iter().map(|file| &file.path).chain(existing);
+    for path in paths {
+        let Some((parent, stem)) = path.parent().zip(path.file_stem()) else {
+            continue;
+        };
+        let (videos, sidecars) = folders.entry(portable_path_key(parent)).or_default();
+        if SIDECAR_EXTENSIONS.contains(&lowercase_extension(path).as_str()) {
+            sidecars.push(path);
+        } else {
+            // The files being renamed come first and keep a stem they share with another file.
+            videos
+                .entry(stem.to_string_lossy().into_owned())
+                .or_insert(path);
+        }
+    }
+    let mut owned: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
+    for (videos, sidecars) in folders.into_values() {
+        for sidecar in sidecars {
+            let owner = videos
+                .iter()
+                .filter_map(|(stem, video)| {
+                    let suffix = sidecar_suffix(stem, sidecar)?;
+                    // Between `Ep.mkv` and `ep.mkv` it is the one spelled like the sidecar.
+                    let same_case = sidecar.file_name()?.to_string_lossy().starts_with(stem);
+                    Some(((stem.len(), same_case), video, suffix))
+                })
+                .max_by_key(|(rank, ..)| *rank);
+            if let Some((_, video, suffix)) = owner {
+                owned
+                    .entry(portable_path_key(video))
+                    .or_default()
+                    .push((sidecar.to_path_buf(), suffix));
+            }
+        }
+    }
+    owned
 }
 
 #[must_use]
@@ -260,21 +391,25 @@ pub fn rename_tokens(file: &MediaFile) -> RenameTokens {
     ]);
     let season = episode.and_then(|value| value.season);
     let episode_number = episode.and_then(|value| value.episode);
+    // Only what the provider says; a number made up from season and episode is not an absolute one.
     let absolute = episode
         .and_then(|value| value.absolute_episode)
-        .or_else(|| {
-            season.zip(episode_number).map(|(season, episode)| {
-                (season.max(1).saturating_sub(1))
-                    .saturating_mul(1_000)
-                    .saturating_add(episode)
-            })
-        });
+        .filter(|number| *number > 0);
+    // The range a name like `S01E01E02` states, when the file was matched to its first episode.
+    let last_episode = crate::library::parse_episode(&file.file_name())
+        .filter(|parsed| {
+            parsed.last_episode > parsed.episode
+                && parsed.season == season
+                && Some(parsed.episode) == episode_number
+        })
+        .map(|parsed| parsed.last_episode);
     RenameTokens {
         title: series.clone(),
         series,
         year: episode.and_then(|value| value.year),
         season,
         episode: episode_number,
+        last_episode,
         absolute,
         episode_title,
     }
@@ -321,14 +456,18 @@ pub fn build_file_name(file: &MediaFile, template: &str) -> String {
     }
 
     let mut rendered = active.to_owned();
+    // First, while what stands before each one is still the template's own text.
+    for (token, width) in [("{episode:00}", 2), ("{episode}", 0)] {
+        rendered = replace_ascii_case_insensitive(&rendered, token, |before| {
+            format_episodes(before, tokens.episode, tokens.last_episode, width)
+        });
+    }
     for (token, value) in [
         ("{episodeTitle}", tokens.episode_title),
         ("{absolute:000}", format_optional(tokens.absolute, 3)),
         ("{season:00}", format_optional(tokens.season, 2)),
-        ("{episode:00}", format_optional(tokens.episode, 2)),
         ("{absolute}", format_optional(tokens.absolute, 0)),
         ("{season}", format_optional(tokens.season, 0)),
-        ("{episode}", format_optional(tokens.episode, 0)),
         ("{series}", tokens.series),
         ("{title}", tokens.title),
         (
@@ -338,7 +477,7 @@ pub fn build_file_name(file: &MediaFile, template: &str) -> String {
                 .map_or_else(String::new, |value| value.to_string()),
         ),
     ] {
-        rendered = replace_ascii_case_insensitive(&rendered, token, &value);
+        rendered = replace_ascii_case_insensitive(&rendered, token, |_| value.clone());
     }
     let stem = sanitize_file_name(&rendered);
     let extension = file.extension();
@@ -380,31 +519,6 @@ pub fn sanitize_file_name(value: &str) -> String {
         clean.insert(0, '_');
     }
     clean
-}
-
-/// Apply the legacy planner sanitizer used for metadata-provided file names.
-///
-/// The filename builder intentionally substitutes portable-invalid characters
-/// with hyphens, while the planner historically used spaces before collapsing
-/// whitespace. Both behaviors are user-visible and are therefore kept as
-/// separate operations.
-#[must_use]
-pub fn sanitize_planner_file_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() || "\\/:*?\"<>|".contains(character) {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_end_matches(['.', ' '])
-        .to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -497,7 +611,12 @@ fn ordered_regular_episodes(provider_episodes: &[EpisodeMetadata]) -> Vec<&Episo
     ordered
 }
 
-fn replace_ascii_case_insensitive(source: &str, token: &str, replacement: &str) -> String {
+/// Replace every `token` with what `replacement` returns for the text before it.
+fn replace_ascii_case_insensitive(
+    source: &str,
+    token: &str,
+    replacement: impl Fn(&str) -> String,
+) -> String {
     let mut result = String::with_capacity(source.len());
     let mut remaining = source;
     let token_lower = token.to_ascii_lowercase();
@@ -508,7 +627,8 @@ fn replace_ascii_case_insensitive(source: &str, token: &str, replacement: &str) 
             break;
         };
         result.push_str(&remaining[..index]);
-        result.push_str(replacement);
+        let replaced = replacement(&result);
+        result.push_str(&replaced);
         remaining = &remaining[index + token.len()..];
     }
     result
@@ -522,6 +642,22 @@ fn format_optional(value: Option<u32>, width: usize) -> String {
             format!("{number:0width$}")
         }
     })
+}
+
+/// `01`, or for a file that holds several episodes `01-02`; after a marker,
+/// as in `S01E`, the second number repeats it: `01-E02`.
+fn format_episodes(before: &str, first: Option<u32>, last: Option<u32>, width: usize) -> String {
+    let first = format_optional(first, width);
+    if last.is_none() {
+        return first;
+    }
+    let mut written = before.chars().rev();
+    let marker = written
+        .next()
+        .filter(|letter| matches!(letter, 'E' | 'e'))
+        .filter(|_| !written.next().is_some_and(char::is_alphabetic))
+        .map_or_else(String::new, String::from);
+    format!("{first}-{marker}{}", format_optional(last, width))
 }
 
 fn first_non_blank<const N: usize>(values: [Option<&str>; N]) -> String {
@@ -614,11 +750,15 @@ mod tests {
 
         assert_eq!(matched.len(), 74);
         assert_eq!(
-            matched.first().map(|item| (item.episode.season, item.episode.episode)),
+            matched
+                .first()
+                .map(|item| (item.episode.season, item.episode.episode)),
             Some((1, 1))
         );
         assert_eq!(
-            matched.last().map(|item| (item.episode.season, item.episode.episode)),
+            matched
+                .last()
+                .map(|item| (item.episode.season, item.episode.episode)),
             Some((5, 15))
         );
     }
@@ -719,6 +859,51 @@ mod tests {
         );
     }
 
+    /// S02E05 used to be given the absolute number 1005.
+    #[test]
+    fn the_absolute_number_is_the_providers_or_nothing() {
+        let mut file = media("old.mkv", 5);
+        let episode = file.episode.as_mut().expect("episode");
+        episode.season = Some(2);
+        assert_eq!(rename_tokens(&file).absolute, None);
+        assert_eq!(
+            build_file_name(&file, "{absolute:000} - {episodeTitle}"),
+            "- Pilot - Part 1.mkv"
+        );
+
+        file.episode.as_mut().expect("episode").absolute_episode = Some(17);
+        assert_eq!(build_file_name(&file, "{absolute:000}"), "017.mkv");
+        // TVDB answers 0 for a series it has no absolute order for.
+        file.episode.as_mut().expect("episode").absolute_episode = Some(0);
+        assert_eq!(rename_tokens(&file).absolute, None);
+    }
+
+    /// `Show S01E01E02.mkv` used to come out as `S01E01`, its second episode gone.
+    #[test]
+    fn a_file_that_holds_two_episodes_keeps_both_numbers() {
+        let mut file = media("Show S01E01E02.mkv", 1);
+        assert_eq!(
+            build_file_name(&file, "S{season:00}E{episode:00} - {episodeTitle}"),
+            "S01E01-E02 - Pilot - Part 1.mkv"
+        );
+        // The second number repeats the marker only where the template has one.
+        for (template, expected) in [
+            ("s{season:00}e{episode:00}", "s01e01-e02.mkv"),
+            ("{season}x{episode}", "1x1-2.mkv"),
+            ("{series} - {episode:00}", "Show - Name - 01-02.mkv"),
+            ("Episode{episode}", "Episode1-2.mkv"),
+        ] {
+            assert_eq!(build_file_name(&file, template), expected);
+        }
+
+        // Matched to an episode other than the one it names: its range says nothing.
+        file.episode.as_mut().expect("episode").episode = Some(5);
+        assert_eq!(
+            build_file_name(&file, "S{season:00}E{episode:00}"),
+            "S01E05.mkv"
+        );
+    }
+
     #[test]
     fn reserved_windows_name_is_portable() {
         assert_eq!(sanitize_file_name("CON"), "_CON");
@@ -729,6 +914,7 @@ mod tests {
         let request = RenamePlanRequest {
             source_access: BTreeMap::new(),
             existing_parents: BTreeSet::new(),
+            unlisted_folders: BTreeSet::new(),
             files: vec![media("a.mkv", 1), media("b.mkv", 1)],
             template: DEFAULT_SERIES_TEMPLATE.to_owned(),
             provider: None,
@@ -782,7 +968,9 @@ mod tests {
                     .as_u64()
                     .or_else(|| input["episode"].as_u64())
                     .and_then(|value| u32::try_from(value).ok()),
-                absolute_episode: None,
+                absolute_episode: episode["absoluteNumber"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok()),
                 episode_title: Some(episode_title.to_owned()),
                 year: input["year"]
                     .as_u64()
@@ -830,27 +1018,19 @@ mod tests {
         let planning_cases = fixture["planningCases"].as_array().expect("planning cases");
         assert_eq!(
             builder_cases.len() + matching_cases.len() + planning_cases.len(),
-            10,
+            9,
             "fixture case count changed"
         );
 
         for case in builder_cases {
             let id = case["id"].as_str().expect("case id");
             let expected = case["expected"].as_str().expect("string result");
-            if case["operation"] == "RenamePlanner.SanitizeFileName" {
-                assert_eq!(
-                    sanitize_planner_file_name(case["input"].as_str().expect("input")),
-                    expected,
-                    "fixture case `{id}`"
-                );
-            } else {
-                let file = fixture_media(&case["input"]);
-                assert_eq!(
-                    build_file_name(&file, case["input"]["template"].as_str().expect("template")),
-                    expected,
-                    "fixture case `{id}`"
-                );
-            }
+            let file = fixture_media(&case["input"]);
+            assert_eq!(
+                build_file_name(&file, case["input"]["template"].as_str().expect("template")),
+                expected,
+                "fixture case `{id}`"
+            );
         }
 
         for case in matching_cases {
@@ -922,6 +1102,7 @@ mod tests {
             let request = RenamePlanRequest {
                 source_access: BTreeMap::new(),
                 existing_parents: BTreeSet::new(),
+                unlisted_folders: BTreeSet::new(),
                 files: input["files"]
                     .as_array()
                     .expect("files")
@@ -1025,6 +1206,7 @@ mod access_conflict_tests {
             existing_paths: BTreeSet::new(),
             source_access: BTreeMap::new(),
             existing_parents: BTreeSet::new(),
+            unlisted_folders: BTreeSet::new(),
             authorized_roots: Vec::new(),
             settings_fingerprint: "settings".to_owned(),
             expires_in_seconds: 60,
@@ -1113,5 +1295,262 @@ mod access_conflict_tests {
 
         let plan = RenamePlanner.build_plan(plan_request).expect("plan");
         assert!(conflict_kinds(&plan).contains(&PlanConflictKind::Busy));
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use mkvo_domain::{ContainerMetadata, EpisodeIdentity, FileFingerprint, RenameSidecar};
+
+    /// A file that the `{episodeTitle}` template names `title`.
+    fn media(path: &str, title: &str) -> MediaFile {
+        MediaFile {
+            path: PathBuf::from(path),
+            original_file_name: None,
+            watch_root: None,
+            relative_path: None,
+            fingerprint: FileFingerprint {
+                path: PathBuf::from(path),
+                size_bytes: 1,
+                modified_at: Utc::now(),
+                quick_hash: None,
+            },
+            container: ContainerMetadata::default(),
+            tracks: Vec::new(),
+            attachments: Vec::new(),
+            episode: Some(EpisodeIdentity {
+                series_title: None,
+                season: None,
+                episode: None,
+                absolute_episode: None,
+                episode_title: Some(title.to_owned()),
+                year: None,
+                is_movie: false,
+            }),
+            provider_match: None,
+            status: mkvo_domain::MediaStatus::Ready,
+        }
+    }
+
+    fn request(files: Vec<MediaFile>, existing: &[&str]) -> RenamePlanRequest {
+        RenamePlanRequest {
+            existing_paths: files
+                .iter()
+                .map(|file| file.path.clone())
+                .chain(existing.iter().map(PathBuf::from))
+                .collect(),
+            files,
+            template: "{episodeTitle}".to_owned(),
+            provider: None,
+            check_existing_files: true,
+            source_access: BTreeMap::new(),
+            existing_parents: BTreeSet::new(),
+            unlisted_folders: BTreeSet::new(),
+            authorized_roots: Vec::new(),
+            settings_fingerprint: "settings".to_owned(),
+            expires_in_seconds: 60,
+            idempotency_key: IdempotencyKey::generate(),
+        }
+    }
+
+    fn plan(files: Vec<MediaFile>, existing: &[&str]) -> RenamePlan {
+        RenamePlanner
+            .build_plan(request(files, existing))
+            .expect("plan")
+    }
+
+    fn kinds(item: &RenamePlanItem) -> Vec<PlanConflictKind> {
+        item.conflicts
+            .iter()
+            .map(|conflict| conflict.kind)
+            .collect()
+    }
+
+    /// `ep.mkv` to `Ep.mkv` was reported as "no change" and then failed on
+    /// Windows because the target "existed".
+    #[test]
+    fn a_rename_that_only_changes_case_is_a_change() {
+        let plan = plan(vec![media("/media/ep.mkv", "Ep")], &[]);
+        let item = &plan.payload.items[0];
+        assert_eq!(item.target, PathBuf::from("/media").join("Ep.mkv"));
+        assert_eq!(kinds(item), []);
+        assert!(item.can_apply());
+    }
+
+    #[test]
+    fn a_name_that_does_not_change_is_still_no_change() {
+        let plan = plan(vec![media("/media/Ep.mkv", "Ep")], &[]);
+        assert_eq!(kinds(&plan.payload.items[0]), [PlanConflictKind::NoChange]);
+        assert_eq!(plan.payload.rename_count(), 0);
+    }
+
+    /// A share can ignore case whatever the host does, so two targets one
+    /// letter case apart would run into each other half-way through a batch.
+    #[test]
+    fn targets_that_differ_only_by_case_collide() {
+        let plan = plan(
+            vec![
+                media("/media/a.mkv", "Pilot"),
+                media("/media/b.mkv", "pilot"),
+            ],
+            &[],
+        );
+        for item in &plan.payload.items {
+            assert_eq!(kinds(item), [PlanConflictKind::DuplicateTarget]);
+        }
+        assert_eq!(plan.payload.rename_count(), 0);
+    }
+
+    #[test]
+    fn a_target_taken_under_another_case_blocks_the_rename() {
+        let plan = plan(vec![media("/media/a.mkv", "Pilot")], &["/media/PILOT.mkv"]);
+        assert_eq!(
+            kinds(&plan.payload.items[0]),
+            [PlanConflictKind::ExistingTarget]
+        );
+    }
+
+    /// The file that only changes case was left out of the duplicate check.
+    #[test]
+    fn a_case_only_rename_still_collides_with_another_file() {
+        let plan = plan(
+            vec![
+                media("/media/pilot.mkv", "Pilot"),
+                media("/media/b.mkv", "Pilot"),
+            ],
+            &[],
+        );
+        assert!(plan.payload.items.iter().all(|item| !item.can_apply()));
+    }
+
+    #[test]
+    fn subtitles_metadata_and_artwork_follow_their_video() {
+        let plan = plan(
+            vec![media("/media/Show - 01.mkv", "Pilot")],
+            &[
+                "/media/Show - 01.srt",
+                "/media/show - 01.en.forced.ass",
+                "/media/Show - 01.nfo",
+                "/media/Show - 01-thumb.jpg",
+                // Other episodes, and files that only look related.
+                "/media/Show - 010.srt",
+                "/media/Show - 01.5.mkv",
+                "/media/Show - 01.5.srt",
+                "/media/Show - 01-extra.srt",
+                "/media/Show - 01.txt",
+                "/media/Show - 02.srt",
+                "/other/Show - 01.srt",
+            ],
+        );
+        let item = &plan.payload.items[0];
+        let moved = |source: &str, target: &str| RenameSidecar {
+            source: PathBuf::from(source),
+            target: PathBuf::from("/media").join(target),
+        };
+        assert_eq!(kinds(item), []);
+        assert_eq!(
+            item.sidecars,
+            [
+                moved("/media/Show - 01-thumb.jpg", "Pilot-thumb.jpg"),
+                moved("/media/Show - 01.nfo", "Pilot.nfo"),
+                moved("/media/Show - 01.srt", "Pilot.srt"),
+                moved("/media/show - 01.en.forced.ass", "Pilot.en.forced.ass"),
+            ]
+        );
+        for sidecar in &item.sidecars {
+            for path in [&sidecar.source, &sidecar.target] {
+                assert!(
+                    plan.context
+                        .resources
+                        .contains(&ResourceClaim::write(path.clone()))
+                );
+            }
+        }
+    }
+
+    /// A folder that cannot be listed used to mean, silently, no sidecars.
+    #[test]
+    fn a_folder_that_could_not_be_listed_is_said_on_its_files() {
+        let mut request = request(vec![media("/media/a.mkv", "Pilot")], &[]);
+        request.unlisted_folders.insert("/media".to_owned());
+        let plan = RenamePlanner.build_plan(request).expect("plan");
+        let item = &plan.payload.items[0];
+        assert_eq!(kinds(item), [PlanConflictKind::Other]);
+        assert!(item.can_apply());
+        assert!(!plan.payload.has_blocking_issues());
+    }
+
+    #[test]
+    fn a_file_that_keeps_its_name_moves_no_sidecars() {
+        let plan = plan(
+            vec![media("/media/Pilot.mkv", "Pilot")],
+            &["/media/Pilot.srt"],
+        );
+        assert_eq!(plan.payload.items[0].sidecars, []);
+    }
+
+    /// `ep.mkv` becoming `Ep.mkv` next to an `Ep.srt` planned a move of the
+    /// subtitle onto itself.
+    #[test]
+    fn a_sidecar_that_already_has_its_new_name_is_left_out() {
+        let plan = plan(
+            vec![media("/media/ep.mkv", "Ep")],
+            &["/media/Ep.srt", "/media/ep.nfo"],
+        );
+        let item = &plan.payload.items[0];
+        assert_eq!(kinds(item), []);
+        assert_eq!(
+            item.sidecars,
+            [RenameSidecar {
+                source: PathBuf::from("/media/ep.nfo"),
+                target: PathBuf::from("/media").join("Ep.nfo"),
+            }]
+        );
+    }
+
+    /// Only where case tells files apart can `Ep.mkv` and `ep.mkv` both exist.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn a_sidecar_goes_with_the_video_whose_case_it_shares() {
+        let plan = plan(
+            vec![
+                media("/media/Ep.mkv", "First"),
+                media("/media/ep.mkv", "Second"),
+            ],
+            &["/media/Ep.srt", "/media/ep.srt"],
+        );
+        let moved: Vec<_> = plan
+            .payload
+            .items
+            .iter()
+            .map(|item| item.sidecars.clone())
+            .collect();
+        let sidecar = |source: &str, target: &str| RenameSidecar {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+        };
+        assert_eq!(
+            moved,
+            [
+                [sidecar("/media/Ep.srt", "/media/First.srt")],
+                [sidecar("/media/ep.srt", "/media/Second.srt")],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sidecar_whose_new_name_is_taken_blocks_the_rename() {
+        let plan = plan(
+            vec![media("/media/a.mkv", "Pilot")],
+            &["/media/a.srt", "/media/Pilot.srt"],
+        );
+        let item = &plan.payload.items[0];
+        assert_eq!(kinds(item), [PlanConflictKind::ExistingTarget]);
+        assert_eq!(
+            item.conflicts[0].path,
+            Some(PathBuf::from("/media").join("Pilot.srt"))
+        );
+        assert!(!item.can_apply());
     }
 }

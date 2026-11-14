@@ -1,6 +1,7 @@
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemResponse,
   LibraryArtworkRequest,
   LibraryArtworkResponse,
@@ -18,6 +19,7 @@ import type {
   PropEditPreviewRequest,
   PropEditPreviewResponse,
   PropEditTemplateResponse,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchUndoPreviewResponse,
@@ -28,6 +30,7 @@ import type {
   RenameSearchResult,
   ScanJobResponse,
   ScanRequest,
+  WatchHealth,
   WebSettings,
   WebSettingsRequest
 } from "../api";
@@ -125,7 +128,8 @@ export interface ScanClient {
   cancelScan(id: string): Promise<ScanJobResponse>;
   getCurrentScanFiles(): Promise<CurrentScanResponse>;
   clearCurrentScanFiles(): Promise<CurrentScanResponse>;
-  setFileSelection(paths: string[]): Promise<CurrentScanResponse>;
+  /** `replaceWorkingSet` makes `paths` the whole working set, all selected. */
+  setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse>;
   /**
    * Authorize a folder found by browsing so it can be scanned.
    *
@@ -159,6 +163,13 @@ export interface OperationJobsClient {
   cancelOperationJob(id: string): Promise<OperationJobResponse>;
 }
 
+/** What the Dashboard polls: both answers are small and carry no file lists. */
+export interface ActivityClient {
+  /** Jobs of every kind, newest first, without their results or logs. */
+  listRecentJobs(limit?: number): Promise<RecentJobsResponse>;
+  getWatchHealth(): Promise<WatchHealth>;
+}
+
 export interface RemuxClient {
   buildMuxPreview(request: MuxPreviewRequest): Promise<MuxPreviewResponse>;
   startMuxApply(request: MuxPreviewRequest): Promise<OperationJobResponse>;
@@ -174,6 +185,8 @@ export interface LibraryClient {
   buildLibraryAudit(files: MediaFileRow[]): Promise<LibraryAuditResponse>;
   getLibraryCatalog(request: LibraryCatalogRequest): Promise<LibraryCatalogResponse>;
   getLibraryArtwork(request: LibraryArtworkRequest): Promise<LibraryArtworkResponse>;
+  /** An image URL for the poster, or undefined when the transport cannot serve one. */
+  libraryArtworkUrl(request: LibraryArtworkRequest, version: number): string | undefined;
   getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse>;
 }
 
@@ -202,6 +215,7 @@ export interface BackendClient
     SettingsClient,
     RenameClient,
     OperationJobsClient,
+    ActivityClient,
     RemuxClient,
     PropertyEditClient,
     LibraryClient,

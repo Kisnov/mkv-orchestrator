@@ -1,813 +1,392 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DashboardPage } from "./DashboardPage";
-import { MediaLibraryProvider } from "../state/MediaLibraryContext";
+import App from "../App";
+import type { BackendClient } from "../backend/client";
+import { ApiError } from "../backend/error";
+import { createMockBackendClient } from "../backend/mockClient";
+import { setBackendClient } from "../backend/runtime";
+import type { MediaFileRow, OperationJobResponse, RecentJob, WebSettings } from "../generated/contracts";
+import { MediaLibraryProvider, MediaLibrarySynchronizer } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow, WebSettings } from "../generated/contracts";
+import { DashboardPage } from "./DashboardPage";
 
-function mediaFile(name: string, audioSummary = "eng x1"): MediaFileRow {
+const tool = (name: string, patch = {}) => ({ name, command: name, resolvedPath: `/usr/bin/${name}`, available: true, version: `${name} v102.0 ('Little Houses') 64-bit`, ...patch });
+const status = { name: "MKVO", version: "test", mediaRoot: "/media", configRoot: "/config", sourceRoots: [], tools: [tool("mkvmerge"), tool("mkvpropedit")], contractVersion: 1 };
+const settings = { enableLiveWatchFolderMonitoring: false, watchFolders: [], mediaServers: [] } as unknown as WebSettings;
+const watchOff = { running: false, backend: "native" as const, watchedRoots: 0 };
+const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+function recentJob(id: string, patch: Partial<RecentJob> = {}): RecentJob {
+  return { id, kind: "remux", status: "Completed", createdUtc: minutesAgo(6), startedUtc: minutesAgo(6), completedUtc: minutesAgo(5), completed: 4, failed: 0, skipped: 0, total: 4, currentFile: "", currentFilePercent: 0, summary: "Mux/remux operation completed", ...patch };
+}
+
+function mediaFile(name: string, patch: Partial<MediaFileRow> = {}): MediaFileRow {
   return {
-    path: `/media/Show/${name}`,
-    fileName: name,
-    extension: ".mkv",
-    status: "Scanned",
-    reader: "mkvmerge",
-    codec: "HEVC/H.265",
-    resolution: "1920x1080",
-    bitDepth: "10",
-    hdr: "None",
-    videoSummary: "HEVC/H.265",
-    audioSummary,
-    subtitleSummary: "eng x1",
-    attachmentSummary: "None",
-    tracks: [],
-    attachments: []
+    path: `/media/Show/${name}`, fileName: name, extension: ".mkv", status: "Scanned", reader: "mkvmerge", codec: "HEVC/H.265", resolution: "1920x1080", bitDepth: "10", hdr: "None",
+    videoSummary: "", audioSummary: "jpn x1", subtitleSummary: "eng x1", attachmentSummary: "None", attachments: [],
+    tracks: [{ id: 1, trackNumber: 2, type: "audio", codec: "AAC", language: "jpn", name: "", channels: 2, default: true, forced: false }],
+    ...patch
   };
 }
 
-function settings(overrides: Partial<WebSettings> = {}): WebSettings {
+function backend(overrides: Partial<BackendClient> = {}): Partial<BackendClient> {
   return {
-    hasTvdbApiKey: false,
-    hasTvdbPin: false,
-    hasTmdbApiKey: false,
-    hasAnidbClient: false,
-    tvdbLanguage: "eng",
-    renameLookupProvider: "TVDB",
-    renameTemplate: "{series}",
-    renameTemplates: [],
-    audioNamePresets: [],
-    subtitleNamePresets: [],
-    languagePresets: [],
-    mkvMergeDefaultAudioLanguages: "eng",
-    mkvMergeDefaultSubtitleLanguages: "eng",
-    mkvToolNixDirectory: null,
-    ffmpegDirectory: null,
-    defaultRoot: null,
-    defaultRootName: "Home",
-    libraryRoots: [],
-    ignoredScanFolderNames: [],
-    useQuickHashOnUnreliableTimestamps: false,
-    renamePreviewCompactView: false,
-    maxScanWorkers: 4,
-    maxEditWorkers: 2,
-    maxRemuxWorkers: 1,
-    watchFolders: [],
-    enableLiveWatchFolderMonitoring: false,
-    watchDebounceMillis: 750,
-    watchReconciliationIntervalMinutes: 30,
-    watchForcePolling: false,
-    selectedThemeName: "Dark",
-    customThemes: [],
-    mediaServers: [],
-    mediaServerPathMappings: [],
-    subtitleFonts: [],
+    getStatus: () => Promise.resolve(status),
+    getWebSettings: () => Promise.resolve(settings),
+    listRecentJobs: () => Promise.resolve({ jobs: [] }),
+    getWatchHealth: () => Promise.resolve(watchOff),
+    getRenameBatches: () => Promise.resolve({ batches: [] }),
+    getCurrentScanFiles: () => Promise.resolve({ updatedUtc: null, files: [], selectedPaths: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 } }),
     ...overrides
   };
 }
 
-const emptyStatus = {
-  name: "MKV Orchestrator",
-  version: "0.1.0",
-  mediaRoot: "/media",
-  configRoot: "/config",
-  sourceRoots: [],
-  tools: [],
-  contractVersion: 1
-};
-
-const emptyScan = { updatedUtc: null, files: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 }, selectedPaths: [] };
-
-// The library context persists the working set and the template choice, so
-// without this one test's files leak into the next -- and the dashboard only
-// adopts a fresh scan when it is holding none, so the leak wins.
-beforeEach(() => {
-  window.localStorage.clear();
-  window.sessionStorage.clear();
-});
-
-function renderDashboard(overrides: Parameters<typeof renderWithBackend>[1]) {
-  return renderWithBackend(
-    <MediaLibraryProvider>
-      <DashboardPage />
-    </MediaLibraryProvider>,
-    overrides
-  );
+function renderDashboard(overrides: Partial<BackendClient> = {}) {
+  return renderWithBackend(<MediaLibraryProvider><MediaLibrarySynchronizer /><DashboardPage /></MediaLibraryProvider>, backend(overrides));
 }
 
-describe("Dashboard empty state", () => {
-  /// The desktop browses the whole machine. Telling it to mount a volume is
-  /// instructions for a container the user is not running.
-  it("tells a desktop user to browse rather than to mount a volume", async () => {
-    renderDashboard({
-      transport: "tauri",
-      getStatus: () => Promise.resolve({ ...emptyStatus, mediaRoot: "C:\\media" }),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings())
-    });
+beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+});
 
-    expect(await screen.findByText(/browse for a folder or file/i)).toBeInTheDocument();
-    expect(screen.queryByText(/mount media to/i)).not.toBeInTheDocument();
-  });
+describe("Dashboard on a fresh install", () => {
+  it("says nothing needs attention and points at Scan", async () => {
+    renderDashboard();
 
-  /// The served build really is reached through a bind mount, so the original
-  /// guidance is still the right guidance there.
-  it("keeps the mount guidance when served over HTTP", async () => {
-    renderDashboard({
-      transport: "http",
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings())
-    });
-
-    expect(await screen.findByText(/mount media to \/media/i)).toBeInTheDocument();
+    expect(await screen.findByText("Nothing needs your attention.")).toBeInTheDocument();
+    expect(screen.getByText("No jobs yet")).toBeInTheDocument();
+    expect(screen.getByText("No files scanned yet")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Scan a folder" })).toHaveAttribute("href", "/dashboard/scan");
+    // Tool versions read as numbers, with the full banner one hover away.
+    const system = within(screen.getByRole("region", { name: "System" }));
+    expect(await system.findByText("mkvmerge")).toBeInTheDocument();
+    expect(system.getAllByText("102.0")).toHaveLength(2);
+    expect(system.getByText("Off")).toBeInTheDocument();
+    expect(system.getByText("None configured")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Recent renames" })).not.toBeInTheDocument();
   });
 });
 
-describe("Dashboard scan source labels", () => {
-  it("shows only the selected folder name while retaining the full path as its tooltip", async () => {
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/downloads/complete/Superstore"]));
-
+describe("Dashboard activity", () => {
+  it("lists running jobs first with progress, under the name of the page that started them", async () => {
+    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "reorder", label: "Reorder Tracks" }, { id: "extract", label: "MKV Operations" }]));
     renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings())
+      getOperationJob: () => new Promise(() => undefined),
+      listRecentJobs: () => Promise.resolve({ jobs: [
+        recentJob("old"),
+        recentJob("extract", { kind: "extract_subtitles" }),
+        recentJob("reorder", { status: "Running", completedUtc: null, completed: 1, total: 4, currentFile: "/media/Show/02.mkv", currentFilePercent: 50 }),
+        recentJob("scan", { kind: "scan", status: "Running", completedUtc: null, completed: 12, total: 128, currentFile: "/media/Show/13.mkv" })
+      ] })
     });
 
-    const label = await screen.findByText("Superstore");
-    expect(label).toHaveAttribute("title", "/media/downloads/complete/Superstore");
-    expect(screen.queryByText("/media/downloads/complete/Superstore")).not.toBeInTheDocument();
+    const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
+    // A remux takes its page's name; a kind that names itself keeps it.
+    expect(rows.map((row) => row.querySelector(".font-semibold")?.textContent)).toEqual(["Reorder Tracks", "Scan", "Remux", "Extract Subtitles"]);
+    expect(within(rows[0]).getByText("1 of 4 files")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("02.mkv 50%")).toBeInTheDocument();
+    expect(within(rows[0]).getByRole("progressbar", { name: "Reorder Tracks progress" })).toHaveAttribute("aria-valuenow", "38");
+    expect(within(rows[1]).getByText("13.mkv")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("4 done")).toBeInTheDocument();
+    expect(screen.getByText("2 running")).toBeInTheDocument();
   });
 
-  it("shows only file names when several files are selected", async () => {
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify([
-      String.raw`C:\media\Show\Episode 01.mkv`,
-      String.raw`C:\media\Show\Episode 02.mkv`
-    ]));
-
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings())
-    });
-
-    expect(await screen.findByText("Episode 01.mkv")).toBeInTheDocument();
-    expect(screen.getByText("Episode 02.mkv")).toBeInTheDocument();
-    expect(screen.queryByText(String.raw`C:\media\Show\Episode 01.mkv`)).not.toBeInTheDocument();
-  });
-
-  it("removes file-info rows immediately when their source is cleared", async () => {
+  it("cancels a scan and an operation through their own endpoints", async () => {
     const user = userEvent.setup();
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify([
-      "/media/ShowA",
-      "/media/ShowB"
-    ]));
-    const showA = {
-      path: "/media/ShowA/Episode 01.mkv",
-      fileName: "Episode 01.mkv",
-      extension: ".mkv",
-      status: "Scanned",
-      reader: "mkvmerge",
-      codec: "HEVC/H.265",
-      resolution: "1920x1080",
-      bitDepth: "",
-      hdr: "",
-      videoSummary: "HEVC/H.265 | 1920x1080",
-      audioSummary: "eng x1",
-      subtitleSummary: "eng x1",
-      attachmentSummary: "None",
-      tracks: [],
-      attachments: []
+    const cancelScan = vi.fn(() => new Promise<never>(() => undefined));
+    const cancelOperationJob = vi.fn(() => new Promise<never>(() => undefined));
+    renderDashboard({
+      cancelScan, cancelOperationJob,
+      listRecentJobs: () => Promise.resolve({ jobs: [
+        recentJob("op", { status: "Running", completedUtc: null, completed: 1 }),
+        recentJob("scan", { kind: "scan", status: "Queued", completedUtc: null, completed: 0, total: 0 })
+      ] })
+    });
+
+    await user.click(await screen.findByRole("button", { name: "Cancel Scan" }));
+    await user.click(screen.getByRole("button", { name: "Cancel Remux" }));
+    expect(cancelScan).toHaveBeenCalledWith("scan");
+    expect(cancelOperationJob).toHaveBeenCalledWith("op");
+  });
+
+  it("opens a finished job's log on demand, and offers none for scans", async () => {
+    const user = userEvent.setup();
+    const job: OperationJobResponse = {
+      id: "failed", kind: "mux", status: "Failed", createdUtc: minutesAgo(6), startedUtc: minutesAgo(6), completedUtc: minutesAgo(5), completed: 3, failed: 1, skipped: 0, total: 4,
+      currentFile: "", currentFilePercent: 0, lines: ["Remux 01.mkv", "Failed 04.mkv"], muxResult: null, propEditResult: null, error: "internal error: 1 of 4 files failed: 04.mkv: tool failed"
     };
-    const showB = { ...showA, path: "/media/ShowB/Episode 02.mkv", fileName: "Episode 02.mkv" };
-
+    const getOperationJob = vi.fn(() => Promise.resolve(job));
     renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files: [showA, showB] }),
-      getWebSettings: () => Promise.resolve(settings())
+      getOperationJob,
+      listRecentJobs: () => Promise.resolve({ jobs: [
+        recentJob("failed", { status: "Failed", completed: 3, failed: 1, error: job.error }),
+        recentJob("scan", { kind: "scan", summary: "Scan completed" })
+      ] })
     });
 
-    expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
-    expect(screen.getByRole("row", { name: /Episode 02\.mkv/i })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /clear selected sources/i }));
-    await waitFor(() => {
-      expect(screen.queryByRole("row", { name: /Episode 01\.mkv/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("row", { name: /Episode 02\.mkv/i })).not.toBeInTheDocument();
-    });
+    const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
+    expect(within(rows[0]).getByText("1 of 4 failed")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("1 of 4 files failed: 04.mkv: tool failed")).toBeInTheDocument();
+    // Nothing says which page ran this remux, so there is nowhere to send a retry.
+    expect(within(rows[0]).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(rows[1]).queryByRole("button")).not.toBeInTheDocument();
+    expect(getOperationJob).not.toHaveBeenCalled();
+
+    await user.click(within(rows[0]).getByRole("button", { name: /View log of Remux/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Remux log" });
+    expect(within(dialog).getByText("04.mkv: tool failed")).toBeInTheDocument();
+    expect(getOperationJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends a retry to the page that ran the job, in this tab or an earlier one", async () => {
+    localStorage.setItem("mkvo.web.jobLabels", JSON.stringify([["reorder", "Reorder Tracks"]]));
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs: [
+      recentJob("reorder", { status: "Failed", failed: 1, error: "tool failed" }),
+      recentJob("edit", { kind: "property_edit", status: "Failed", failed: 2, error: "tool failed" })
+    ] }) });
+
+    const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
+    expect(within(rows[0]).getByRole("link", { name: /^Retry in Reorder Tracks/ })).toHaveAttribute("href", "/tracks/reorder");
+    expect(within(rows[1]).getByRole("link", { name: /^Retry in Edit Tracks/ })).toHaveAttribute("href", "/tracks/properties");
+  });
+
+  it("says what Cancel does to an edit in place, and takes a job that is already over as canceled", async () => {
+    const user = userEvent.setup();
+    let jobs = [recentJob("edit", { kind: "property_edit", status: "Running", completedUtc: null, completed: 1 }), recentJob("remux", { status: "Running", completedUtc: null, completed: 1 })];
+    const cancelOperationJob = vi.fn((id: string) => Promise.reject(id === "edit"
+      ? new ApiError("operation job edit", { code: "not_found", status: 404 })
+      : new ApiError("the job store is busy", { code: "internal", status: 500 })));
+    const listRecentJobs = vi.fn(() => Promise.resolve({ jobs }));
+    renderDashboard({ cancelOperationJob, listRecentJobs });
+
+    const cancelEdit = await screen.findByRole("button", { name: "Cancel Edit Tracks" });
+    expect(cancelEdit).toHaveAttribute("title", "Stops after the current file");
+    expect(screen.getByRole("button", { name: "Cancel Remux" })).not.toHaveAttribute("title");
+
+    await user.click(cancelEdit);
+    await waitFor(() => expect(cancelOperationJob).toHaveBeenCalledWith("edit"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Cancel Remux" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Remux could not be canceled: the job store is busy");
+    // The line goes once the list says the job is over.
+    jobs = [recentJob("edit", { kind: "property_edit" }), recentJob("remux")];
+    await user.click(screen.getByRole("button", { name: "Cancel Remux" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  });
+
+  it("keeps a row to one line unless it has an error or a file in progress, and folds repeated scans", async () => {
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs: [
+      recentJob("remux", { summary: "Mux/remux operation completed" }),
+      recentJob("scan-3", { kind: "scan", total: 369, completed: 369, summary: "Scan completed" }),
+      recentJob("scan-2", { kind: "scan", total: 369, completed: 369, summary: "Scan completed" }),
+      recentJob("scan-1", { kind: "scan", total: 369, completed: 369, summary: "Scan completed" }),
+      recentJob("scan-0", { kind: "scan", total: 9, completed: 9, summary: "Scan completed" })
+    ] }) });
+
+    const rows = await within(await screen.findByRole("list", { name: "Running and recent jobs" })).findAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(rows[1]).toHaveTextContent("Scan369 files×3, 3 scans in a row");
+    expect(rows[2]).toHaveTextContent("Scan9 files");
+    expect(screen.queryByText("Scan completed")).not.toBeInTheDocument();
+    expect(screen.queryByText("Mux/remux operation completed")).not.toBeInTheDocument();
+  });
+
+  it("says why the list is empty when it cannot be read, and tries again", async () => {
+    const user = userEvent.setup();
+    const listRecentJobs = vi.fn<() => Promise<{ jobs: RecentJob[] }>>().mockRejectedValueOnce(new ApiError("database is locked", { code: "internal", status: 500 })).mockResolvedValue({ jobs: [recentJob("ok")] });
+    renderDashboard({ listRecentJobs });
+
+    expect(await screen.findByText("Jobs could not be loaded: database is locked")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("4 done")).toBeInTheDocument();
   });
 });
 
-describe("Dashboard file sorting", () => {
-  it("sorts File Info rows in both directions without changing their identity", async () => {
-    const user = userEvent.setup();
-    const files = [mediaFile("Episode 10.mkv"), mediaFile("Episode 2.mkv")];
+describe("Dashboard attention list", () => {
+  it("names each problem once with the place to fix it", async () => {
+    const testMediaServerConnection = vi.fn(() => Promise.resolve({ success: false, status: "Jellyfin rejected the stored API key (HTTP 401). Enter the key again in Settings.", libraryCount: 0 }));
     renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files }),
-      getWebSettings: () => Promise.resolve(settings())
+      getStatus: () => Promise.resolve({ ...status, tools: [tool("mkvmerge"), tool("mkvpropedit", { available: false, version: "", error: "mkvpropedit was not found" })] }),
+      getWebSettings: () => Promise.resolve({ ...settings, enableLiveWatchFolderMonitoring: true, mediaServers: [{ id: "server-1", name: "Jellyfin", type: "Jellyfin", serverUrl: "http://nas:8096", hasApiKey: true, isDefault: true, lastSyncedUtc: null, libraries: [] }] }),
+      getWatchHealth: () => Promise.resolve({ ...watchOff, error: "The watch folder does not exist." }),
+      testMediaServerConnection,
+      listRecentJobs: () => Promise.resolve({ jobs: [recentJob("scan", { kind: "scan" }), recentJob("failed", { status: "Failed", failed: 1, error: "tool failed" })] })
     });
 
-    const table = await screen.findByLabelText("Scanned files");
-    const rowNames = () => within(table).getAllByRole("row").slice(1).map((row) => row.textContent);
-    await waitFor(() => expect(rowNames()[0]).toContain("Episode 2.mkv"));
-    await user.click(within(table).getByRole("button", { name: "Sort by File" }));
-    expect(rowNames()[0]).toContain("Episode 10.mkv");
+    const attention = within(screen.getByRole("region", { name: "Needs attention" }));
+    expect(await attention.findByText("mkvpropedit is not available: mkvpropedit was not found.")).toBeInTheDocument();
+    expect(attention.getByRole("link", { name: "Tool settings" })).toHaveAttribute("href", "/settings?tab=general");
+    expect(await attention.findByText("Watch folders: The watch folder does not exist.")).toBeInTheDocument();
+    expect(await attention.findByText("Jellyfin rejected the stored API key (HTTP 401). Enter the key again in Settings.")).toBeInTheDocument();
+    expect(attention.getByRole("link", { name: "Server settings" })).toHaveAttribute("href", "/settings?tab=library");
+    expect(await attention.findByText("Remux failed 5 minutes ago.")).toBeInTheDocument();
+    expect(attention.getAllByRole("listitem")).toHaveLength(4);
+    // A screen reader hears the count change, not every line of the list.
+    expect(screen.getByRole("status")).toHaveTextContent("4 items need attention");
+    expect(screen.getByRole("region", { name: "Needs attention" })).not.toHaveAttribute("aria-live");
+    // Only a failed job can be dismissed: the other lines go away when the cause does.
+    expect(attention.getAllByRole("button", { name: /^Dismiss/ })).toHaveLength(1);
+    expect(testMediaServerConnection).toHaveBeenCalledTimes(1);
+    expect(testMediaServerConnection).toHaveBeenCalledWith({ id: "server-1" });
+  });
+
+  it("gives each failed job its own line, which can be dismissed for good", async () => {
+    const user = userEvent.setup();
+    const jobs = [recentJob("scan-failed", { kind: "scan", status: "Failed", error: "folder is gone" }), recentJob("failed", { status: "Failed", failed: 1, error: "tool failed" })];
+    const first = renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs }) });
+
+    const attention = within(screen.getByRole("region", { name: "Needs attention" }));
+    expect(await attention.findByText("Remux failed 5 minutes ago.")).toBeInTheDocument();
+    const scanLine = attention.getByText("Scan failed 5 minutes ago.").closest("li")!;
+    expect(within(scanLine).getByRole("link", { name: "Open Scan" })).toHaveAttribute("href", "/dashboard/scan");
+
+    await user.click(attention.getByRole("button", { name: "Dismiss: Remux failed 5 minutes ago." }));
+    expect(attention.queryByText("Remux failed 5 minutes ago.")).not.toBeInTheDocument();
+    expect(attention.getByText("Scan failed 5 minutes ago.")).toBeInTheDocument();
+
+    // Still dismissed after a reload.
+    first.unmount();
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs }) });
+    const again = within(screen.getByRole("region", { name: "Needs attention" }));
+    expect(await again.findByText("Scan failed 5 minutes ago.")).toBeInTheDocument();
+    expect(again.queryByText("Remux failed 5 minutes ago.")).not.toBeInTheDocument();
+  });
+
+  it("checks a media server once and again only when asked", async () => {
+    const user = userEvent.setup();
+    const testMediaServerConnection = vi.fn(() => Promise.resolve({ success: true, status: "Connection succeeded.", libraryCount: 3 }));
+    const servers = [
+      { id: "server-1", name: "Jellyfin", type: "Jellyfin", serverUrl: "http://nas:8096", hasApiKey: true, isDefault: true, lastSyncedUtc: null, libraries: [] },
+      { id: "server-2", name: "Plex", type: "Plex", serverUrl: "http://nas:32400", hasApiKey: false, isDefault: false, lastSyncedUtc: null, libraries: [] }
+    ];
+    const { unmount } = renderDashboard({ getWebSettings: () => Promise.resolve({ ...settings, mediaServers: servers }), testMediaServerConnection });
+
+    expect(await screen.findByText("Connected, 3 library paths")).toBeInTheDocument();
+    // A server without a key is not asked anything.
+    expect(screen.getByText("No API key is saved.")).toBeInTheDocument();
+    expect(testMediaServerConnection).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "Check Jellyfin again" }));
+    await waitFor(() => expect(testMediaServerConnection).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "Check Plex again" })).not.toBeInTheDocument();
+    unmount();
   });
 });
 
-describe("Dashboard UI cache reset", () => {
-  it("clears scan state and workflow caches while keeping the chosen sources", async () => {
-    const user = userEvent.setup();
-    const scannedFile = mediaFile("Episode 01.mkv");
-    const files = [scannedFile];
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));
-    window.sessionStorage.setItem("mkvo.web.renameState", "stale rename state");
-    window.sessionStorage.setItem("mkvo.web.trackPropertiesConfiguration", "stale track state");
-    const clearCurrentScanFiles = vi.fn().mockResolvedValue(emptyScan);
+describe("Dashboard scanned files", () => {
+  it("summarises the files the app already holds without reading the list again", async () => {
+    const files = [mediaFile("01.mkv"), mediaFile("02.mkv"), mediaFile("03.mkv", { codec: "AVC/H.264", audioSummary: "eng x1" }), mediaFile("04.mp4", { extension: ".mp4", status: "Scan failed" })];
+    const getCurrentScanFiles = vi.fn(() => Promise.resolve({ updatedUtc: "2026-11-14T10:00:00Z", files, selectedPaths: [], summary: { total: 4, mkv: 3, mp4: 1, failed: 1, cached: 0 } }));
+    sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show/"]));
+    renderDashboard({ getCurrentScanFiles });
 
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files }),
-      getWebSettings: () => Promise.resolve(settings()),
-      clearCurrentScanFiles
-    });
-
-    expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /clear ui cache/i }));
-
-    await waitFor(() => expect(clearCurrentScanFiles).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.queryByRole("row", { name: /Episode 01\.mkv/i })).not.toBeInTheDocument());
-    expect(screen.getByText("Show")).toBeInTheDocument();
-    expect(window.sessionStorage.getItem("mkvo.web.scanSources")).toBe(JSON.stringify(["/media/Show"]));
-    expect(window.sessionStorage.getItem("mkvo.web.renameState")).toBeNull();
-    expect(window.sessionStorage.getItem("mkvo.web.trackPropertiesConfiguration")).toBeNull();
-    expect(screen.getByText(/ui cache cleared/i)).toBeInTheDocument();
+    const card = within(screen.getByRole("region", { name: "Scanned files" }));
+    expect(await card.findByText("3 MKV")).toBeInTheDocument();
+    expect(card.getByText("1 MP4")).toBeInTheDocument();
+    expect(card.getByText("1 unreadable")).toBeInTheDocument();
+    expect(card.getByText("From Show")).toBeInTheDocument();
+    expect(card.getByText("01.mkv")).toBeInTheDocument();
+    expect(card.getByText(/1 file differs from it/)).toBeInTheDocument();
+    const video = within(card.getByRole("heading", { name: "Video" }).parentElement!);
+    expect(video.getAllByRole("listitem").map((item) => item.textContent)).toEqual(["HEVC/H.2652", "AVC/H.2641"]);
+    expect(card.getByRole("link", { name: "Open Scan" })).toHaveAttribute("href", "/dashboard/scan");
+    expect(within(screen.getByRole("region", { name: "Needs attention" })).getByText("1 scanned file could not be read.")).toBeInTheDocument();
+    // The synchronizer's read is the only one.
+    expect(getCurrentScanFiles).toHaveBeenCalledTimes(1);
   });
 
-  it("shows files from a scan started after the UI cache is cleared", async () => {
-    const user = userEvent.setup();
-    const scannedFile = mediaFile("Episode 01.mkv");
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));
+  it("says a scan is running instead of inviting another", async () => {
+    renderDashboard({ listRecentJobs: () => Promise.resolve({ jobs: [recentJob("scan", { kind: "scan", status: "Running", completedUtc: null })] }) });
 
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve({ ...emptyScan, files: [scannedFile] }),
-      getWebSettings: () => Promise.resolve(settings()),
-      clearCurrentScanFiles: () => Promise.resolve(emptyScan),
-      startScan: () => Promise.resolve({
-        id: "rescan-job",
-        status: "Queued" as const,
-        createdUtc: new Date().toISOString(),
-        startedUtc: null,
-        completedUtc: null,
-        currentSource: "",
-        completed: 0,
-        total: 1,
-        files: [],
-        skipped: [],
-        summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-        error: ""
-      }),
-      getScanJob: () => Promise.resolve({
-        id: "rescan-job",
-        status: "Completed" as const,
-        createdUtc: new Date().toISOString(),
-        startedUtc: new Date().toISOString(),
-        completedUtc: new Date().toISOString(),
-        currentSource: "/media/Show",
-        completed: 1,
-        total: 1,
-        files: [scannedFile],
-        skipped: [],
-        summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 1 },
-        error: ""
-      })
-    });
-
-    expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /clear ui cache/i }));
-    await waitFor(() => expect(screen.queryByRole("row", { name: /Episode 01\.mkv/i })).not.toBeInTheDocument());
-
-    await user.click(screen.getByRole("button", { name: /^scan$/i }));
-
-    expect(await screen.findByRole("row", { name: /Episode 01\.mkv/i }, { timeout: 3000 })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "Rescan" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Rescan Files" })).not.toBeInTheDocument();
+    expect(await screen.findByText("A scan is running")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Scan a folder" })).not.toBeInTheDocument();
   });
 });
 
-describe("Dashboard ignored folders", () => {
-  /// The ignored list is sent with every scan request, so seeding it from a
-  /// local constant silently overrode whatever the user configured in Settings.
-  it("seeds the ignored list from saved settings rather than a local default", async () => {
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () =>
-        Promise.resolve(settings({ ignoredScanFolderNames: ["Featurettes", "Trailers"] }))
-    });
+describe("Dashboard polling", () => {
+  it("re-reads only the watcher's state on its own timer", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const getWatchHealth = vi.fn(() => Promise.resolve({ running: true, backend: "polling" as const, watchedRoots: 2, lastEventUtc: minutesAgo(7) }));
+    const calls = { getStatus: vi.fn(() => Promise.resolve(status)), getWebSettings: vi.fn(() => Promise.resolve(settings)), getRenameBatches: vi.fn(() => Promise.resolve({ batches: [] })), listRecentJobs: vi.fn(() => Promise.resolve({ jobs: [] })) };
+    renderDashboard({ getWatchHealth, ...calls });
 
-    const field = await screen.findByLabelText(/ignored subfolders/i);
-    await waitFor(() => expect(field).toHaveValue("Featurettes, Trailers"));
+    expect(await screen.findByText("Watching 2 folders")).toBeInTheDocument();
+    expect(screen.getByText("Polling, last change 7 minutes ago")).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(31_000));
+    expect(getWatchHealth).toHaveBeenCalledTimes(2);
+    // The job list is the sidebar's poll; this page only reads it.
+    for (const call of Object.values(calls)) expect(call).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
   });
 
-  it("does not discard an edit in progress when settings arrive", async () => {
-    const user = userEvent.setup();
-    let resolveSettings: (value: WebSettings) => void = () => {};
-    const pending = new Promise<WebSettings>((resolve) => {
-      resolveSettings = resolve;
-    });
+  it("reads the watcher's state once while watching is off", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const getWatchHealth = vi.fn(() => Promise.resolve(watchOff));
+    renderDashboard({ getWatchHealth });
 
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => pending
-    });
-
-    const field = await screen.findByLabelText(/ignored subfolders/i);
-    await user.type(field, "MyOwnFolder");
-    resolveSettings(settings({ ignoredScanFolderNames: ["Extras"] }));
-
-    // The saved value must not clobber what the user is actively typing.
-    await waitFor(() => expect(field).toHaveValue("MyOwnFolder"));
+    expect(await screen.findByText("Folders are not watched for changes.")).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(65_000));
+    expect(getWatchHealth).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
   });
+});
 
-  it("restores an ignored-folder edit when the page reloads before saving finishes", async () => {
-    const firstRender = renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras"] })),
-      saveWebSettings: () => new Promise(() => undefined)
-    });
+describe("Dashboard recent renames", () => {
+  it("links a batch to the undo dialog in Rename Files", async () => {
+    const entry = { originalPath: "/media/a.mkv", renamedPath: "/media/Show - S01E01.mkv", originalFileName: "a.mkv", renamedFileName: "Show - S01E01.mkv" };
+    renderDashboard({ getRenameBatches: () => Promise.resolve({ batches: [
+      { id: "batch-1", createdAt: minutesAgo(90), undoneAt: null, provider: "TVDB", template: "", totalFiles: 12, entries: [entry], isUndone: false, displayName: "2026-11-14 09:00 - 12 file(s)" },
+      { id: "batch-2", createdAt: minutesAgo(3000), undoneAt: minutesAgo(2000), provider: "TVDB", template: "", totalFiles: 1, entries: [], isUndone: true, displayName: "2026-11-12 09:00 - 1 file(s)" }
+    ] }) });
 
-    const field = await screen.findByLabelText(/ignored subfolders/i);
-    fireEvent.change(field, { target: { value: "Backdrops, OVAs, Specials" } });
-    firstRender.unmount();
-
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras"] })),
-      saveWebSettings: () => new Promise(() => undefined)
-    });
-
-    expect(await screen.findByLabelText(/ignored subfolders/i)).toHaveValue("Backdrops, OVAs, Specials");
+    const card = within(await screen.findByRole("region", { name: "Recent renames" }));
+    expect(card.getByText("Show - S01E01.mkv")).toBeInTheDocument();
+    expect(card.getByText("12 files, 1 hour ago")).toBeInTheDocument();
+    expect(card.getByRole("link", { name: "Undo the rename of Show - S01E01.mkv" })).toHaveAttribute("href", "/rename");
+    expect(card.getByText("Undone")).toBeInTheDocument();
+    expect(card.getAllByRole("link")).toHaveLength(1);
   });
+});
 
-  it("persists ignored-folder edits to the shared settings", async () => {
-    const saveWebSettings = vi.fn().mockImplementation((request) =>
-      Promise.resolve(settings({ ignoredScanFolderNames: request.ignoredScanFolderNames ?? [] }))
+describe("Dashboard routes", () => {
+  function Location() { return <output aria-label="Location">{useLocation().pathname}</output>; }
+
+  function renderApp(path: string) {
+    setBackendClient(createMockBackendClient({ transport: "tauri", ...backend() }));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={[path]}><App /><Location /></MemoryRouter>
+      </QueryClientProvider>
     );
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras"] })),
-      saveWebSettings
-    });
-
-    fireEvent.change(await screen.findByLabelText(/ignored subfolders/i), {
-      target: { value: "Backdrops, OVAs, Specials" }
-    });
-
-    await waitFor(() => expect(saveWebSettings).toHaveBeenCalledWith({
-      ignoredScanFolderNames: ["Backdrops", "OVAs", "Specials"]
-    }), { timeout: 2000 });
-  });
-
-  it("sends the configured folders with the scan request", async () => {
-    const user = userEvent.setup();
-    const startScan = vi.fn().mockResolvedValue({
-      id: "job-1",
-      status: "Queued",
-      createdUtc: new Date().toISOString(),
-      startedUtc: null,
-      completedUtc: null,
-      currentSource: "",
-      completed: 0,
-      total: 0,
-      files: [],
-      skipped: [],
-      summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-      error: ""
-    });
-
-    renderDashboard({
-      getStatus: () => Promise.resolve({ ...emptyStatus, sourceRoots: [{ name: "Media", path: "/media" }] }),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings({ ignoredScanFolderNames: ["Extras", "Samples"] })),
-      browseFileSystem: () =>
-        Promise.resolve({ path: "/media", parentPath: null, entries: [] }),
-      // Browsing can range outside the authorized roots, so the chosen folder
-      // is granted before it is used as a scan source.
-      authorizeBrowsedRoot: () => Promise.resolve(),
-      startScan,
-      getScanJob: () =>
-        Promise.resolve({
-          id: "job-1",
-          status: "Completed" as const,
-          createdUtc: new Date().toISOString(),
-          startedUtc: null,
-          completedUtc: null,
-          currentSource: "",
-          completed: 0,
-          total: 0,
-          files: [],
-          skipped: [],
-          summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-          error: ""
-        })
-    });
-
-    await waitFor(() =>
-      expect(screen.getByLabelText(/ignored subfolders/i)).toHaveValue("Extras, Samples")
-    );
-
-    await user.click(await screen.findByRole("button", { name: /browse/i }));
-    await user.click(await screen.findByRole("button", { name: /select this folder/i }));
-    await user.click(await screen.findByRole("button", { name: /^scan$/i }));
-
-    await waitFor(() => expect(startScan).toHaveBeenCalled());
-    expect(startScan.mock.calls[0][0].ignoredFolderNames).toEqual(["Extras", "Samples"]);
-    expect(startScan.mock.calls[0][0].forceRefresh).toBe(false);
-  });
-
-  it("turns the Scan button into the cancel control while scanning", async () => {
-    const user = userEvent.setup();
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media/Show"]));
-    const now = new Date().toISOString();
-    const cancelScan = vi.fn().mockResolvedValue({
-      id: "job-1",
-      status: "Canceled" as const,
-      createdUtc: now,
-      startedUtc: now,
-      completedUtc: now,
-      currentSource: "/media/Show",
-      completed: 0,
-      total: 1,
-      files: [],
-      skipped: [],
-      summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-      error: ""
-    });
-
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings()),
-      startScan: () => Promise.resolve({
-        id: "job-1",
-        status: "Queued" as const,
-        createdUtc: now,
-        startedUtc: null,
-        completedUtc: null,
-        currentSource: "",
-        completed: 0,
-        total: 1,
-        files: [],
-        skipped: [],
-        summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-        error: ""
-      }),
-      getScanJob: () => Promise.resolve({
-        id: "job-1",
-        status: "Running" as const,
-        createdUtc: now,
-        startedUtc: now,
-        completedUtc: null,
-        currentSource: "/media/Show",
-        completed: 0,
-        total: 1,
-        files: [],
-        skipped: [],
-        summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-        error: ""
-      }),
-      cancelScan
-    });
-
-    await user.click(await screen.findByRole("button", { name: /^scan$/i }));
-    const cancelButton = await screen.findByRole("button", { name: /cancel scan/i });
-    expect(screen.getAllByRole("button", { name: /cancel scan/i })).toHaveLength(1);
-    await user.click(cancelButton);
-    await waitFor(() => expect(cancelScan).toHaveBeenCalledWith("job-1"));
-  });
-
-  it("can force a rescan of sources that were already scanned", async () => {
-    const user = userEvent.setup();
-    window.sessionStorage.setItem("mkvo.web.lastScannedSources", JSON.stringify(["/media"]));
-    window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(["/media"]));
-    const startScan = vi.fn().mockResolvedValue({
-      id: "refresh-job",
-      status: "Queued",
-      createdUtc: new Date().toISOString(),
-      startedUtc: null,
-      completedUtc: null,
-      currentSource: "",
-      completed: 0,
-      total: 0,
-      files: [],
-      skipped: [],
-      summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 },
-      error: ""
-    });
-
-    renderDashboard({
-      getStatus: () => Promise.resolve({
-        ...emptyStatus,
-        sourceRoots: [{ name: "Media", path: "/media" }]
-      }),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings()),
-      browseFileSystem: () =>
-        Promise.resolve({ path: "/media", parentPath: null, entries: [] }),
-      authorizeBrowsedRoot: () => Promise.resolve(),
-      startScan
-    });
-
-    await user.click(await screen.findByRole("button", { name: /browse/i }));
-    await user.click(await screen.findByRole("button", { name: /select this folder/i }));
-    await user.click(await screen.findByRole("button", { name: /^rescan$/i }));
-
-    await waitFor(() => expect(startScan).toHaveBeenCalledTimes(1));
-    expect(startScan.mock.calls[0][0]).toMatchObject({
-      sources: ["/media"],
-      forceRefresh: true
-    });
-  });
-});
-
-describe("Dashboard detail panels", () => {
-  /// They used to appear only once a file was selected, so the dashboard
-  /// reflowed as scans came and went and an empty page gave no hint of what
-  /// these panels are for.
-  it("keeps Media Info and Track Info in place with nothing scanned", async () => {
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve(emptyScan),
-      getWebSettings: () => Promise.resolve(settings())
-    });
-
-    expect(await screen.findByText("Media Info")).toBeInTheDocument();
-    expect(screen.getByText("Track Info")).toBeInTheDocument();
-
-    // The labels stay so the panel says what it will show.
-    for (const label of ["File", "Codec", "Resolution", "Bit Depth", "HDR", "Status"]) {
-      expect(screen.getAllByText(label).length).toBeGreaterThan(0);
-    }
-    expect(screen.getByText(/scan a folder, then select a file/i)).toBeInTheDocument();
-  });
-
-  it("fills the panels once a file is scanned", async () => {
-    const file = {
-      path: "/media/Show/Ep01.mkv",
-      fileName: "Ep01.mkv",
-      extension: ".mkv",
-      status: "Scanned",
-      reader: "mkvmerge",
-      codec: "HEVC/H.265",
-      resolution: "1920x1080",
-      bitDepth: "",
-      hdr: "",
-      videoSummary: "HEVC/H.265 | 1920x1080",
-      audioSummary: "eng x1",
-      subtitleSummary: "eng x1",
-      attachmentSummary: "None",
-      tracks: [
-        {
-          id: 0,
-          trackNumber: 1,
-          type: "video",
-          codec: "HEVC/H.265",
-          language: "und",
-          name: "",
-          channels: null,
-          default: true,
-          forced: false
-        },
-        {
-          id: 1,
-          trackNumber: 2,
-          type: "audio",
-          codec: "AC-3",
-          language: "eng",
-          name: "",
-          channels: 6,
-          default: true,
-          forced: false
-        },
-        {
-          id: 2,
-          trackNumber: 3,
-          type: "audio",
-          codec: "AAC",
-          language: "jpn",
-          name: "",
-          channels: 2,
-          default: false,
-          forced: false
-        }
-      ],
-      attachments: []
-    };
-
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () =>
-        Promise.resolve({ ...emptyScan, files: [file], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 } }),
-      getWebSettings: () => Promise.resolve(settings())
-    });
-
-    await waitFor(() => expect(screen.getAllByText("HEVC/H.265").length).toBeGreaterThan(0));
-    expect(screen.getByText("Channel")).toBeInTheDocument();
-    expect(screen.getByText("eng (5.1), jpn (2.0)")).toBeInTheDocument();
-    expect(screen.queryByText(/scan a folder, then select a file/i)).not.toBeInTheDocument();
-  });
-
-  it("supports range selection, Ctrl+A, and Delete for scanned files", async () => {
-    const user = userEvent.setup();
-    const baseFile = {
-      path: "/media/Show/Ep01.mkv",
-      fileName: "Ep01.mkv",
-      extension: ".mkv",
-      status: "Scanned",
-      reader: "mkvmerge",
-      codec: "HEVC/H.265",
-      resolution: "1920x1080",
-      bitDepth: "",
-      hdr: "",
-      videoSummary: "HEVC/H.265 | 1920x1080",
-      audioSummary: "eng x1",
-      subtitleSummary: "eng x1",
-      attachmentSummary: "None",
-      tracks: [],
-      attachments: []
-    };
-    const secondFile = { ...baseFile, path: "/media/Show/Ep02.mkv", fileName: "Ep02.mkv" };
-    const thirdFile = { ...baseFile, path: "/media/Show/Ep03.mkv", fileName: "Ep03.mkv" };
-
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve({
-        ...emptyScan,
-        files: [baseFile, secondFile, thirdFile],
-        summary: { total: 3, mkv: 3, mp4: 0, failed: 0, cached: 0 }
-      }),
-      getWebSettings: () => Promise.resolve(settings()),
-      setFileSelection: (paths: string[]) => Promise.resolve({ ...emptyScan, selectedPaths: paths })
-    });
-
-    const firstRow = (await screen.findAllByText("Ep01.mkv"))[0].closest("tr")!;
-    const secondRow = (await screen.findAllByText("Ep02.mkv"))[0].closest("tr")!;
-    const thirdRow = (await screen.findAllByText("Ep03.mkv"))[0].closest("tr")!;
-    await user.click(firstRow);
-    fireEvent.click(thirdRow, { shiftKey: true });
-    expect(firstRow).toHaveClass("bg-selected");
-    expect(secondRow).toHaveClass("bg-selected");
-    expect(thirdRow).toHaveClass("bg-selected");
-
-    fireEvent.click(secondRow, { ctrlKey: true });
-    expect(secondRow).not.toHaveClass("bg-selected");
-
-    const scannedFiles = screen.getByLabelText("Scanned files");
-    fireEvent.keyDown(scannedFiles, { key: "a", ctrlKey: true });
-    expect(secondRow).toHaveClass("bg-selected");
-    fireEvent.keyDown(scannedFiles, { key: "Delete" });
-    expect(await screen.findByText("No files scanned yet")).toBeInTheDocument();
-  });
-});
-
-describe("Dashboard template highlighting", () => {
-  const templateFile = {
-    path: "/media/Show/Ep01.mkv",
-    fileName: "Ep01.mkv",
-    extension: ".mkv",
-    status: "Scanned",
-    reader: "mkvmerge",
-    codec: "HEVC/H.265",
-    resolution: "1920x1080",
-    bitDepth: "",
-    hdr: "",
-    videoSummary: "HEVC/H.265 | 1920x1080",
-    audioSummary: "eng x1",
-    subtitleSummary: "eng x1",
-    attachmentSummary: "None",
-    tracks: [
-      { id: 0, trackNumber: 1, type: "video", codec: "HEVC/H.265", language: "und", name: "Ep01.Release", channels: null, default: true, forced: false },
-      { id: 1, trackNumber: 2, type: "audio", codec: "AC-3", language: "eng", name: "", channels: 6, default: true, forced: false }
-    ],
-    attachments: []
-  };
-
-  function renderWithTemplate() {
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () =>
-        Promise.resolve({
-          ...emptyScan,
-          files: [templateFile],
-          summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 }
-        }),
-      getWebSettings: () => Promise.resolve(settings())
-    });
   }
 
-  it("keeps template selection in the file context menu instead of the File Info header", async () => {
-    renderWithTemplate();
-
-    expect(await screen.findByText("Template: Ep01.mkv")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /use selected as template/i })).not.toBeInTheDocument();
-  });
-
-  it("setting a template does not collapse the selected batch", async () => {
+  it("opens on the overview, with Scan one tab away", async () => {
     const user = userEvent.setup();
-    const otherFile = {
-      ...templateFile,
-      path: "/media/Show/Ep02.mkv",
-      fileName: "Ep02.mkv"
-    };
-    const setFileSelection = vi.fn();
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () =>
-        Promise.resolve({
-          ...emptyScan,
-          files: [templateFile, otherFile],
-          selectedPaths: [templateFile.path, otherFile.path],
-          summary: { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 }
-        }),
-      getWebSettings: () => Promise.resolve(settings()),
-      setFileSelection
-    });
+    renderApp("/");
 
-    const otherRow = await screen.findByRole("row", { name: /Ep02\.mkv/i });
-    fireEvent.contextMenu(otherRow);
-    await user.click(screen.getByRole("button", { name: /set as template/i }));
+    expect(await screen.findByText("Nothing needs your attention.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Location")).toHaveTextContent("/dashboard");
+    const tabs = within(screen.getByRole("navigation", { name: "Dashboard views" }));
+    expect(tabs.getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
 
-    expect(setFileSelection).not.toHaveBeenCalled();
-    expect(screen.getByText("Template: Ep02.mkv")).toBeInTheDocument();
+    await user.click(tabs.getByRole("link", { name: "Scan" }));
+    expect(await screen.findByRole("heading", { name: "Scan Sources" })).toBeInTheDocument();
+    expect(tabs.getByRole("link", { name: "Scan" })).toHaveAttribute("aria-current", "page");
+    expect(tabs.getByRole("link", { name: "Overview" })).not.toHaveAttribute("aria-current");
+    // Scan is a view of Dashboard, so the menu still marks Dashboard.
+    expect(within(screen.getByRole("complementary")).getByRole("link", { name: "Dashboard" })).toHaveAttribute("aria-current", "page");
   });
 
-  it("keeps the template filename white like the other file details", async () => {
-    renderWithTemplate();
+  it("sends /scan to the Scan view", async () => {
+    renderApp("/scan");
 
-    const rows = await screen.findAllByText("Ep01.mkv");
-    const detail = rows.find((element) => element.tagName === "DD");
-    expect(detail).toBeDefined();
-    expect(detail).toHaveClass("text-text");
-  });
-
-  it("labels the selected template beside its media reader", async () => {
-    renderWithTemplate();
-
-    const templateBadge = await screen.findByText("Template File");
-    expect(templateBadge).toBeInTheDocument();
-    expect(templateBadge.nextElementSibling).toHaveTextContent("mkvmerge");
-  });
-
-  it("uses purple text for the template row in File Info", async () => {
-    renderWithTemplate();
-
-    const templateRow = await screen.findByRole("row", { name: /Ep01\.mkv/i });
-    expect(templateRow).toHaveClass("text-template");
-  });
-
-  it("keeps the template's track rows white for a uniform schema", async () => {
-    renderWithTemplate();
-
-    const codec = (await screen.findAllByText("AC-3"))[0];
-    expect(codec).toHaveClass("text-text");
-
-    expect(screen.getByText("Ep01.Release")).toHaveClass("text-text");
-  });
-
-  it("identifies extra tracks by the mkvmerge ID shown in Track Info", async () => {
-    const user = userEvent.setup();
-    const fileWithExtraTrack = {
-      ...templateFile,
-      path: "/media/Show/Ep02.mkv",
-      fileName: "Ep02.mkv",
-      subtitleSummary: "eng x1",
-      tracks: [
-        ...templateFile.tracks,
-        { id: 3, trackNumber: 4, type: "subtitles", codec: "SubRip/SRT", language: "eng", name: "SDH", channels: null, default: false, forced: false }
-      ]
-    };
-
-    renderDashboard({
-      getStatus: () => Promise.resolve(emptyStatus),
-      getCurrentScanFiles: () => Promise.resolve({
-        ...emptyScan,
-        files: [templateFile, fileWithExtraTrack],
-        summary: { total: 2, mkv: 2, mp4: 0, failed: 0, cached: 0 }
-      }),
-      getWebSettings: () => Promise.resolve(settings())
-    });
-
-    await user.click(await screen.findByRole("row", { name: /Ep02\.mkv/i }));
-    expect(await screen.findByText("Extra track · ID 3")).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Selected file comparison" })).toHaveTextContent("No corresponding track");
-    expect(screen.queryByText(/Track 4 is extra/i)).not.toBeInTheDocument();
-    expect(screen.getByText("1 warning file(s)")).toHaveClass("text-warning");
+    expect(await screen.findByRole("heading", { name: "Scan Sources" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Location")).toHaveTextContent("/dashboard/scan");
   });
 });

@@ -2,6 +2,7 @@ import type { LogExport } from "./client";
 import type {
   AppStatus,
   CurrentScanResponse,
+  FileSelectionResponse,
   FileSystemResponse,
   LibraryArtworkRequest,
   LibraryArtworkResponse,
@@ -19,6 +20,7 @@ import type {
   PropEditPreviewRequest,
   PropEditPreviewResponse,
   PropEditTemplateResponse,
+  RecentJobsResponse,
   RenameApplyResponse,
   RenameBatchListResponse,
   RenameBatchUndoPreviewResponse,
@@ -29,6 +31,7 @@ import type {
   RenameSearchResult,
   ScanJobResponse,
   ScanRequest,
+  WatchHealth,
   WebSettings,
   WebSettingsRequest
 } from "../api";
@@ -116,8 +119,8 @@ export class TauriBackendClient implements BackendClient {
     return this.invoke<CurrentScanResponse>("clear_current_scan_files", undefined, "CurrentScanResponse");
   }
 
-  setFileSelection(paths: string[]): Promise<CurrentScanResponse> {
-    return this.invoke<CurrentScanResponse>("set_file_selection", { request: { paths } }, "CurrentScanResponse");
+  setFileSelection(paths: string[], replaceWorkingSet?: boolean): Promise<FileSelectionResponse> {
+    return this.invoke<FileSelectionResponse>("set_file_selection", { request: { paths, replaceWorkingSet } }, "FileSelectionResponse");
   }
 
   async authorizeBrowsedRoot(path: string): Promise<void> {
@@ -192,6 +195,14 @@ export class TauriBackendClient implements BackendClient {
     return this.invoke<OperationJobResponse>("cancel_operation_job", { id }, "OperationJobResponse");
   }
 
+  listRecentJobs(limit?: number): Promise<RecentJobsResponse> {
+    return this.invoke<RecentJobsResponse>("list_recent_jobs", { limit: limit ?? null }, "RecentJobsResponse");
+  }
+
+  getWatchHealth(): Promise<WatchHealth> {
+    return this.invoke<WatchHealth>("get_watch_health", undefined, "WatchHealth");
+  }
+
   loadPropEditTemplate(request: PropEditTemplateRequest): Promise<PropEditTemplateResponse> {
     return this.invoke<PropEditTemplateResponse>("load_propedit_template", { request }, "PropEditTemplateResponse");
   }
@@ -218,6 +229,11 @@ export class TauriBackendClient implements BackendClient {
 
   getLibraryArtwork(request: LibraryArtworkRequest): Promise<LibraryArtworkResponse> {
     return this.invoke<LibraryArtworkResponse>("get_library_artwork", { request }, "LibraryArtworkResponse");
+  }
+
+  // The desktop shell has no HTTP origin to load images from.
+  libraryArtworkUrl(): undefined {
+    return undefined;
   }
 
   getLibraryLocalArtwork(request: LibraryLocalArtworkRequest): Promise<LibraryArtworkResponse> {

@@ -45,6 +45,8 @@ pub enum SnapshotError {
 pub fn snapshot_roots(roots: &[PathBuf], media_only: bool) -> Result<Snapshot, SnapshotError> {
     let mut snapshot = Snapshot::new();
     for root in roots {
+        // No link is followed, so below a canonical root every path is canonical.
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         for entry in WalkDir::new(root)
             .follow_links(false)
             .into_iter()
@@ -66,10 +68,8 @@ pub fn snapshot_roots(roots: &[PathBuf], media_only: bool) -> Result<Snapshot, S
                 .map_or(0, |duration| {
                     i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
                 });
-            let path =
-                std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
             snapshot.insert(
-                path,
+                entry.into_path(),
                 FileIdentity {
                     size: metadata.len(),
                     modified_at_ns,

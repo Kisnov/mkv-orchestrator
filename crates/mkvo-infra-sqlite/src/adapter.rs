@@ -6,19 +6,22 @@ use mkvo_application::{
     JobRepository, JournalRecord, MetadataCache, OperationJournal, OperationLog, PlanRepository,
     PortError, RenameHistoryRepository, SettingsRepository,
 };
-use mkvo_contracts::{JobEventEnvelope, JobSnapshot, LogLevel, LogQuery, OperationLogEntry};
+use mkvo_contracts::{
+    JobEventEnvelope, JobSnapshot, LogLevel, LogQuery, OperationLogEntry, RecentJob,
+};
 use mkvo_domain::{
     AppSettings, FileFingerprint, IdempotencyKey, JobId, MediaFile, PlanId, RenameBatchId,
     RenameBatchRecord, StoredPlan as DomainStoredPlan,
 };
 use rusqlite::{OptionalExtension, params};
 
-use crate::{
-    CacheFingerprint, CachedMedia, RenameBatch, RenameBatchEntry, SqliteStore, StoreError,
-    StoredJob, StoredPlan,
-};
+use crate::{CacheFingerprint, SqliteStore, StoreError, StoredJob, StoredPlan};
 
 const SETTINGS_KEY: &str = "app";
+/// Rows deleted per transaction while pruning.
+const PRUNE_BATCH: usize = 1_000;
+/// Scan payloads rewritten per transaction; one can be tens of megabytes.
+const STRIP_BATCH: usize = 2;
 
 /// Composition-friendly bundle. A single WAL-configured store can be shared by
 /// desktop and server hosts and registered for each application repository port.
@@ -59,6 +62,22 @@ impl SqliteRepositories {
             .map_err(|error| PortError::Other(format!("SQLite task failed: {error}")))?
             .map_err(store_port_error)
     }
+
+    /// Run `batch` until it finds nothing left. Each run is its own short
+    /// transaction, so other requests get the connection in between.
+    async fn repeat<F>(&self, batch: F) -> Result<u64, PortError>
+    where
+        F: Fn(SqliteStore) -> Result<u64, StoreError> + Clone + Send + 'static,
+    {
+        let mut total = 0;
+        loop {
+            let done = self.blocking(batch.clone()).await?;
+            if done == 0 {
+                return Ok(total);
+            }
+            total += done;
+        }
+    }
 }
 
 #[async_trait]
@@ -68,23 +87,22 @@ impl MetadataCache for SqliteRepositories {
         fingerprint: &FileFingerprint,
     ) -> Result<Option<MediaFile>, PortError> {
         let fingerprint = to_cache_fingerprint(fingerprint);
-        self.blocking(move |store| {
-            store
-                .get_valid_media(&fingerprint)?
-                .map(|cached| serde_json::from_value(cached.payload).map_err(StoreError::from))
-                .transpose()
-        })
-        .await
+        self.blocking(move |store| Ok(store.get_valid_payload(&fingerprint)?.map(|(_, file)| file)))
+            .await
     }
 
     async fn upsert(&self, file: &MediaFile) -> Result<(), PortError> {
-        let file = file.clone();
+        self.upsert_many(std::slice::from_ref(file)).await
+    }
+
+    async fn upsert_many(&self, files: &[MediaFile]) -> Result<(), PortError> {
+        let files = files.to_vec();
         self.blocking(move |store| {
-            store.upsert_media(&CachedMedia {
-                fingerprint: to_cache_fingerprint(&file.fingerprint),
-                scanned_at_ms: Utc::now().timestamp_millis(),
-                payload: serde_json::to_value(file)?,
-            })
+            let entries: Vec<_> = files
+                .iter()
+                .map(|file| (to_cache_fingerprint(&file.fingerprint), file))
+                .collect();
+            store.upsert_media_batch(&entries, Utc::now().timestamp_millis())
         })
         .await
     }
@@ -117,6 +135,28 @@ impl MetadataCache for SqliteRepositories {
                 .into_iter()
                 .map(|cached| serde_json::from_value(cached.payload).map_err(StoreError::from))
                 .collect()
+        })
+        .await
+    }
+
+    async fn mark_seen(
+        &self,
+        paths: &[std::path::PathBuf],
+        seen_at: DateTime<Utc>,
+    ) -> Result<(), PortError> {
+        let paths = paths.to_vec();
+        self.blocking(move |store| store.mark_media_seen(&paths, seen_at.timestamp_millis()))
+            .await
+    }
+
+    async fn remove_unseen_under(
+        &self,
+        root: &Path,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, PortError> {
+        let root = root.to_path_buf();
+        self.blocking(move |store| {
+            store.remove_media_unseen_under(&root, cutoff.timestamp_millis())
         })
         .await
     }
@@ -219,12 +259,35 @@ impl JobRepository for SqliteRepositories {
             .await
     }
 
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError> {
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError> {
         self.blocking(move |store| {
-            store
-                .list_recent_jobs(limit)?
-                .into_iter()
-                .map(|job| decode_job(Some(job)).map(Option::unwrap))
+            let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
+            let connection = store.connection()?;
+            // SQLite drops the result payload, so it is never loaded here.
+            let mut statement = connection.prepare(
+                "SELECT json_remove(result_json, '$.result') FROM jobs
+                 ORDER BY updated_at_ms DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit], |row| row.get::<_, String>(0))?;
+            rows.map(|row| {
+                let snapshot: JobSnapshot = serde_json::from_str(&row?)?;
+                Ok(RecentJob::from(&snapshot))
+            })
+            .collect()
+        })
+        .await
+    }
+
+    async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError> {
+        self.blocking(|store| {
+            let connection = store.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT result_json FROM jobs
+                 WHERE state IN ('\"Queued\"', '\"WaitingForResources\"', '\"Running\"', '\"Canceling\"')
+                 ORDER BY updated_at_ms",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|row| serde_json::from_str(&row?).map_err(StoreError::from))
                 .collect()
         })
         .await
@@ -252,6 +315,28 @@ impl JobRepository for SqliteRepositories {
             Ok(())
         })
         .await
+    }
+
+    async fn prune_history(&self, cutoff: Option<DateTime<Utc>>) -> Result<u64, PortError> {
+        let mut removed = self
+            .repeat(|store| store.delete_superseded_job_events(PRUNE_BATCH))
+            .await?;
+        if let Some(cutoff) = cutoff {
+            let cutoff_ms = cutoff.timestamp_millis();
+            removed += self
+                .repeat(move |store| store.delete_finished_jobs(cutoff_ms, PRUNE_BATCH))
+                .await?;
+            removed += self
+                .blocking(move |store| store.delete_finished_journals_and_logs(cutoff_ms))
+                .await?;
+        }
+        // After the deletes, so nothing about to go is rewritten first.
+        self.repeat(|store| store.strip_scan_file_lists(STRIP_BATCH))
+            .await?;
+        removed += self
+            .blocking(|store| store.delete_unended_job_events())
+            .await?;
+        Ok(removed)
     }
 }
 
@@ -297,59 +382,28 @@ fn decode_job(job: Option<StoredJob>) -> Result<Option<JobSnapshot>, StoreError>
 impl RenameHistoryRepository for SqliteRepositories {
     async fn add(&self, record: &RenameBatchRecord) -> Result<(), PortError> {
         let record = record.clone();
-        self.blocking(move |store| {
-            let local = RenameBatch {
-                id: record.id.to_string(),
-                created_at_ms: record.created_at.timestamp_millis(),
-                undone_at_ms: record.undone_at.map(|value| value.timestamp_millis()),
-                provider: record
-                    .provider
-                    .map(|provider| serde_json::to_string(&provider))
-                    .transpose()?
-                    .unwrap_or_default(),
-                template: record.template.clone(),
-                entries: record
-                    .entries
-                    .iter()
-                    .map(|entry| RenameBatchEntry {
-                        original_path: entry.original_path.clone(),
-                        renamed_path: entry.renamed_path.clone(),
-                    })
-                    .collect(),
-            };
-            store.record_rename_batch(&local)?;
-            let payload = serde_json::to_string(&record)?;
-            let connection = store.connection()?;
-            connection.execute(
-                "UPDATE rename_batches SET payload_json = ?2 WHERE id = ?1",
-                params![record.id.to_string(), payload],
-            )?;
-            Ok(())
-        })
-        .await
+        self.blocking(move |store| store.save_rename_record(&record))
+            .await
+    }
+
+    async fn append(
+        &self,
+        id: RenameBatchId,
+        entry: &mkvo_domain::RenameBatchEntry,
+    ) -> Result<(), PortError> {
+        let entry = entry.clone();
+        self.blocking(move |store| store.append_rename_record_entry(&id.to_string(), &entry))
+            .await
     }
 
     async fn get(&self, id: RenameBatchId) -> Result<Option<RenameBatchRecord>, PortError> {
-        self.blocking(move |store| load_rename_payload(&store, &id.to_string()))
+        self.blocking(move |store| store.rename_record(&id.to_string()))
             .await
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<RenameBatchRecord>, PortError> {
-        self.blocking(move |store| {
-            let limit = i64::try_from(limit).map_err(|_| StoreError::NumericOverflow)?;
-            let connection = store.connection()?;
-            let mut statement = connection.prepare(
-                "SELECT payload_json FROM rename_batches WHERE payload_json IS NOT NULL
-                 ORDER BY created_at_ms DESC LIMIT ?1",
-            )?;
-            let rows = statement.query_map([limit], |row| row.get::<_, String>(0))?;
-            rows.map(|row| {
-                let payload = row?;
-                serde_json::from_str(&payload).map_err(StoreError::from)
-            })
-            .collect()
-        })
-        .await
+        self.blocking(move |store| store.recent_rename_records(limit))
+            .await
     }
 
     async fn mark_undone(&self, id: RenameBatchId, at: DateTime<Utc>) -> Result<(), PortError> {
@@ -360,27 +414,14 @@ impl RenameHistoryRepository for SqliteRepositories {
         RenameHistoryRepository::add(self, &record).await
     }
 
+    async fn remove_before(&self, before: DateTime<Utc>) -> Result<u64, PortError> {
+        self.blocking(move |store| store.delete_rename_batches_before(before.timestamp_millis()))
+            .await
+    }
+
     async fn clear(&self) -> Result<u64, PortError> {
         self.blocking(|store| store.clear_rename_batches()).await
     }
-}
-
-fn load_rename_payload(
-    store: &SqliteStore,
-    id: &str,
-) -> Result<Option<RenameBatchRecord>, StoreError> {
-    let connection = store.connection()?;
-    let payload = connection
-        .query_row(
-            "SELECT payload_json FROM rename_batches WHERE id = ?1",
-            [id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    payload
-        .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
-        .transpose()
 }
 
 #[async_trait]
@@ -491,13 +532,32 @@ impl OperationLog for SqliteRepositories {
         self.blocking(move |store| {
             let connection = store.connection()?;
             let limit = i64::try_from(query.limit).map_err(|_| StoreError::NumericOverflow)?;
+            // The stored spellings of every level at or above the minimum.
+            let levels = query
+                .minimum_level
+                .map(|minimum| {
+                    let levels: Vec<_> = [
+                        LogLevel::Trace,
+                        LogLevel::Debug,
+                        LogLevel::Information,
+                        LogLevel::Warning,
+                        LogLevel::Error,
+                    ]
+                    .into_iter()
+                    .filter(|level| log_rank(*level) >= log_rank(minimum))
+                    .map(|level| serde_json::to_string(&level))
+                    .collect::<Result<_, _>>()?;
+                    serde_json::to_string(&levels)
+                })
+                .transpose()?;
             let mut statement = connection.prepare(
                 "SELECT timestamp_ms, correlation_id, area, level, message, detail
                  FROM operation_logs
                  WHERE (?1 IS NULL OR area = ?1)
+                 AND (?3 IS NULL OR level IN (SELECT value FROM json_each(?3)))
                  ORDER BY timestamp_ms DESC LIMIT ?2",
             )?;
-            let rows = statement.query_map(params![query.area, limit], |row| {
+            let rows = statement.query_map(params![query.area, limit, levels], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -511,12 +571,6 @@ impl OperationLog for SqliteRepositories {
             for row in rows {
                 let (timestamp, correlation, area, level, message, detail) = row?;
                 let level: LogLevel = serde_json::from_str(&level)?;
-                if query
-                    .minimum_level
-                    .is_some_and(|minimum| log_rank(level) < log_rank(minimum))
-                {
-                    continue;
-                }
                 entries.push(OperationLogEntry {
                     timestamp_utc: DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
                         StoreError::Json(serde_json::Error::io(std::io::Error::new(
@@ -597,6 +651,60 @@ fn store_port_error(error: StoreError) -> PortError {
 mod tests {
     use super::*;
 
+    /// The weekly re-probe: an entry older than the retention must still be a
+    /// hit once a scan has seen its file again.
+    #[tokio::test]
+    async fn a_cache_hit_marked_seen_outlives_the_retention_cutoff() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let fingerprint = FileFingerprint {
+            path: std::path::PathBuf::from("/lib/a.mkv"),
+            size_bytes: 10,
+            modified_at: DateTime::from_timestamp(1_000, 0).expect("timestamp"),
+            quick_hash: None,
+        };
+        let file = MediaFile {
+            path: fingerprint.path.clone(),
+            original_file_name: None,
+            watch_root: None,
+            relative_path: None,
+            fingerprint: fingerprint.clone(),
+            container: mkvo_domain::ContainerMetadata::default(),
+            tracks: Vec::new(),
+            attachments: Vec::new(),
+            episode: None,
+            provider_match: None,
+            status: mkvo_domain::MediaStatus::Ready,
+        };
+        let probed_at = DateTime::from_timestamp(0, 0).expect("timestamp");
+        let eight_days_later = probed_at + chrono::TimeDelta::days(8);
+        repositories
+            .store()
+            .upsert_media(&crate::CachedMedia {
+                fingerprint: to_cache_fingerprint(&fingerprint),
+                scanned_at_ms: probed_at.timestamp_millis(),
+                payload: serde_json::to_value(&file).expect("payload"),
+            })
+            .expect("seed");
+
+        let hit = repositories.get_valid(&fingerprint).await.expect("lookup");
+        assert_eq!(hit, Some(file.clone()));
+        repositories
+            .mark_seen(std::slice::from_ref(&fingerprint.path), eight_days_later)
+            .await
+            .expect("mark seen");
+        repositories
+            .remove_unseen_under(
+                Path::new("/lib"),
+                eight_days_later - chrono::TimeDelta::days(7),
+            )
+            .await
+            .expect("prune");
+
+        let hit = repositories.get_valid(&fingerprint).await.expect("lookup");
+        assert_eq!(hit, Some(file));
+    }
+
     #[tokio::test]
     async fn settings_repository_enforces_revisions() {
         let repositories =
@@ -610,6 +718,540 @@ mod tests {
             .await
             .expect_err("create-only save conflicts");
         assert!(matches!(error, PortError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn unfinished_jobs_exclude_terminal_ones() {
+        use mkvo_contracts::{JobKind, JobStatus};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let statuses = [
+            JobStatus::Queued,
+            JobStatus::WaitingForResources,
+            JobStatus::Running,
+            JobStatus::Canceling,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Skipped,
+            JobStatus::Canceled,
+        ];
+        for status in statuses {
+            let snapshot = JobSnapshot {
+                id: JobId::new(),
+                kind: JobKind::Scan,
+                status,
+                correlation_id: mkvo_domain::CorrelationId::new(),
+                idempotency_key: IdempotencyKey::generate(),
+                request_fingerprint: String::new(),
+                plan_id: None,
+                created_utc: Utc::now(),
+                started_utc: None,
+                completed_utc: None,
+                completed: 0,
+                failed: 0,
+                skipped: 0,
+                total: 0,
+                current_file: String::new(),
+                current_file_percent: 0,
+                lines: Vec::new(),
+                result: None,
+                error: None,
+                revision: 0,
+            };
+            JobRepository::insert(&repositories, &snapshot)
+                .await
+                .expect("insert");
+        }
+
+        let unfinished = JobRepository::list_unfinished(&repositories)
+            .await
+            .expect("list");
+        let found: std::collections::HashSet<_> = unfinished.iter().map(|job| job.status).collect();
+        let expected: std::collections::HashSet<_> = statuses
+            .into_iter()
+            .filter(|status| !status.is_terminal())
+            .collect();
+        assert_eq!(unfinished.len(), expected.len());
+        assert_eq!(found, expected);
+    }
+
+    fn job(status: mkvo_contracts::JobStatus) -> JobSnapshot {
+        JobSnapshot {
+            id: JobId::new(),
+            kind: mkvo_contracts::JobKind::Scan,
+            status,
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            idempotency_key: IdempotencyKey::generate(),
+            request_fingerprint: String::new(),
+            plan_id: None,
+            created_utc: Utc::now(),
+            started_utc: None,
+            completed_utc: None,
+            completed: 0,
+            failed: 0,
+            skipped: 0,
+            total: 0,
+            current_file: String::new(),
+            current_file_percent: 0,
+            lines: Vec::new(),
+            result: None,
+            error: None,
+            revision: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_jobs_are_listed_without_their_results() {
+        use mkvo_contracts::JobStatus;
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let mut failed = job(JobStatus::Failed);
+        failed.lines = vec!["first".to_owned(), "Skipped a.mkv: unreadable".to_owned()];
+        failed.error = Some("mkvmerge exited with 2".to_owned());
+        failed.result = Some(serde_json::json!({ "files": ["a".repeat(100_000)] }));
+        failed.completed = 4;
+        failed.total = 9;
+        JobRepository::insert(&repositories, &failed)
+            .await
+            .expect("insert");
+
+        let recent = JobRepository::list_recent(&repositories, 10)
+            .await
+            .expect("list");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, failed.id);
+        assert_eq!(recent[0].status, JobStatus::Failed);
+        assert_eq!((recent[0].completed, recent[0].total), (4, 9));
+        assert_eq!(recent[0].summary, "Skipped a.mkv: unreadable");
+        assert_eq!(recent[0].error.as_deref(), Some("mkvmerge exited with 2"));
+        assert!(serde_json::to_string(&recent).expect("json").len() < 1_000);
+    }
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    /// Stores `snapshot` as if it had last changed `age_days` ago.
+    fn store_job_aged(repositories: &SqliteRepositories, snapshot: &JobSnapshot, age_days: i64) {
+        repositories
+            .store()
+            .upsert_job(&StoredJob {
+                id: snapshot.id.to_string(),
+                kind: serde_json::to_string(&snapshot.kind).expect("kind"),
+                state: serde_json::to_string(&snapshot.status).expect("state"),
+                request: serde_json::Value::Null,
+                result: Some(serde_json::to_value(snapshot).expect("snapshot")),
+                idempotency_key: Some(snapshot.idempotency_key.to_string()),
+                error: None,
+                created_at_ms: 0,
+                updated_at_ms: Utc::now().timestamp_millis() - age_days * DAY_MS,
+            })
+            .expect("store job");
+    }
+
+    fn journal(
+        key: &IdempotencyKey,
+        status: mkvo_application::JournalStatus,
+        age_days: i64,
+    ) -> JournalRecord {
+        JournalRecord {
+            idempotency_key: key.clone(),
+            plan_id: PlanId::new(),
+            step: 0,
+            status,
+            resources: Vec::new(),
+            items: Vec::new(),
+            detail: None,
+            updated_utc: Utc::now() - chrono::TimeDelta::days(age_days),
+        }
+    }
+
+    fn log(message: &str, age_days: i64) -> OperationLogEntry {
+        OperationLogEntry {
+            timestamp_utc: Utc::now() - chrono::TimeDelta::days(age_days),
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            area: "Scan".to_owned(),
+            level: LogLevel::Information,
+            message: message.to_owned(),
+            detail: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_removes_only_history_that_finished_before_the_cutoff() {
+        use mkvo_application::JournalStatus;
+        use mkvo_contracts::{JobEvent, JobStatus};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+
+        let old_done = job(JobStatus::Completed);
+        let old_failed = job(JobStatus::Failed);
+        let old_running = job(JobStatus::Running);
+        let recent_done = job(JobStatus::Completed);
+        for (snapshot, age_days) in [
+            (&old_done, 100),
+            (&old_failed, 100),
+            (&old_running, 100),
+            (&recent_done, 1),
+        ] {
+            store_job_aged(&repositories, snapshot, age_days);
+            JobRepository::append_event(
+                &repositories,
+                &JobEventEnvelope {
+                    job_id: snapshot.id,
+                    correlation_id: snapshot.correlation_id,
+                    sequence: 0,
+                    emitted_utc: Utc::now(),
+                    event: JobEvent::Canceled {
+                        message: String::new(),
+                    },
+                },
+            )
+            .await
+            .expect("event");
+        }
+
+        let renamed = IdempotencyKey::parse("rename-finished").unwrap();
+        let rename_crashed = IdempotencyKey::parse("rename-crashed").unwrap();
+        let kept_journals = [
+            // Recovery pairs an unfinished job with its journal, however old.
+            journal(&old_running.idempotency_key, JournalStatus::Completed, 100),
+            journal(&recent_done.idempotency_key, JournalStatus::Completed, 100),
+            // A rename that stopped midway still needs a person to look at it.
+            journal(&rename_crashed, JournalStatus::Running, 100),
+        ];
+        let pruned_journals = [
+            journal(&old_done.idempotency_key, JournalStatus::Completed, 100),
+            // Its job is forgotten, so it must not resurface as an orphan.
+            journal(&old_failed.idempotency_key, JournalStatus::Running, 100),
+            journal(&renamed, JournalStatus::Completed, 100),
+        ];
+        for record in kept_journals.iter().chain(&pruned_journals) {
+            OperationJournal::begin(&repositories, record)
+                .await
+                .expect("journal");
+        }
+        for entry in [log("old", 100), log("recent", 1)] {
+            OperationLog::append(&repositories, &entry)
+                .await
+                .expect("log");
+        }
+
+        let cutoff = Utc::now() - chrono::TimeDelta::days(90);
+        let removed = JobRepository::prune_history(&repositories, Some(cutoff))
+            .await
+            .expect("prune");
+        assert_eq!(removed, 6);
+
+        for (snapshot, kept) in [
+            (&old_done, false),
+            (&old_failed, false),
+            (&old_running, true),
+            (&recent_done, true),
+        ] {
+            let stored = JobRepository::get(&repositories, snapshot.id)
+                .await
+                .expect("get");
+            assert_eq!(stored.is_some(), kept, "{:?} job", snapshot.status);
+            let events = repositories
+                .store()
+                .count_job_events(&snapshot.id.to_string())
+                .expect("events");
+            assert_eq!(events, u64::from(kept), "{:?} job events", snapshot.status);
+        }
+        for (records, kept) in [(&kept_journals, true), (&pruned_journals, false)] {
+            for record in records {
+                let stored = OperationJournal::get(&repositories, &record.idempotency_key)
+                    .await
+                    .expect("journal");
+                assert_eq!(stored.is_some(), kept, "journal {}", record.idempotency_key);
+            }
+        }
+        let logs = OperationLog::query(
+            &repositories,
+            &LogQuery {
+                area: None,
+                minimum_level: None,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "recent");
+    }
+
+    fn event(
+        job: &JobSnapshot,
+        sequence: u64,
+        event: mkvo_contracts::JobEvent,
+    ) -> JobEventEnvelope {
+        JobEventEnvelope {
+            job_id: job.id,
+            correlation_id: job.correlation_id,
+            sequence,
+            emitted_utc: Utc::now(),
+            event,
+        }
+    }
+
+    async fn stored_events(
+        repositories: &SqliteRepositories,
+        job: &JobSnapshot,
+    ) -> Vec<serde_json::Value> {
+        let id = job.id.to_string();
+        repositories
+            .blocking(move |store| {
+                let connection = store.connection()?;
+                let mut statement = connection.prepare(
+                    "SELECT payload_json FROM job_events WHERE job_id = ?1 ORDER BY sequence",
+                )?;
+                let rows = statement.query_map([id], |row| row.get::<_, String>(0))?;
+                rows.map(|row| serde_json::from_str(&row?).map_err(StoreError::from))
+                    .collect()
+            })
+            .await
+            .expect("events")
+    }
+
+    /// A database written by an older build: an event or two per scanned
+    /// file, and the whole file list in both the result and the final event.
+    /// None of it is read, so it goes even when history is kept forever.
+    #[tokio::test]
+    async fn pruning_clears_what_older_builds_stored_whatever_the_retention() {
+        use mkvo_contracts::{JobEvent, JobLogLevel, JobStatus, JobSummary};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let fat_result = serde_json::json!({
+            "files": ["a".repeat(100_000)],
+            "rows": ["b".repeat(100_000)],
+            "skipped": ["broken.mkv: unreadable"],
+            "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
+        });
+        let slim_result = serde_json::json!({
+            "skipped": ["broken.mkv: unreadable"],
+            "summary": { "total": 1, "mkv": 1, "mp4": 0, "failed": 1, "cached": 0 },
+        });
+        let mut scanned = job(JobStatus::Completed);
+        scanned.result = Some(fat_result.clone());
+        // The process died mid-scan, so there is no final event.
+        let crashed = job(JobStatus::Failed);
+        let current = job(JobStatus::Completed);
+        for snapshot in [&scanned, &crashed, &current] {
+            JobRepository::insert(&repositories, snapshot)
+                .await
+                .expect("insert");
+        }
+
+        let mut per_file = vec![JobEvent::StatusChanged {
+            status: JobStatus::Running,
+        }];
+        for file in 1..=12 {
+            per_file.push(JobEvent::Progress {
+                completed: file,
+                total: 12,
+                current_file: "a.mkv".to_owned(),
+                current_file_percent: 100,
+            });
+            per_file.push(JobEvent::Log {
+                level: JobLogLevel::Warning,
+                line: "Skipped a.mkv".to_owned(),
+            });
+        }
+        let completed = |result| JobEvent::Completed {
+            summary: JobSummary::default(),
+            result,
+        };
+        let mut events = Vec::new();
+        for (sequence, per_file_event) in (0..).zip(&per_file) {
+            events.push(event(&scanned, sequence, per_file_event.clone()));
+            events.push(event(&crashed, sequence, per_file_event.clone()));
+        }
+        events.push(event(&scanned, 25, completed(Some(fat_result))));
+        events.push(event(&current, 7, completed(None)));
+        for envelope in &events {
+            JobRepository::append_event(&repositories, envelope)
+                .await
+                .expect("event");
+        }
+
+        let removed = JobRepository::prune_history(&repositories, None)
+            .await
+            .expect("prune");
+        assert_eq!(removed, 50);
+
+        let kept = stored_events(&repositories, &scanned).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["event"]["type"], "completed");
+        assert_eq!(kept[0]["event"]["result"], slim_result);
+        assert!(stored_events(&repositories, &crashed).await.is_empty());
+        assert_eq!(stored_events(&repositories, &current).await.len(), 1);
+
+        let stored = JobRepository::get(&repositories, scanned.id)
+            .await
+            .expect("get")
+            .expect("history is kept forever, so the job stays");
+        assert_eq!(stored.result, Some(slim_result));
+    }
+
+    /// The first prune of an old database has hundreds of thousands of rows
+    /// to delete while requests are being served on the same connection.
+    #[tokio::test]
+    async fn job_events_are_deleted_in_bounded_batches() {
+        use mkvo_contracts::{JobEvent, JobStatus};
+
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let scanned = job(JobStatus::Canceled);
+        JobRepository::insert(&repositories, &scanned)
+            .await
+            .expect("insert");
+        for sequence in 0..13 {
+            let last = JobEvent::Canceled {
+                message: String::new(),
+            };
+            let status = JobEvent::StatusChanged {
+                status: JobStatus::Running,
+            };
+            let envelope = event(
+                &scanned,
+                sequence,
+                if sequence == 12 { last } else { status },
+            );
+            JobRepository::append_event(&repositories, &envelope)
+                .await
+                .expect("event");
+        }
+
+        let store = repositories.store();
+        let batches: Vec<u64> = (0..4)
+            .map(|_| store.delete_superseded_job_events(5).expect("batch"))
+            .collect();
+        assert_eq!(batches, [5, 5, 2, 0]);
+        let kept = stored_events(&repositories, &scanned).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["event"]["type"], "canceled");
+    }
+
+    fn rename_batch(name: &str, age_days: i64) -> RenameBatchRecord {
+        let original = std::path::PathBuf::from(format!("/library/{name}.mkv"));
+        RenameBatchRecord {
+            id: RenameBatchId::new(),
+            created_at: Utc::now() - chrono::TimeDelta::days(age_days),
+            undone_at: None,
+            provider: None,
+            template: "{title}".to_owned(),
+            entries: vec![mkvo_domain::RenameBatchEntry {
+                renamed_path: original.with_extension("renamed.mkv"),
+                original_fingerprint: FileFingerprint {
+                    path: original.clone(),
+                    size_bytes: 1,
+                    modified_at: Utc::now(),
+                    quick_hash: None,
+                },
+                original_path: original,
+                renamed_fingerprint: None,
+                sidecars: Vec::new(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_batches_applied_before_the_cutoff_go_with_their_entries() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        let old = rename_batch("old", 31);
+        let recent = rename_batch("recent", 29);
+        for batch in [&old, &recent] {
+            RenameHistoryRepository::add(&repositories, batch)
+                .await
+                .expect("add");
+        }
+
+        let cutoff = Utc::now() - chrono::TimeDelta::days(30);
+        let removed = RenameHistoryRepository::remove_before(&repositories, cutoff)
+            .await
+            .expect("remove");
+        assert_eq!(removed, 1);
+
+        let stored = RenameHistoryRepository::list_recent(&repositories, 10)
+            .await
+            .expect("list");
+        assert_eq!(stored, [recent]);
+        let entries: i64 = repositories
+            .store()
+            .connection()
+            .expect("connection")
+            .query_row("SELECT COUNT(*) FROM rename_entries", [], |row| row.get(0))
+            .expect("entries");
+        assert_eq!(entries, 1);
+    }
+
+    /// The level filter has to apply before the limit, or newer quieter
+    /// entries crowd every warning out of the page.
+    #[tokio::test]
+    async fn the_level_filter_applies_before_the_limit() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        for (index, level) in [LogLevel::Error, LogLevel::Warning]
+            .into_iter()
+            .chain([LogLevel::Information; 5])
+            .enumerate()
+        {
+            let mut entry = log(&format!("entry {index}"), 0);
+            entry.timestamp_utc =
+                DateTime::from_timestamp_millis(1_000 + i64::try_from(index).unwrap()).unwrap();
+            entry.level = level;
+            OperationLog::append(&repositories, &entry)
+                .await
+                .expect("append");
+        }
+
+        let entries = OperationLog::query(
+            &repositories,
+            &LogQuery {
+                area: None,
+                minimum_level: Some(LogLevel::Warning),
+                limit: 2,
+            },
+        )
+        .await
+        .expect("query");
+        let levels: Vec<_> = entries.iter().map(|entry| entry.level).collect();
+        assert_eq!(levels, [LogLevel::Warning, LogLevel::Error]);
+    }
+
+    #[tokio::test]
+    async fn expired_plans_are_removed() {
+        let repositories =
+            SqliteRepositories::from_store(SqliteStore::open_in_memory().expect("store"));
+        for (id, expires_at_ms) in [("expired", Some(10)), ("current", Some(i64::MAX))] {
+            repositories
+                .store()
+                .put_plan(&StoredPlan {
+                    id: id.to_owned(),
+                    kind: "rename".to_owned(),
+                    version: 1,
+                    fingerprint: "abc".to_owned(),
+                    payload: serde_json::json!({}),
+                    created_at_ms: 1,
+                    expires_at_ms,
+                })
+                .expect("plan");
+        }
+        let removed = PlanRepository::remove_expired(&repositories, Utc::now())
+            .await
+            .expect("remove");
+        assert_eq!(removed, 1);
+        assert!(
+            repositories
+                .store()
+                .get_plan("current", 20)
+                .expect("plan")
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -10,14 +10,14 @@ impl MkvoRuntime {
         requested: Option<&str>,
         requested_language: Option<&str>,
     ) -> RuntimeResult<Arc<dyn MetadataProviderClient>> {
-        let loaded = self.settings_service().load().await?;
+        let settings = self.settings_service().load_settings().await?;
         let provider = requested
             .map(parse_provider)
             .transpose()?
-            .unwrap_or(loaded.settings.rename.provider);
+            .unwrap_or(settings.rename.provider);
         let language = requested_language
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&loaded.settings.rename.language)
+            .unwrap_or(&settings.rename.language)
             .to_owned();
         match provider {
             MetadataProvider::Tvdb => {
@@ -30,7 +30,7 @@ impl MkvoRuntime {
                     .await?
                     .map(SecretString::new);
                 Ok(Arc::new(ConfiguredTvdbProvider::new(
-                    TvdbClient::new(),
+                    self.inner.providers.tvdb.clone(),
                     ProviderCredentials {
                         api_key: SecretString::new(api_key),
                         pin,
@@ -44,14 +44,14 @@ impl MkvoRuntime {
                     .await?
                     .ok_or_else(|| RuntimeError::invalid("TMDB API key is not configured"))?;
                 Ok(Arc::new(ConfiguredTmdbProvider::new(
-                    TmdbClient::new(),
+                    self.inner.providers.tmdb.clone(),
                     ProviderCredentials::api_key(api_key),
                     language,
                 )))
             }
             // AniList is a public GraphQL API and needs no credentials.
             MetadataProvider::AniList => Ok(Arc::new(ConfiguredAniListProvider::new(
-                AniListClient::new(),
+                self.inner.providers.anilist.clone(),
                 language,
             ))),
             // AniDB identifies callers by a registered client name rather than a
@@ -64,7 +64,7 @@ impl MkvoRuntime {
                     .await?
                     .unwrap_or_default();
                 Ok(Arc::new(ConfiguredAniDbProvider::new(
-                    AniDbClient::new(),
+                    self.inner.providers.anidb.clone(),
                     ProviderCredentials::api_key(client),
                     language,
                 )))
@@ -72,8 +72,47 @@ impl MkvoRuntime {
         }
     }
 
-    pub(crate) async fn current_domain_files(&self) -> Vec<MediaFile> {
+    /// The working-set files whose `key` is in `wanted`, by that key. Only
+    /// those are copied, however large the set is.
+    pub(crate) async fn working_set_by_key(
+        &self,
+        key: impl Fn(&Path) -> String,
+        wanted: &BTreeSet<String>,
+    ) -> HashMap<String, MediaFile> {
+        let state = self.inner.current_scan.read().await;
+        state
+            .files
+            .iter()
+            .filter_map(|file| {
+                let key = key(&file.path);
+                wanted.contains(&key).then(|| (key, file.clone()))
+            })
+            .collect()
+    }
+
+    /// The files of the latest scan that left the working set alone, while
+    /// its job is still in memory.
+    pub(crate) async fn overview_files(&self) -> Option<Arc<Vec<MediaFile>>> {
+        let job = self.inner.current_scan.read().await.overview_job?;
+        self.inner.jobs.attachment(job).await
+    }
+
+    pub(crate) async fn find_working_set_file(
+        &self,
+        mut is_it: impl FnMut(&MediaFile) -> bool,
+    ) -> Option<MediaFile> {
+        let state = self.inner.current_scan.read().await;
+        state.files.iter().find(|file| is_it(file)).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn working_set_files(&self) -> Vec<MediaFile> {
         self.inner.current_scan.read().await.files.clone()
+    }
+
+    pub(crate) async fn working_set_paths(&self) -> BTreeSet<PathBuf> {
+        let state = self.inner.current_scan.read().await;
+        state.files.iter().map(|file| file.path.clone()).collect()
     }
 
     pub(crate) fn dependencies(&self) -> &RuntimeDependencies {

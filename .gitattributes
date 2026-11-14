@@ -1,2 +1,4 @@
 # Shell scripts must keep LF endings so they run inside the Linux container.
 *.sh text eol=lf
+# Generated contracts are compared byte for byte by mkvo-contract-gen --check.
+web/src/generated/** text eol=lf

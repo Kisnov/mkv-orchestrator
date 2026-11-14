@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Copy, Download, FileDown, RefreshCw, Trash2 } from "lucide-react";
 import { clearOperationLogs, exportOperationLogs, getOperationLogs, OperationLogEntry } from "../api";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { SectionHeader } from "../components/SectionHeader";
 
 export function LogsPage() {
@@ -10,6 +11,7 @@ export function LogsPage() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [areaFilter, setAreaFilter] = useState("All");
   const [statusText, setStatusText] = useState("");
+  const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
   const clear = useMutation({
     mutationFn: clearOperationLogs,
     onSuccess: () => {
@@ -18,6 +20,11 @@ export function LogsPage() {
       logs.refetch();
     }
   });
+  const [exportError, setExportError] = useState<unknown>(null);
+  // One line per failing source, so a standing load error does not hide a later one.
+  const failures = ([[logs.error, "Logs could not be loaded."], [clear.error, "Logs could not be cleared."], [exportError, "Logs could not be exported."]] as const)
+    .filter(([error]) => error !== null)
+    .map(([error, fallback]) => (error instanceof Error && error.message) || fallback);
   const entries = logs.data?.entries ?? [];
   const areas = useMemo(() => ["All", ...Array.from(new Set(entries.map((entry) => entry.area))).sort()], [entries]);
   const visibleEntries = useMemo(() => {
@@ -35,7 +42,9 @@ export function LogsPage() {
   // The whole log is rendered by the backend so the export matches what the
   // server actually recorded, not just the entries this page has fetched.
   async function exportAllLogs() {
-    const exported = await exportOperationLogs();
+    setExportError(null);
+    const exported = await exportOperationLogs().catch((error: unknown) => { setExportError(error); return null; });
+    if (!exported) return;
     const blob = new Blob([exported.content], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -67,13 +76,13 @@ export function LogsPage() {
           <div className="flex items-center justify-between">
             <h2 className="text-base font-semibold">Recent Operations</h2>
             <div className="flex gap-2">
-              <button onClick={() => logs.refetch()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Refresh">
+              <button onClick={() => logs.refetch()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Refresh" aria-label="Refresh logs">
                 <RefreshCw size={15} />
               </button>
-              <button onClick={exportAllLogs} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Export all logs">
+              <button onClick={exportAllLogs} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Export all logs" aria-label="Export all logs">
                 <FileDown size={15} />
               </button>
-              <button onClick={() => clear.mutate()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Clear">
+              <button onClick={() => setIsClearConfirmOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-button text-muted hover:bg-button-hover hover:text-text" title="Clear" aria-label="Clear logs">
                 <Trash2 size={15} />
               </button>
             </div>
@@ -99,9 +108,12 @@ export function LogsPage() {
             </label>
           </div>
 
+          {failures.map((failure, index) => <div key={index} role="alert" className="mt-4 rounded-md border border-warning bg-panel px-3 py-2 text-sm text-warning">{failure}</div>)}
           <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-panel">
             {visibleEntries.length === 0 ? (
-              <div className="flex h-full min-h-[18.75rem] items-center justify-center text-sm text-subtle">No operation logs yet.</div>
+              <div className="flex h-full min-h-[18.75rem] items-center justify-center text-sm text-subtle">
+                {logs.isLoading ? "Loading logs..." : logs.isError ? "Logs could not be loaded." : "No operation logs yet."}
+              </div>
             ) : visibleEntries.map((entry, index) => (
               <button
                 key={`${entry.timestampUtc}-${entry.area}-${index}`}
@@ -153,6 +165,15 @@ export function LogsPage() {
           )}
         </section>
       </div>
+      {isClearConfirmOpen ? (
+        <ConfirmModal
+          title="Clear Logs"
+          message="This permanently deletes every recorded operation log. Export them first if you need a copy."
+          confirmLabel="Clear Logs"
+          onConfirm={() => { setIsClearConfirmOpen(false); clear.mutate(); }}
+          onClose={() => setIsClearConfirmOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }

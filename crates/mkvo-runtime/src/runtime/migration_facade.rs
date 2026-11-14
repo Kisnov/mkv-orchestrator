@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::*;
 
 impl MkvoRuntime {
@@ -175,10 +177,7 @@ impl MkvoRuntime {
             journal_enumeration_supported: false,
             limitations: Vec::new(),
         };
-        for mut snapshot in self.inner.dependencies.jobs.list_recent(1_000).await? {
-            if snapshot.status.is_terminal() {
-                continue;
-            }
+        for mut snapshot in self.inner.dependencies.jobs.list_unfinished().await? {
             let previous_status = snapshot.status;
             let journal = self
                 .inner
@@ -226,6 +225,15 @@ impl MkvoRuntime {
         match self.inner.dependencies.journal.list_incomplete().await? {
             Some(journals) => {
                 report.journal_enumeration_supported = true;
+                if persist {
+                    // In the background: a share that does not answer must not hold up startup.
+                    let (runtime, journals) = (self.clone(), journals.clone());
+                    tokio::spawn(async move {
+                        runtime
+                            .clean_stale_temporaries(journals, STALE_FOLDER_TIMEOUT)
+                            .await;
+                    });
+                }
                 for journal in journals {
                     if self
                         .inner
@@ -277,4 +285,162 @@ impl MkvoRuntime {
         }
         Ok(report)
     }
+
+    /// Removes the temporaries an interrupted job left next to an intact original, and
+    /// keeps (with a warning) any that may be the only copy. Reads only the folders the
+    /// journals claim, each once and for at most `folder_timeout`.
+    pub(crate) async fn clean_stale_temporaries(
+        &self,
+        journals: Vec<mkvo_application::JournalRecord>,
+        folder_timeout: Duration,
+    ) {
+        let mut remuxes = Vec::new();
+        for journal in journals {
+            // Only a remux writes these temporaries; another kind's claim says nothing about them.
+            if let Ok(Some(job)) = self
+                .inner
+                .dependencies
+                .jobs
+                .find_by_idempotency(&journal.idempotency_key)
+                .await
+                && matches!(
+                    job.kind,
+                    JobKind::Remux
+                        | JobKind::ConvertToMkv
+                        | JobKind::MuxSubtitles
+                        | JobKind::ExtractSubtitles
+                )
+            {
+                remuxes.push(journal);
+            }
+        }
+        let journals = remuxes;
+        let mut folders =
+            std::collections::BTreeMap::<_, (&Path, Vec<&mkvo_application::JournalRecord>)>::new();
+        for journal in &journals {
+            for folder in journal
+                .resources
+                .iter()
+                .filter_map(|claim| claim.path.parent())
+            {
+                let (_, claimants) = folders
+                    .entry(mkvo_domain::path_key(folder))
+                    .or_insert((folder, Vec::new()));
+                if !claimants
+                    .iter()
+                    .any(|claimant| std::ptr::eq(*claimant, journal))
+                {
+                    claimants.push(journal);
+                }
+            }
+        }
+        for (folder, claimants) in folders.values() {
+            let cleaned = self.clean_stale_folder(folder, claimants);
+            if tokio::time::timeout(folder_timeout, cleaned).await.is_err() {
+                tracing::warn!(folder = %folder.display(), "timed out looking for files an interrupted job left behind");
+            }
+        }
+    }
+
+    async fn clean_stale_folder(
+        &self,
+        folder: &Path,
+        journals: &[&mkvo_application::JournalRecord],
+    ) {
+        let file_system = &self.inner.dependencies.file_system;
+        let Ok(listed) = file_system.list_files(folder).await else {
+            return;
+        };
+        for name in listed.iter().filter_map(|path| path.file_name()?.to_str()) {
+            let Some((original, extraction)) = temporary_original(name) else {
+                continue;
+            };
+            let original = folder.join(original);
+            let key = mkvo_domain::path_key(&original);
+            let claimants: Vec<_> = journals
+                .iter()
+                .filter(|journal| {
+                    journal
+                        .resources
+                        .iter()
+                        .any(|claim| mkvo_domain::path_key(&claim.path) == key)
+                })
+                .collect();
+            if claimants.is_empty() {
+                continue;
+            }
+            let temporary = folder.join(name);
+            let mut items = claimants.iter().flat_map(|journal| &journal.items);
+            let completed = if extraction {
+                // A subtitle is named after its source: "Ep 01.eng.2.srt" belongs to "Ep 01.mkv".
+                let subtitle = original.file_name().unwrap_or_default().to_string_lossy();
+                let source = items
+                    .filter(|item| {
+                        let source = Path::new(&item.key);
+                        same_path(source.parent().unwrap_or(source), folder)
+                            && source.file_stem().is_some_and(|stem| {
+                                subtitle.starts_with(&format!("{}.", stem.to_string_lossy()))
+                            })
+                    })
+                    .max_by_key(|item| item.key.len());
+                let Some(source) = source else {
+                    continue;
+                };
+                source.status == mkvo_application::JournalItemStatus::Completed
+            } else {
+                items.any(|item| {
+                    item.status == mkvo_application::JournalItemStatus::Completed
+                        && mkvo_domain::path_key(Path::new(&item.key)) == key
+                })
+            };
+            if completed {
+                tracing::warn!(path = %temporary.display(), "an interrupted job left this file; it was kept");
+                continue;
+            }
+            // A job started since startup may be writing this very file: take its lease first.
+            let claims = [
+                mkvo_domain::ResourceClaim::write(temporary.clone()),
+                mkvo_domain::ResourceClaim::write(original.clone()),
+            ];
+            let removal =
+                self.jobs()
+                    .with_resource_lease(&claims, CancellationToken::new(), || async {
+                        // Extraction only reads the source, so its temporary is never the only copy.
+                        if !extraction && !file_system.exists(&original).await.unwrap_or(false) {
+                            return Ok(false);
+                        }
+                        file_system.remove_file(&temporary).await?;
+                        Ok(true)
+                    });
+            match tokio::time::timeout(STALE_LEASE_WAIT, removal).await {
+                Err(_) => {
+                    tracing::info!(path = %temporary.display(), "a running job is using this file; it was left alone");
+                }
+                Ok(Ok(true)) => {
+                    tracing::info!(path = %temporary.display(), "removed a file an interrupted job left behind");
+                }
+                Ok(Ok(false)) => tracing::warn!(
+                    path = %temporary.display(),
+                    "an interrupted job left this file and it may be the only copy; it was kept"
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(path = %temporary.display(), %error, "an interrupted job left this file and it could not be removed");
+                }
+            }
+        }
+    }
+}
+
+const STALE_FOLDER_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_LEASE_WAIT: Duration = Duration::from_millis(100);
+
+/// The file a remux or extraction temporary was written for, and whether it is an extraction.
+fn temporary_original(name: &str) -> Option<(&str, bool)> {
+    let inner = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    if let Some(original) = inner.strip_suffix(".mkvo-remux") {
+        return Some((original, false));
+    }
+    let (original, track) = inner.rsplit_once(".mkvo-extract-")?;
+    (!track.is_empty() && track.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((original, true))
 }

@@ -1,30 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { AlertTriangle, CheckCircle2, Film, RefreshCw, Search, X } from "lucide-react";
 import {
+  ApiError,
   buildLibraryAudit,
   cancelScan,
+  CurrentScanResponse,
   getLibraryArtwork,
   getLibraryCatalog,
   getLibraryLocalArtwork,
+  getCurrentScanFiles,
   getScanJob,
   getWebSettings,
+  libraryArtworkUrl,
   LibraryAuditResponse,
   LibraryAuditRow,
   LibraryCatalogItem,
   MediaFileRow,
+  setFileSelection,
   startScan,
   WebSettings
 } from "../api";
 import { SectionHeader } from "../components/SectionHeader";
-import { useMediaLibrary } from "../state/MediaLibraryContext";
+import { useMediaLibraryActions } from "../state/MediaLibraryContext";
 
 type LibraryFilter = "all" | "matching" | "mismatch";
 
+// Only the audit is kept: the file rows come back from the backend on a handoff.
 type LibraryViewSnapshot = {
   auditResult: LibraryAuditResponse;
-  libraryFiles: MediaFileRow[];
   statusText: string;
   artworkGeneration: number;
 };
@@ -44,6 +49,7 @@ type PendingTitleRebuild = {
 // in memory and mirror completed snapshots to IndexedDB, which avoids the small
 // synchronous Web Storage quota while surviving navigation and browser reloads.
 const libraryViewCache = new Map<string, LibraryViewSnapshot>();
+const scanResultsLost = "The scan results are no longer held. Scan the library again.";
 
 export function resetLibraryViewCacheForTests() {
   libraryViewCache.clear();
@@ -52,10 +58,9 @@ export function resetLibraryViewCacheForTests() {
 export function LibraryPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { setWorkingView } = useMediaLibrary();
+  const { setWorkingView } = useMediaLibraryActions();
   const webSettings = useQuery({ queryKey: ["web-settings"], queryFn: getWebSettings });
   const [auditResult, setAuditResult] = useState<LibraryAuditResponse | null>(null);
-  const [libraryFiles, setLibraryFiles] = useState<MediaFileRow[]>([]);
   const [selectedTitleId, setSelectedTitleId] = useState("");
   const [selectedSource, setSelectedSource] = useState("");
   const [scanJobId, setScanJobId] = useState<string | null>(null);
@@ -67,6 +72,10 @@ export function LibraryPage() {
   const [artworkGeneration, setArtworkGeneration] = useState(0);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; titleId: string } | null>(null);
   const [pendingTitleRebuild, setPendingTitleRebuild] = useState<PendingTitleRebuild | null>(null);
+  const [rejectedPosterServers, setRejectedPosterServers] = useState<Record<string, string>>({});
+  const probedPosterServers = useRef(new Set<string>());
+  const [handoff, setHandoff] = useState({ sending: false, message: "" });
+  const handoffRunning = useRef(false);
   const selectedSourceRef = useRef(selectedSource);
   const buildSourcesRef = useRef<LibrarySourceOption[]>([]);
   const automaticBuildKey = useRef("");
@@ -105,7 +114,7 @@ export function LibraryPage() {
   });
 
   const scanStart = useMutation({
-    mutationFn: startScan,
+    mutationFn: (request: { sources: string[]; ignoredFolderNames: string[]; forceRefresh: boolean }) => startScan({ ...request, keepWorkingSet: true }),
     onSuccess: (job) => {
       setScanJobId(job.id);
       setPendingOverviewScanId(job.id);
@@ -117,7 +126,7 @@ export function LibraryPage() {
     }
   });
   const titleScanStart = useMutation({
-    mutationFn: ({ title: _title, sourceId: _sourceId, ...request }: { title: LibraryTitle; sourceId: string; sources: string[]; ignoredFolderNames: string[]; forceRefresh: boolean }) => startScan(request),
+    mutationFn: ({ title: _title, sourceId: _sourceId, ...request }: { title: LibraryTitle; sourceId: string; sources: string[]; ignoredFolderNames: string[]; forceRefresh: boolean }) => startScan({ ...request, keepWorkingSet: true }),
     onSuccess: (job, variables) => {
       setScanJobId(job.id);
       setPendingTitleRebuild({ jobId: job.id, sourceId: variables.sourceId, title: variables.title });
@@ -137,6 +146,7 @@ export function LibraryPage() {
     queryKey: ["library-cache-job", scanJobId],
     queryFn: () => getScanJob(scanJobId!),
     enabled: scanJobId !== null,
+    gcTime: 0,
     refetchInterval: (query) => {
       const job = query.state.data;
       return job && ["Completed", "Failed", "Skipped", "Canceled"].includes(job.status) ? false : 1000;
@@ -161,18 +171,27 @@ export function LibraryPage() {
         : `Scanning library: ${progressText}`);
       return;
     }
-    if (currentScanJob.status === "Completed" && currentScanJob.id === pendingTitleRebuild?.jobId) {
+    // The server holds a Library scan's files only for a while; counts without them are not an empty library.
+    const filesLost = currentScanJob.status === "Completed" && currentScanJob.files.length === 0 && currentScanJob.summary.total > 0;
+    if (filesLost && currentScanJob.id === pendingTitleRebuild?.jobId) {
+      setPendingTitleRebuild(null);
+      setStatusText(scanResultsLost);
+    } else if (filesLost && currentScanJob.id === pendingOverviewScanId) {
+      setPendingOverviewScanId(null);
+      setStatusText(scanResultsLost);
+    } else if (currentScanJob.status === "Completed" && currentScanJob.id === pendingTitleRebuild?.jobId) {
       const pending = pendingTitleRebuild;
       setPendingTitleRebuild(null);
       setIsAuditingLibraries(true);
+      // The audit needs only the paths; dropping the job lets its rows go.
+      setScanJobId(null);
       void buildLibraryAudit(currentScanJob.files).then((response) => {
-        const snapshot = mergeTitleSnapshot(pending.sourceId, pending.title, currentScanJob.files, response);
+        const snapshot = mergeTitleSnapshot(pending.sourceId, pending.title, response);
         libraryViewCache.set(pending.sourceId, snapshot);
         const source = sourceOptions.find((candidate) => candidate.id === pending.sourceId);
         if (source) void persistLibrarySnapshot(source.id, librarySnapshotSignature(source, webSettings.data), snapshot);
         if (mounted.current && selectedSourceRef.current === pending.sourceId) {
           setAuditResult(snapshot.auditResult);
-          setLibraryFiles(snapshot.libraryFiles);
           setArtworkGeneration(snapshot.artworkGeneration);
           setStatusText(snapshot.statusText);
         }
@@ -184,16 +203,16 @@ export function LibraryPage() {
     } else if (currentScanJob.status === "Completed" && currentScanJob.id === pendingOverviewScanId) {
       setPendingOverviewScanId(null);
       setIsAuditingLibraries(true);
+      setScanJobId(null);
       const sources = buildSourcesRef.current;
       void Promise.allSettled(sources.map(async (source) => {
         const files = filesForLibrarySource(currentScanJob.files, source);
         const response = await buildLibraryAudit(files);
-        const snapshot = librarySnapshot(source.id, files, response);
+        const snapshot = librarySnapshot(source.id, response);
         libraryViewCache.set(source.id, snapshot);
         void persistLibrarySnapshot(source.id, librarySnapshotSignature(source, webSettings.data), snapshot);
         if (mounted.current && selectedSourceRef.current === source.id) {
           setAuditResult(snapshot.auditResult);
-          setLibraryFiles(snapshot.libraryFiles);
           setArtworkGeneration(snapshot.artworkGeneration);
           setStatusText(snapshot.statusText);
         }
@@ -260,14 +279,15 @@ export function LibraryPage() {
         if (libraryViewCache.has(source.id)) continue;
         const stored = await loadLibrarySnapshot(source.id);
         if (!canceled && stored?.signature === librarySnapshotSignature(source, webSettings.data)) {
-          libraryViewCache.set(source.id, stored.snapshot);
+          // Older snapshots also stored every file row; keep only what is used.
+          const { auditResult, statusText, artworkGeneration } = stored.snapshot;
+          libraryViewCache.set(source.id, { auditResult, statusText, artworkGeneration });
         }
       }
       if (canceled) return;
       const restored = libraryViewCache.get(selectedSourceRef.current);
       if (restored) {
         setAuditResult(restored.auditResult);
-        setLibraryFiles(restored.libraryFiles);
         setArtworkGeneration(restored.artworkGeneration);
         setStatusText(restored.statusText);
       }
@@ -294,6 +314,35 @@ export function LibraryPage() {
     });
   }, [filter, searchText, titles]);
   const selectedTitle = titles.find((title) => title.id === selectedTitleId) ?? null;
+  const selectedServerId = selectedSourceOption?.serverId;
+  const credentialMessage = (isCredentialError(catalog.error) ? catalog.error.message : undefined)
+    ?? (selectedServerId ? rejectedPosterServers[selectedServerId] : undefined);
+
+  const openPosterMenu = useCallback((event: React.MouseEvent<HTMLButtonElement>, titleId: string) => {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY, titleId });
+  }, []);
+
+  // An <img> cannot say why it failed, so a failure asks the server, one question at a time.
+  const reportServerPosterError = useCallback((serverId: string, itemId: string, error?: unknown) => {
+    const remember = (reason: unknown) => {
+      if (!isCredentialError(reason)) return;
+      setRejectedPosterServers((current) => current[serverId] ? current : { ...current, [serverId]: reason.message });
+    };
+    if (error !== undefined) {
+      remember(error);
+      return;
+    }
+    if (probedPosterServers.current.has(serverId)) return;
+    probedPosterServers.current.add(serverId);
+    getLibraryArtwork({ serverId, itemId }).then(() => false, (reason: unknown) => {
+      remember(reason);
+      return isCredentialError(reason);
+    }).then((rejected) => {
+      // Only a refused key ends the questions; a missing poster says nothing about it.
+      if (!rejected) probedPosterServers.current.delete(serverId);
+    });
+  }, []);
 
   function selectSource(id: string) {
     activateSource(id);
@@ -306,7 +355,6 @@ export function LibraryPage() {
     const cached = libraryViewCache.get(id);
     setSelectedSource(id);
     setAuditResult(cached?.auditResult ?? null);
-    setLibraryFiles(cached?.libraryFiles ?? []);
     setArtworkGeneration(cached?.artworkGeneration ?? 0);
     setStatusText(cached?.statusText ?? "Loading this library automatically...");
   }
@@ -315,11 +363,6 @@ export function LibraryPage() {
     if (sourceOptions.length === 0) {
       setStatusText("Configure a library first.");
       return;
-    }
-    // Keep a completed view visible during Refresh/Rebuild. It is replaced
-    // atomically when the new scan and audit finish.
-    if (!auditResult) {
-      setLibraryFiles([]);
     }
     setSelectedTitleId("");
     startLibraryBuild(forceRefresh);
@@ -357,14 +400,46 @@ export function LibraryPage() {
     });
   }
 
-  function handoffToDashboard(title: LibraryTitle, mode: "mismatch" | "all") {
+  async function handoffToScan(title: LibraryTitle, mode: "mismatch" | "all") {
+    if (handoffRunning.current) return;
+    handoffRunning.current = true;
+    try {
+      await sendToScan(title, mode);
+    } finally {
+      handoffRunning.current = false;
+    }
+  }
+
+  async function sendToScan(title: LibraryTitle, mode: "mismatch" | "all") {
     const paths = mode === "all"
       ? title.allFilePaths
       : uniquePaths(title.seasons.flatMap((season) => season.hasIssues ? [season.templateFilePath, ...season.issueFilePaths] : []));
     const wanted = new Set(paths.map(normalizePath));
-    const selectedFiles = libraryFiles.filter((file) => wanted.has(normalizePath(file.path)));
+    const fail = (message: string) => {
+      if (mounted.current) setHandoff({ sending: false, message });
+    };
+    setHandoff({ sending: true, message: `Sending ${title.title} to Scan...` });
+    try {
+      // The backend reads these files from its probe cache and holds them as the working set.
+      await setFileSelection(paths, true);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "The files could not be sent to Scan.");
+      return;
+    }
+    let scan: CurrentScanResponse;
+    try {
+      scan = await getCurrentScanFiles();
+    } catch (error) {
+      // The backend took the files; Scan picks them up when it next reads them.
+      void queryClient.invalidateQueries({ queryKey: ["current-scan-files"] });
+      fail(`The files were sent, but could not be loaded back: ${error instanceof Error ? error.message : "request failed"}`);
+      return;
+    }
+    if (!mounted.current) return;
+    const selectedFiles = scan.files.filter((file) => wanted.has(normalizePath(file.path)));
     if (selectedFiles.length === 0) {
-      setStatusText("The selected title has no scanned files available for Dashboard.");
+      // The backend kept its working set, so Scan is untouched.
+      fail("None of this title's files could be read, so the scanned files were left as they were.");
       return;
     }
     const templatePath = title.seasons.find((season) => season.hasIssues)?.templateFilePath
@@ -375,30 +450,19 @@ export function LibraryPage() {
       if (normalizePath(right.path) === normalizePath(templatePath)) return 1;
       return left.path.localeCompare(right.path);
     });
-    // Replace Dashboard's previous scan cache before navigation. Otherwise an
+    // Replace Scan's previous scan cache before navigation. Otherwise an
     // already cached or in-flight response can restore the old file list until
     // the whole browser is refreshed.
     void queryClient.cancelQueries({ queryKey: ["current-scan-files"] });
     const selectedPaths = selectedFiles.map((file) => file.path);
-    queryClient.setQueryData(["current-scan-files"], {
-      updatedUtc: new Date().toISOString(),
-      files: selectedFiles,
-      selectedPaths,
-      summary: {
-        total: selectedFiles.length,
-        mkv: selectedFiles.filter((file) => file.extension.toLowerCase() === ".mkv").length,
-        mp4: selectedFiles.filter((file) => file.extension.toLowerCase() === ".mp4").length,
-        failed: selectedFiles.filter((file) => file.status.toLowerCase().includes("failed")).length,
-        cached: selectedFiles.filter((file) => file.status.toLowerCase().includes("cached")).length
-      }
-    });
+    queryClient.setQueryData(["current-scan-files"], scan);
     try {
       window.sessionStorage.setItem("mkvo.web.scanSources", JSON.stringify(titleSourcePaths(title)));
     } catch {
       // The in-memory working view remains authoritative for this tab.
     }
     setWorkingView(selectedFiles, selectedPaths, templatePath);
-    navigate("/dashboard");
+    navigate("/dashboard/scan");
   }
 
   const mismatchCount = titles.filter((title) => title.hasIssues).length;
@@ -406,7 +470,7 @@ export function LibraryPage() {
 
   return (
     <div className="workspace-page flex h-full min-h-0 flex-col">
-      <SectionHeader title="Library" description="Browse your media as posters, review metadata health, and send repair batches to Dashboard." />
+      <SectionHeader title="Library" description="Browse your media as posters, review metadata health, and send repair batches to Scan." />
 
       <section className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card shadow-[0_1.25rem_3.75rem_rgba(0,0,0,0.18)]">
         <div className="shrink-0 border-b border-border px-5 pt-4">
@@ -451,16 +515,23 @@ export function LibraryPage() {
           </div>
           <div className={`truncate text-xs ${isBusy ? "text-accent" : "text-subtle"}`} title={statusText}>{statusText}</div>
         </div>
+        {credentialMessage ? (
+          <div role="alert" className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-warning/10 px-5 py-2 text-xs text-warning">
+            <span className="min-w-0">{credentialMessage} Media-server posters are paused.</span>
+            <Link to="/settings" className="shrink-0 font-semibold underline">Open Settings</Link>
+          </div>
+        ) : null}
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {isBusy && !auditResult ? (
-            <div className="grid h-full min-h-72 place-items-center text-sm text-muted"><div className="text-center"><RefreshCw size={28} className="mx-auto mb-3 animate-spin text-accent" />Scanning {progressText}</div></div>
+            <div className="grid h-full min-h-72 place-items-center text-sm text-muted"><div className="text-center"><RefreshCw size={28} className="mx-auto mb-3 animate-spin text-accent" />{isAuditingLibraries ? "Auditing the scanned files..." : `Scanning ${progressText}`}</div></div>
           ) : displayedTitles.length > 0 ? (
             <div className="grid gap-x-5 gap-y-6 [grid-template-columns:repeat(auto-fill,minmax(9.375rem,1fr))]">
-              {displayedTitles.map((title) => <LibraryPosterCard key={title.id} title={title} serverId={selectedSourceOption?.serverId} artworkGeneration={artworkGeneration} onOpen={() => setSelectedTitleId(title.id)} onContextMenu={(event) => {
-                event.preventDefault();
-                setContextMenu({ x: event.clientX, y: event.clientY, titleId: title.id });
-              }} />)}
+              {displayedTitles.map((title) => {
+                const serverPoster = Boolean(selectedServerId && title.catalogItem?.hasPoster && !credentialMessage);
+                const posterUrl = serverPoster ? libraryArtworkUrl({ serverId: selectedServerId!, itemId: title.catalogItem!.id }, artworkGeneration) : undefined;
+                return <LibraryPosterCard key={title.id} title={title} serverId={selectedServerId} posterUrl={posterUrl} inlineServerPoster={serverPoster && posterUrl === undefined} artworkGeneration={artworkGeneration} onServerPosterError={reportServerPosterError} onOpen={setSelectedTitleId} onContextMenu={openPosterMenu} />;
+              })}
             </div>
           ) : (
             <div className="grid h-full min-h-72 place-items-center rounded-lg border border-dashed border-border bg-panel/40 px-6 text-center text-sm text-subtle">
@@ -470,35 +541,80 @@ export function LibraryPage() {
         </div>
       </section>
 
-      {selectedTitle ? <LibraryTitleDialog title={selectedTitle} serverId={selectedSourceOption?.serverId} onClose={() => setSelectedTitleId("")} onSendMismatches={() => handoffToDashboard(selectedTitle, "mismatch")} onSendAll={() => handoffToDashboard(selectedTitle, "all")} onRebuild={() => rebuildTitle(selectedTitle)} /> : null}
+      {selectedTitle ? <LibraryTitleDialog title={selectedTitle} serverId={selectedSourceOption?.serverId} sending={handoff.sending} handoffMessage={handoff.message} onClose={() => {
+        setSelectedTitleId("");
+        if (!handoff.sending) setHandoff({ sending: false, message: "" });
+      }} onSendMismatches={() => void handoffToScan(selectedTitle, "mismatch")} onSendAll={() => void handoffToScan(selectedTitle, "all")} onRebuild={() => rebuildTitle(selectedTitle)} /> : null}
       {contextMenu ? <LibraryPosterContextMenu x={contextMenu.x} y={contextMenu.y} title={titles.find((title) => title.id === contextMenu.titleId) ?? null} disabled={isBusy} onRebuild={rebuildTitle} /> : null}
     </div>
   );
 }
 
-function LibraryPosterCard({ title, serverId, artworkGeneration, onOpen, onContextMenu }: { title: LibraryTitle; serverId?: string; artworkGeneration: number; onOpen: () => void; onContextMenu: (event: React.MouseEvent<HTMLButtonElement>) => void }) {
+function isCredentialError(error: unknown): error is ApiError {
+  return error instanceof ApiError && (error.code === "credential_rejected" || error.code === "credential_insufficient");
+}
+
+/** True once the element has been on screen; without IntersectionObserver, at once. */
+function useSeenOnScreen<T extends Element>() {
+  const ref = useRef<T>(null);
+  const [seen, setSeen] = useState(typeof IntersectionObserver === "undefined");
+  useEffect(() => {
+    if (seen || !ref.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setSeen(true);
+    });
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [seen]);
+  return [ref, seen] as const;
+}
+
+type PosterCardProps = {
+  title: LibraryTitle;
+  serverId?: string;
+  /** The media-server poster as an image URL (web). */
+  posterUrl?: string;
+  /** Ask for the media-server poster inline, where there is no image URL (desktop). */
+  inlineServerPoster: boolean;
+  artworkGeneration: number;
+  onOpen: (titleId: string) => void;
+  onContextMenu: (event: React.MouseEvent<HTMLButtonElement>, titleId: string) => void;
+  onServerPosterError: (serverId: string, itemId: string, error?: unknown) => void;
+};
+
+// Memoised so progress text and filter typing do not repaint every card; off-screen
+// cards skip rendering, and the padding keeps the hover lift and ring inside their paint box.
+const LibraryPosterCard = memo(function LibraryPosterCard({ title, serverId, posterUrl, inlineServerPoster, artworkGeneration, onOpen, onContextMenu, onServerPosterError }: PosterCardProps) {
+  const [card, seen] = useSeenOnScreen<HTMLButtonElement>();
+  const [posterFailed, setPosterFailed] = useState(false);
+  const serverPoster = posterUrl && !posterFailed ? posterUrl : "";
   const artwork = useQuery({
-    queryKey: ["library-artwork", serverId, title.catalogItem?.id, title.id, artworkGeneration],
+    queryKey: ["library-artwork", serverId, title.catalogItem?.id, title.id, artworkGeneration, inlineServerPoster],
     queryFn: async () => {
-      if (serverId && title.catalogItem?.hasPoster) {
+      if (inlineServerPoster && serverId && title.catalogItem) {
         try {
           return await getLibraryArtwork({ serverId, itemId: title.catalogItem.id });
-        } catch {
-          // The media-server catalog can advertise a stale or inaccessible
-          // primary image. Fall through to local poster discovery.
+        } catch (error) {
+          // A stale or inaccessible primary image falls through to a local poster.
+          onServerPosterError(serverId, title.catalogItem.id, error);
         }
       }
       return getLibraryLocalArtwork({ folderPaths: title.seasons.map((season) => season.folderPath) });
     },
-    enabled: title.seasons.length > 0,
-    staleTime: Number.POSITIVE_INFINITY,
-    gcTime: Number.POSITIVE_INFINITY
+    enabled: !serverPoster && seen && title.seasons.length > 0,
+    staleTime: Number.POSITIVE_INFINITY
   });
-  const imageUrl = artwork.data ? `data:${artwork.data.contentType};base64,${artwork.data.dataBase64}` : "";
+  const imageUrl = serverPoster || (artwork.data ? `data:${artwork.data.contentType};base64,${artwork.data.dataBase64}` : "");
+  const onImageError = serverPoster && serverId && title.catalogItem
+    ? () => {
+      setPosterFailed(true);
+      onServerPosterError(serverId, title.catalogItem!.id);
+    }
+    : undefined;
   return (
-    <button type="button" onClick={onOpen} onContextMenu={onContextMenu} className="group min-w-0 select-none text-left" title={title.title} aria-label={`Open ${title.title} library details`}>
+    <button ref={card} type="button" onClick={() => onOpen(title.id)} onContextMenu={(event) => onContextMenu(event, title.id)} className="group -m-1 min-w-0 select-none p-1 text-left [contain-intrinsic-size:auto_9.875rem_auto_18.5rem] [content-visibility:auto]" title={title.title} aria-label={`Open ${title.title} library details`}>
       <div className="relative aspect-[2/3] overflow-hidden rounded-xl bg-[#64748B] ring-1 ring-border transition duration-150 group-hover:-translate-y-1 group-hover:ring-2 group-hover:ring-accent group-focus-visible:ring-2 group-focus-visible:ring-accent">
-        {imageUrl ? <img src={imageUrl} alt={`${title.title} poster`} loading="lazy" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center bg-[#64748B] px-4 text-center text-xs font-bold uppercase tracking-wider text-white"><div><Film size={34} className="mx-auto mb-3 opacity-80" />No poster found</div></div>}
+        {imageUrl ? <img src={imageUrl} alt={`${title.title} poster`} loading="lazy" onError={onImageError} className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center bg-[#64748B] px-4 text-center text-xs font-bold uppercase tracking-wider text-white"><div><Film size={34} className="mx-auto mb-3 opacity-80" />No poster found</div></div>}
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-2 pb-2 pt-10">
           <span className={`inline-flex rounded-md px-2 py-1 text-[0.6875rem] font-semibold uppercase tracking-wide ${title.hasIssues ? "bg-warning/20 text-warning" : "bg-success/20 text-success"}`}>{title.hasIssues ? `Mismatch · ${title.mismatchFileCount}` : "Match"}</span>
         </div>
@@ -506,7 +622,7 @@ function LibraryPosterCard({ title, serverId, artworkGeneration, onOpen, onConte
       <div className="mt-2 px-0.5"><div className="truncate text-sm font-semibold text-text">{title.title}</div><div className="mt-0.5 truncate text-xs text-subtle">{title.catalogItem?.year ? `${title.catalogItem.year} · ` : ""}{title.seasons.length} season{title.seasons.length === 1 ? "" : "s"} · {title.fileCount} files</div></div>
     </button>
   );
-}
+});
 
 function LibraryPosterContextMenu({ x, y, title, disabled, onRebuild }: { x: number; y: number; title: LibraryTitle | null; disabled: boolean; onRebuild: (title: LibraryTitle) => void }) {
   if (!title) return null;
@@ -519,7 +635,7 @@ function LibraryPosterContextMenu({ x, y, title, disabled, onRebuild }: { x: num
   );
 }
 
-function LibraryTitleDialog({ title, serverId, onClose, onSendMismatches, onSendAll, onRebuild }: { title: LibraryTitle; serverId?: string; onClose: () => void; onSendMismatches: () => void; onSendAll: () => void; onRebuild: () => void }) {
+function LibraryTitleDialog({ title, serverId, sending, handoffMessage, onClose, onSendMismatches, onSendAll, onRebuild }: { title: LibraryTitle; serverId?: string; sending: boolean; handoffMessage: string; onClose: () => void; onSendMismatches: () => void; onSendAll: () => void; onRebuild: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section role="dialog" aria-modal="true" aria-label={`${title.title} library details`} className="flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
@@ -541,7 +657,7 @@ function LibraryTitleDialog({ title, serverId, onClose, onSendMismatches, onSend
             ))}
           </div>
         </div>
-        <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-4"><button type="button" onClick={onClose} className="h-9 rounded-md border border-border bg-button px-4 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">Close</button><button type="button" onClick={onSendMismatches} disabled={!title.hasIssues} className="h-9 rounded-md border border-warning bg-button px-4 text-sm font-semibold text-warning hover:bg-button-hover disabled:border-border disabled:text-disabled">Send mismatches + template to Dashboard</button><button type="button" onClick={onSendAll} className="h-9 rounded-md bg-accent px-4 text-sm font-semibold text-window">Send all files to Dashboard</button></footer>
+        <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-4">{handoffMessage ? <span role="status" className={`mr-auto text-sm ${sending ? "text-accent" : "text-warning"}`}>{handoffMessage}</span> : null}<button type="button" onClick={onClose} className="h-9 rounded-md border border-border bg-button px-4 text-sm font-semibold text-muted hover:bg-button-hover hover:text-text">Close</button><button type="button" onClick={onSendMismatches} disabled={sending || !title.hasIssues} className="h-9 rounded-md border border-warning bg-button px-4 text-sm font-semibold text-warning hover:bg-button-hover disabled:border-border disabled:text-disabled">Send mismatches + template to Scan</button><button type="button" onClick={onSendAll} disabled={sending} className="h-9 rounded-md bg-accent px-4 text-sm font-semibold text-window disabled:bg-button disabled:text-disabled">Send all files to Scan</button></footer>
       </section>
     </div>
   );
@@ -594,10 +710,10 @@ export function buildLibraryTitles(rows: LibraryAuditRow[], catalogItems: Librar
     current.fileCount += row.fileCount;
     current.mismatchFileCount += row.issueFilePaths.length;
     current.hasIssues ||= row.hasIssues;
-    current.allFilePaths = uniquePaths([...current.allFilePaths, ...row.allFilePaths]);
+    current.allFilePaths.push(...row.allFilePaths);
     grouped.set(key, current);
   }
-  return [...grouped.values()].map((title) => ({ ...title, seasons: [...title.seasons].sort((left, right) => seasonLabel(left).localeCompare(seasonLabel(right), undefined, { numeric: true })) })).sort((left, right) => left.title.localeCompare(right.title, undefined, { numeric: true }));
+  return [...grouped.values()].map((title) => ({ ...title, allFilePaths: uniquePaths(title.allFilePaths), seasons: [...title.seasons].sort((left, right) => seasonLabel(left).localeCompare(seasonLabel(right), undefined, { numeric: true })) })).sort((left, right) => left.title.localeCompare(right.title, undefined, { numeric: true }));
 }
 
 function auditTitle(row: LibraryAuditRow) {
@@ -636,15 +752,14 @@ function filesForLibrarySource(files: MediaFileRow[], source: LibrarySourceOptio
     return roots.some((root) => path === root || path.startsWith(`${root}/`));
   });
 }
-function librarySnapshot(sourceId: string, files: MediaFileRow[], response: LibraryAuditResponse): LibraryViewSnapshot {
+function librarySnapshot(sourceId: string, response: LibraryAuditResponse): LibraryViewSnapshot {
   return {
     auditResult: response,
-    libraryFiles: files,
     statusText: `Library ready: ${response.summary.groups} season/folder groups, ${response.summary.files} files, ${response.summary.issueGroups} warning groups.`,
     artworkGeneration: (libraryViewCache.get(sourceId)?.artworkGeneration ?? 0) + 1
   };
 }
-function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, files: MediaFileRow[], response: LibraryAuditResponse): LibraryViewSnapshot {
+function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, response: LibraryAuditResponse): LibraryViewSnapshot {
   const previous = libraryViewCache.get(sourceId);
   const roots = title.seasons.map((season) => normalizePath(season.folderPath));
   const isInTitle = (path: string) => {
@@ -655,10 +770,6 @@ function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, files: MediaF
     ...(previous?.auditResult.items ?? []).filter((row) => !isInTitle(row.folderPath)),
     ...response.items
   ];
-  const libraryFiles = uniqueFiles([
-    ...(previous?.libraryFiles ?? []).filter((file) => !isInTitle(file.path)),
-    ...files
-  ]);
   const issueGroups = items.filter((row) => row.hasIssues).length;
   return {
     auditResult: {
@@ -670,7 +781,6 @@ function mergeTitleSnapshot(sourceId: string, title: LibraryTitle, files: MediaF
         standardGroups: items.length - issueGroups
       }
     },
-    libraryFiles,
     statusText: `${title.title} rebuilt: ${response.summary.files} files, ${response.summary.issueGroups} warning groups.`,
     artworkGeneration: (previous?.artworkGeneration ?? 0) + 1
   };
@@ -680,15 +790,6 @@ function titleSourcePaths(title: LibraryTitle) {
     const folder = folderName(season.folderPath);
     return isSeasonFolderName(folder) ? parentPath(season.folderPath) : season.folderPath;
   }));
-}
-function uniqueFiles(files: MediaFileRow[]) {
-  const seen = new Set<string>();
-  return files.filter((file) => {
-    const key = normalizePath(file.path);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 function uniquePaths(paths: string[]) {
   const seen = new Set<string>();

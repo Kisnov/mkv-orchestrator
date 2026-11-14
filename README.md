@@ -42,12 +42,15 @@ The application combines a Rust core with a React interface hosted by Tauri for 
 - Builds and manages a local metadata cache for watch folders.
 - Discovers library paths from Emby, Jellyfin, or Plex servers with per-library enablement and path mapping.
 - Supports user-editable GUI themes.
+- Shows running and recent jobs, tool versions, watch-folder state and media-server connections on the Dashboard.
 
 ## Screenshots
 
-### Dashboard
+### Scan
 
-![Dashboard](docs/screenshots/Dashboard.png)
+The Scan view of the Dashboard.
+
+![Scan](docs/screenshots/Dashboard.png)
 
 ### Rename Files
 
@@ -172,11 +175,11 @@ Provider setup links are shown inside the app under Settings.
 7. Go to `Settings > API Providers`.
 8. Enter your own TVDB and/or TMDB API key.
 9. Click **Test Selected Provider** to confirm lookup access.
-10. Go to Dashboard and scan one or more folders.
+10. Go to `Dashboard > Scan` and scan one or more folders.
 
 ## Rename Workflow
 
-1. Scan files from the Dashboard.
+1. Scan files from `Dashboard > Scan`.
 2. Go to Rename Files.
 3. Search for the show or movie title.
 4. Select the correct TVDB or TMDB result.
@@ -249,6 +252,16 @@ cargo test --workspace
 npm --prefix web test
 ```
 
+Run the other checks CI runs (formatting, lints, and drift in the generated TypeScript contracts):
+
+```powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --exclude mkvo-desktop -- -D warnings
+cargo run --locked --package mkvo-contract-gen -- --check
+```
+
+`.\scripts\verify.ps1` runs these together with the web build and the Rust tests.
+
 ## Command Line
 
 The `mkvo` binary drives the same runtime as the app, against whichever
@@ -299,9 +312,23 @@ docker exec mkvo mkvo scan /media --json
 
 ## Docker Web Container
 
-The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image.
+The Docker build runs as one container. It serves the React web UI and the Rust API from the same process and installs MKVToolNix plus FFmpeg inside the image. Those are the versions Debian bookworm packages (currently MKVToolNix 74 and FFmpeg 5.1), not the latest upstream releases.
 
-Build and run:
+CI publishes the image to GHCR from every commit on `main` whose CI run passed:
+
+```text
+ghcr.io/kisnov/mkv-orchestrator:latest
+ghcr.io/kisnov/mkv-orchestrator:sha-<short commit>
+```
+
+Run the published image:
+
+```powershell
+docker compose pull
+docker compose up -d
+```
+
+Or build and run from source:
 
 ```powershell
 docker compose up --build
@@ -334,8 +361,9 @@ Keep `.env` local. Do not commit API keys, SMB usernames, SMB passwords, or serv
 Optional container settings (see `docs/DOCKER_WEB_CONTAINER.md` for the full list):
 
 - `PUID` / `PGID` / `UMASK` run the app as a specific user so files written to shares are not root-owned.
-- `MKVO_AUTH_ENABLED` selects the in-app administrator login. Supplied container definitions default to false: anyone who can reach MKVO, including reverse-proxy visitors, has full access.
-- `MKVO_USERNAME` defaults to `admin`; a blank `MKVO_PASSWORD` generates a persistent password in `/config/admin-password.txt`. Existing legacy authentication variables remain supported.
+- Login is on by default. Sign in as `MKVO_USERNAME` (default `admin`) with `MKVO_PASSWORD`, or, when it is blank, with the generated password: `docker exec mkvo cat /config/admin-password.txt`. After the first sign-in only a hash is kept. Existing legacy authentication variables remain supported.
+- `MKVO_AUTH_ENABLED=false` gives anyone who can reach MKVO, including reverse-proxy visitors, full access; the server refuses to start that way on a network address unless `MKVO_ALLOW_NO_LOGIN=true` is set too. Upgrading from a container that ran without login: see `docs/AUTHENTICATION.md`.
+- `MKVO_ALLOWED_HOSTS` lists extra host names for reverse proxies or login-free access by name; `MKVO_TOOL_DIRECTORIES` lists the only tool directories the Settings page may choose.
 - `MKVO_SCAN_WORKERS` and `MKVO_EDIT_WORKERS` tune scan and mkvpropedit concurrency.
 
 The container wires Dashboard, Rename, Mux / Remux, Track Properties, Library, Settings, and Logs through the single Rust host, from the same React sources the desktop app embeds.

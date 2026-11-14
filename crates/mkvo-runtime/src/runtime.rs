@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -48,6 +49,7 @@ mod media_servers;
 mod metadata_facade;
 mod migration_facade;
 mod recovery;
+mod retention;
 mod runtime_support;
 mod scan_facade;
 mod scan_state;
@@ -69,6 +71,38 @@ struct RuntimeInner {
     settings_service: Arc<SettingsService>,
     current_scan: Arc<RwLock<CurrentScanState>>,
     legacy_rename_history: Vec<LegacyRenameBatchRecord>,
+    providers: ProviderClients,
+    media_server_http: MediaServerDiscoveryClient,
+    media_server_rejections:
+        RwLock<HashMap<MediaServerId, media_server_facade::CredentialRejection>>,
+    /// Bumped when a media server accepts a credential, so a refusal from a
+    /// request that started earlier is not remembered.
+    media_server_acceptances: AtomicU64,
+}
+
+/// HTTP clients for the metadata providers, built once per runtime.
+///
+/// Each client keeps its state behind an `Arc`: the TVDB login token and the
+/// AniDB title dump (which AniDB asks clients to fetch at most once a day), as
+/// well as the connection pool. Building a client per request threw all of
+/// that away, so every search logged in to TVDB again and downloaded the AniDB
+/// dump again. Clones share the state.
+struct ProviderClients {
+    tvdb: TvdbClient,
+    tmdb: TmdbClient,
+    anilist: AniListClient,
+    anidb: AniDbClient,
+}
+
+impl ProviderClients {
+    fn new(config_root: &Path) -> Self {
+        Self {
+            tvdb: TvdbClient::new(),
+            tmdb: TmdbClient::new(),
+            anilist: AniListClient::new(),
+            anidb: AniDbClient::new().with_cache_dir(config_root),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -156,11 +190,7 @@ pub struct LogExport {
     pub content: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecentJobsResponse {
-    pub jobs: Vec<JobSnapshot>,
-}
+pub use mkvo_contracts::RecentJobsResponse;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +236,7 @@ impl MkvoRuntime {
                 });
         Self {
             inner: Arc::new(RuntimeInner {
+                providers: ProviderClients::new(&config.config_root),
                 config,
                 dependencies,
                 jobs,
@@ -213,6 +244,9 @@ impl MkvoRuntime {
                 settings_service,
                 current_scan: Arc::new(RwLock::new(CurrentScanState::default())),
                 legacy_rename_history,
+                media_server_http: MediaServerDiscoveryClient::new(),
+                media_server_rejections: RwLock::new(HashMap::new()),
+                media_server_acceptances: AtomicU64::new(0),
             }),
         }
     }
@@ -509,13 +543,22 @@ fn apply_web_settings_request(
             let prior = existing.get(&id);
             let secret_reference = format!("media_server.{id}.api_key");
             let legacy_secret_reference = format!("mediaServer:{id}");
-            let configured_update = server.api_key.as_ref().map(|value| !value.is_empty());
-            if let Some(api_key) = server.api_key {
+            // A blank key is how the form shows a stored one, so it means "unchanged".
+            let api_key = server.api_key.filter(|value| !value.trim().is_empty());
+            // A stored key belongs to its URL: never let Sync or artwork send it elsewhere.
+            let url_changed = prior
+                .zip(server.server_url.as_deref())
+                .is_some_and(|(prior, url)| !media_server_urls_equivalent(url, &prior.server_url));
+            let configured_update = match &api_key {
+                Some(_) => Some(true),
+                None => url_changed.then_some(false),
+            };
+            if api_key.is_some() || url_changed {
                 for key in [&secret_reference, &legacy_secret_reference] {
                     secrets.push(SecretUpdate {
                         key: key.clone(),
-                        clear: api_key.is_empty(),
-                        value: (!api_key.is_empty()).then_some(api_key.clone()),
+                        clear: api_key.is_none(),
+                        value: api_key.clone(),
                     });
                 }
             }
@@ -739,23 +782,29 @@ fn resolve_media_server_local_paths(libraries: &mut [MediaServerLibrary], media_
     }
 }
 
-fn media_server_client(
-    kind: MediaServerKind,
-    settings: &AppSettings,
-) -> Arc<dyn MediaServerClient> {
-    let mappings = settings
-        .media_server_path_mappings
-        .iter()
-        .map(|mapping| MediaServerPathMapping {
-            server_path_prefix: display_path(&mapping.remote_prefix),
-            local_path_prefix: mapping.local_prefix.clone(),
-        })
-        .collect();
-    Arc::new(ConfiguredMediaServerClient::new(
-        kind,
-        MediaServerDiscoveryClient::new(),
-        mappings,
-    ))
+impl MkvoRuntime {
+    /// A media-server client over the runtime's shared HTTP client, so poster
+    /// grids and syncs reuse pooled connections instead of a new client (and a
+    /// new TLS handshake) per request.
+    fn media_server_client(
+        &self,
+        kind: MediaServerKind,
+        settings: &AppSettings,
+    ) -> Arc<dyn MediaServerClient> {
+        let mappings = settings
+            .media_server_path_mappings
+            .iter()
+            .map(|mapping| MediaServerPathMapping {
+                server_path_prefix: display_path(&mapping.remote_prefix),
+                local_path_prefix: mapping.local_prefix.clone(),
+            })
+            .collect();
+        Arc::new(ConfiguredMediaServerClient::new(
+            kind,
+            self.inner.media_server_http.clone(),
+            mappings,
+        ))
+    }
 }
 
 fn rename_search_result(value: mkvo_domain::ProviderSearchResult) -> RenameSearchResult {
@@ -844,10 +893,13 @@ fn volume_listing() -> FileSystemResponse {
 
 /// The shares a server publishes, presented as an ordinary folder listing so
 /// the browser can navigate into one without knowing it came from elsewhere.
-fn server_listing(server: &str) -> RuntimeResult<FileSystemResponse> {
-    let shares = list_server_shares(server).map_err(|error| {
-        RuntimeError::invalid(format!(r"cannot list the shares of \\{server}: {error}"))
-    })?;
+async fn server_listing(server: &str) -> RuntimeResult<FileSystemResponse> {
+    let shares = list_shares_within(
+        server,
+        std::time::Duration::from_secs(15),
+        list_server_shares,
+    )
+    .await?;
 
     Ok(FileSystemResponse {
         path: format!(r"\\{server}"),
@@ -866,6 +918,47 @@ fn server_listing(server: &str) -> RuntimeResult<FileSystemResponse> {
             })
             .collect(),
     })
+}
+
+/// `NetShareEnum` blocks, with no timeout of its own, while an unreachable server is tried.
+async fn list_shares_within(
+    server: &str,
+    bound: std::time::Duration,
+    list: fn(&str) -> std::io::Result<Vec<mkvo_infra_netshare::Share>>,
+) -> RuntimeResult<Vec<mkvo_infra_netshare::Share>> {
+    let owned = server.to_owned();
+    match tokio::time::timeout(bound, tokio::task::spawn_blocking(move || list(&owned))).await {
+        Ok(Ok(Ok(shares))) => Ok(shares),
+        Ok(Ok(Err(error))) => Err(RuntimeError::invalid(format!(
+            r"cannot list the shares of \\{server}: {error}"
+        ))),
+        Ok(Err(error)) => Err(RuntimeError::internal(format!(
+            "share listing task failed: {error}"
+        ))),
+        Err(_) => Err(RuntimeError::invalid(format!(
+            r"\\{server} did not list its shares within {} s",
+            bound.as_secs()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod share_listing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_times_out() {
+        let error = list_shares_within("nas", std::time::Duration::from_millis(50), |_| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(Vec::new())
+        })
+        .await
+        .expect_err("timed out");
+        assert!(
+            error.to_string().contains("did not list its shares"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1643,6 +1736,209 @@ mod tests {
                 .iter()
                 .any(|secret| secret.key == format!("mediaServer:{id}"))
         );
+    }
+}
+
+#[cfg(test)]
+mod media_server_save_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    use mkvo_contracts::WebMediaServerRequest;
+
+    use super::*;
+    use crate::MkvoRuntimeBuilder;
+
+    /// A Jellyfin stand-in that records the `Authorization` header of every
+    /// request and only answers the key `old-secret`.
+    struct FakeJellyfin {
+        url: String,
+        authorizations: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeJellyfin {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+            let url = format!("http://{}", listener.local_addr().expect("fake address"));
+            let authorizations = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&authorizations);
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream);
+                    let mut authorization = String::new();
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("authorization")
+                        {
+                            value.trim().clone_into(&mut authorization);
+                        }
+                        line.clear();
+                    }
+                    let authorized = authorization.contains("old-secret");
+                    seen.lock().expect("header log").push(authorization);
+                    let (status, body) = if authorized {
+                        (
+                            "200 OK",
+                            r#"[{"Name":"Shows","ItemId":"lib-1","CollectionType":"tvshows","Locations":["/data/tv"]}]"#,
+                        )
+                    } else {
+                        ("401 Unauthorized", "")
+                    };
+                    let _ = reader.get_mut().write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+            Self {
+                url,
+                authorizations,
+            }
+        }
+
+        fn authorizations(&self) -> Vec<String> {
+            self.authorizations.lock().expect("header log").clone()
+        }
+    }
+
+    async fn save_server(
+        runtime: &MkvoRuntime,
+        id: Option<&str>,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> WebMediaServer {
+        runtime
+            .save_web_settings(WebSettingsRequest {
+                media_servers: Some(vec![WebMediaServerRequest {
+                    id: id.map(str::to_owned),
+                    name: Some("Home".to_owned()),
+                    server_type: Some("jellyfin".to_owned()),
+                    server_url: Some(url.to_owned()),
+                    api_key: api_key.map(str::to_owned),
+                    is_default: true,
+                    libraries: None,
+                }]),
+                ..WebSettingsRequest::default()
+            })
+            .await
+            .expect("save settings")
+            .media_servers
+            .into_iter()
+            .next()
+            .expect("saved server")
+    }
+
+    fn runtime(directory: &Path) -> MkvoRuntime {
+        let media = directory.join("media");
+        std::fs::create_dir_all(&media).expect("media root");
+        MkvoRuntimeBuilder::new(&media, directory.join("config"))
+            .app_name("test")
+            .disable_legacy_migration()
+            .authorized_root(&media, true)
+            .build()
+            .expect("runtime")
+    }
+
+    /// Autosave sends the server without a key once the field is blank, so a
+    /// new URL arrives alone. The stored key must not follow it there.
+    #[tokio::test]
+    async fn a_changed_url_never_receives_the_old_key() {
+        let old = FakeJellyfin::start();
+        let new = FakeJellyfin::start();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = runtime(directory.path());
+        let server = save_server(&runtime, None, &old.url, Some("old-secret")).await;
+        runtime
+            .sync_media_server_libraries(&server.id)
+            .await
+            .expect("sync with the original URL");
+        assert!(old.authorizations()[0].contains("old-secret"));
+
+        let moved = save_server(&runtime, Some(&server.id), &new.url, None).await;
+        let _ = runtime.sync_media_server_libraries(&server.id).await;
+
+        assert!(
+            !new.authorizations().is_empty(),
+            "sync never reached the new URL"
+        );
+        assert!(
+            new.authorizations()
+                .iter()
+                .all(|header| !header.contains("old-secret")),
+            "{:?}",
+            new.authorizations()
+        );
+        assert!(!moved.has_api_key);
+    }
+
+    /// Moving a server with its key typed again keeps that key, for the new URL.
+    #[tokio::test]
+    async fn a_changed_url_with_a_new_key_stores_that_key() {
+        let old = FakeJellyfin::start();
+        let new = FakeJellyfin::start();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = runtime(directory.path());
+        let server = save_server(&runtime, None, &old.url, Some("first-key")).await;
+
+        let moved = save_server(&runtime, Some(&server.id), &new.url, Some("old-secret")).await;
+
+        assert!(moved.has_api_key);
+        runtime
+            .sync_media_server_libraries(&server.id)
+            .await
+            .expect("sync with the new key");
+        assert_eq!(new.authorizations(), [r#"MediaBrowser Token="old-secret""#]);
+        assert!(old.authorizations().is_empty());
+    }
+
+    /// The comparison Test already uses: a trailing slash is not a new server.
+    #[tokio::test]
+    async fn a_cosmetic_url_change_keeps_the_key() {
+        let jellyfin = FakeJellyfin::start();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = runtime(directory.path());
+        let server = save_server(&runtime, None, &jellyfin.url, Some("old-secret")).await;
+
+        let saved = save_server(
+            &runtime,
+            Some(&server.id),
+            &format!("{}/", jellyfin.url),
+            None,
+        )
+        .await;
+
+        assert!(saved.has_api_key);
+        runtime
+            .sync_media_server_libraries(&server.id)
+            .await
+            .expect("sync keeps the key");
+    }
+
+    /// A blank key field is how the form shows a stored key, so sending it
+    /// back must not erase the key.
+    #[tokio::test]
+    async fn a_blank_key_keeps_the_stored_one() {
+        let jellyfin = FakeJellyfin::start();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = runtime(directory.path());
+        let server = save_server(&runtime, None, &jellyfin.url, Some("old-secret")).await;
+
+        for blank in ["", "  "] {
+            let saved = save_server(&runtime, Some(&server.id), &jellyfin.url, Some(blank)).await;
+            assert!(saved.has_api_key, "{blank:?} erased the key");
+        }
+        runtime
+            .sync_media_server_libraries(&server.id)
+            .await
+            .expect("sync with the stored key");
     }
 }
 

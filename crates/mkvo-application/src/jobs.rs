@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -9,13 +10,18 @@ use async_trait::async_trait;
 use chrono::Utc;
 use mkvo_contracts::{
     JobAccepted, JobCompletion, JobEvent, JobEventEnvelope, JobKind, JobLogLevel, JobSnapshot,
-    JobStatus,
+    JobStatus, RecentJob,
 };
 use mkvo_domain::{CorrelationId, IdempotencyKey, JobId, PlanId, ResourceAccess, ResourceClaim};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ApplicationError, ApplicationResult, JobRepository, PortError};
+
+/// Progress lives in memory. While a job runs the repository is brought up to
+/// date at most this often, and always when the job's status changes.
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct JobSpec {
@@ -171,6 +177,7 @@ impl JobSupervisor {
         };
         let (events, _) = broadcast::channel(256);
         let live = Arc::new(LiveJob {
+            id,
             correlation_id,
             snapshot: Mutex::new(snapshot.clone()),
             cancel: CancellationToken::new(),
@@ -178,14 +185,15 @@ impl JobSupervisor {
             sequence: AtomicU64::new(0),
             repository: Arc::clone(&self.repository),
             retained_lines: self.retained_lines,
+            saved_at: Mutex::new(Instant::now()),
+            attachment: StdMutex::new(None),
         });
 
         self.repository.insert(&snapshot).await?;
         self.live.write().await.insert(id, Arc::clone(&live));
         live.publish(JobEvent::Snapshot {
             snapshot: snapshot.clone(),
-        })
-        .await?;
+        });
 
         let supervisor = Arc::clone(self);
         tokio::spawn(async move {
@@ -209,82 +217,63 @@ impl JobSupervisor {
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: Future<Output = ApplicationResult<JobCompletion>> + Send + 'static,
     {
-        let id = live.snapshot.lock().await.id;
-        Arc::clone(&self)
+        let id = live.id;
+        // A terminal state the repository refused is only readable from memory.
+        if Arc::clone(&self)
             .run_to_completion(live, resources, task)
-            .await;
+            .await
+            .is_err()
+        {
+            return;
+        }
         tokio::time::sleep(self.completed_job_retention).await;
         self.live.write().await.remove(&id);
     }
 
+    /// Runs the job to a terminal state. An error means that state could not
+    /// be written to the repository.
     async fn run_to_completion<F, Fut>(
         self: Arc<Self>,
         live: Arc<LiveJob>,
         resources: Vec<ResourceClaim>,
         task: F,
-    ) where
+    ) -> ApplicationResult<()>
+    where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
         Fut: Future<Output = ApplicationResult<JobCompletion>> + Send + 'static,
     {
         if !resources.is_empty()
-            && live
-                .transition(JobStatus::WaitingForResources, None)
-                .await
-                .is_err()
+            && let Err(error) = live.transition(JobStatus::WaitingForResources).await
         {
-            return;
+            return live.finish_unstarted(error).await;
         }
 
         let lease = match self.leases.acquire(&resources, live.cancel.clone()).await {
             Ok(lease) => lease,
             Err(ApplicationError::Canceled) => {
-                let _ = live
+                return live
                     .finish_canceled("Canceled before resources became available")
                     .await;
-                return;
             }
-            Err(error) => {
-                let _ = live.finish_failed(error.to_string()).await;
-                return;
-            }
+            Err(error) => return live.finish_failed(error.to_string()).await,
         };
 
-        if live.cancel.is_cancelled() {
-            let _ = live.finish_canceled("Canceled before execution").await;
-            drop(lease);
-            return;
-        }
-        if live.transition(JobStatus::Running, None).await.is_err() {
-            drop(lease);
-            return;
+        if let Err(error) = live.transition(JobStatus::Running).await {
+            return live.finish_unstarted(error).await;
         }
 
         let context = JobContext {
             live: Arc::clone(&live),
         };
-        let result = task(context).await;
-        match result {
-            Ok(completion) if live.cancel.is_cancelled() => {
-                let _ = live
-                    .finish_canceled(
-                        completion
-                            .message
-                            .as_deref()
-                            .unwrap_or("Canceled during execution"),
-                    )
-                    .await;
-            }
-            Ok(completion) => {
-                let _ = live.finish_completed(completion).await;
-            }
-            Err(ApplicationError::Canceled) => {
-                let _ = live.finish_canceled("Canceled").await;
-            }
-            Err(error) => {
-                let _ = live.finish_failed(error.to_string()).await;
-            }
-        }
+        // Spawned so a panic in the task is seen here instead of leaving the
+        // job running forever.
+        let outcome = match tokio::spawn(async move { task(context).await }).await {
+            Ok(outcome) => outcome,
+            Err(error) => Err(ApplicationError::Internal(format!("job {error}"))),
+        };
+        let finished = live.finish(outcome).await;
         drop(lease);
+        finished
     }
 
     pub async fn get(&self, id: JobId) -> ApplicationResult<Option<JobSnapshot>> {
@@ -294,11 +283,38 @@ impl JobSupervisor {
         self.repository.get(id).await.map_err(Into::into)
     }
 
-    pub async fn list_recent(&self, limit: usize) -> ApplicationResult<Vec<JobSnapshot>> {
-        self.repository
-            .list_recent(limit.clamp(1, 1_000))
-            .await
-            .map_err(Into::into)
+    pub async fn list_recent(&self, limit: usize) -> ApplicationResult<Vec<RecentJob>> {
+        let mut jobs = self.repository.list_recent(limit.clamp(1, 1_000)).await?;
+        // A running job's progress reaches the repository at a limited rate.
+        let live = self.live.read().await;
+        for job in &mut jobs {
+            if let Some(live) = live.get(&job.id) {
+                *job = RecentJob::from(&*live.snapshot.lock().await);
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Keep data in memory with a job until the job leaves it, for output
+    /// too large to store in the job itself. A job no longer in memory keeps
+    /// nothing.
+    pub async fn attach(&self, id: JobId, data: Arc<dyn Any + Send + Sync>) {
+        if let Some(live) = self.live.read().await.get(&id) {
+            *live
+                .attachment
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(data);
+        }
+    }
+
+    pub async fn attachment<T: Any + Send + Sync>(&self, id: JobId) -> Option<Arc<T>> {
+        let live = self.live.read().await.get(&id).cloned()?;
+        let data = live
+            .attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        data.downcast().ok()
     }
 
     pub async fn cancel(&self, id: JobId) -> ApplicationResult<JobSnapshot> {
@@ -309,12 +325,7 @@ impl JobSupervisor {
             .get(&id)
             .cloned()
             .ok_or_else(|| ApplicationError::NotFound(format!("job {id}")))?;
-        let snapshot = live.snapshot.lock().await.clone();
-        if snapshot.status.is_terminal() {
-            return Ok(snapshot);
-        }
-        live.cancel.cancel();
-        live.transition(JobStatus::Canceling, None).await
+        live.request_cancel().await
     }
 
     pub async fn subscribe(
@@ -331,6 +342,7 @@ impl JobSupervisor {
 }
 
 struct LiveJob {
+    id: JobId,
     /// Duplicated from the snapshot so a running task can correlate its log
     /// entries without taking the snapshot lock on every write.
     correlation_id: CorrelationId,
@@ -340,115 +352,187 @@ struct LiveJob {
     sequence: AtomicU64,
     repository: Arc<dyn JobRepository>,
     retained_lines: usize,
+    /// When the snapshot last reached the repository. Held across each write
+    /// so an older snapshot can never land after a newer one.
+    saved_at: Mutex<Instant>,
+    attachment: StdMutex<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
 impl LiveJob {
-    async fn transition(
-        &self,
-        status: JobStatus,
-        error: Option<String>,
-    ) -> ApplicationResult<JobSnapshot> {
+    async fn transition(&self, status: JobStatus) -> ApplicationResult<()> {
         let now = Utc::now();
-        let snapshot = self
-            .update(|snapshot| {
-                if !snapshot.status.can_transition_to(status) {
-                    return Err(ApplicationError::Conflict(format!(
-                        "invalid job transition {:?} -> {status:?}",
-                        snapshot.status
-                    )));
-                }
-                snapshot.status = status;
-                if status == JobStatus::Running && snapshot.started_utc.is_none() {
-                    snapshot.started_utc = Some(now);
-                }
-                if status.is_terminal() {
-                    snapshot.completed_utc = Some(now);
-                    snapshot.current_file.clear();
-                    snapshot.current_file_percent = 0;
-                }
-                if error.is_some() {
-                    snapshot.error = error;
-                }
-                Ok(())
-            })
-            .await?;
-        self.publish(JobEvent::StatusChanged { status }).await?;
-        Ok(snapshot)
+        self.update(|snapshot| {
+            if !snapshot.status.can_transition_to(status) {
+                return Err(ApplicationError::Conflict(format!(
+                    "invalid job transition {:?} -> {status:?}",
+                    snapshot.status
+                )));
+            }
+            snapshot.status = status;
+            if status == JobStatus::Running && snapshot.started_utc.is_none() {
+                snapshot.started_utc = Some(now);
+            }
+            // Announced under the lock, so events keep the order of the changes.
+            self.publish(JobEvent::StatusChanged { status });
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
 
     async fn update(
         &self,
         mutate: impl FnOnce(&mut JobSnapshot) -> ApplicationResult<()>,
     ) -> ApplicationResult<JobSnapshot> {
-        let snapshot = {
+        {
             let mut snapshot = self.snapshot.lock().await;
             mutate(&mut snapshot)?;
             snapshot.revision = snapshot.revision.saturating_add(1);
-            snapshot.clone()
-        };
-        self.repository.update(&snapshot).await?;
-        Ok(snapshot)
+        }
+        self.persist().await
     }
 
-    async fn publish(&self, event: JobEvent) -> ApplicationResult<()> {
-        let snapshot = self.snapshot.lock().await;
-        let envelope = JobEventEnvelope {
-            job_id: snapshot.id,
-            correlation_id: snapshot.correlation_id,
-            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
-            emitted_utc: Utc::now(),
-            event,
-        };
-        drop(snapshot);
-        self.repository.append_event(&envelope).await?;
-        let _ = self.events.send(envelope);
+    /// Change progress in memory, saving it only once the last write is old
+    /// enough: a scan reports every file, and a write per file starves it.
+    async fn record(&self, mutate: impl FnOnce(&mut JobSnapshot)) -> ApplicationResult<()> {
+        {
+            let mut snapshot = self.snapshot.lock().await;
+            mutate(&mut snapshot);
+            snapshot.revision = snapshot.revision.saturating_add(1);
+        }
+        // A write already in flight is recent enough.
+        if let Ok(mut saved_at) = self.saved_at.try_lock()
+            && saved_at.elapsed() >= PROGRESS_PERSIST_INTERVAL
+        {
+            self.write(&mut saved_at).await?;
+        }
         Ok(())
     }
 
-    async fn finish_completed(&self, completion: JobCompletion) -> ApplicationResult<JobSnapshot> {
-        let result_for_event = completion.result.clone();
-        let snapshot = self
-            .update(|snapshot| {
-                if !snapshot.status.can_transition_to(JobStatus::Completed) {
-                    return Err(ApplicationError::Conflict(format!(
-                        "cannot complete job in {:?}",
-                        snapshot.status
-                    )));
-                }
-                snapshot.status = JobStatus::Completed;
-                snapshot.completed_utc = Some(Utc::now());
-                snapshot.current_file.clear();
-                snapshot.current_file_percent = 0;
-                snapshot.result = completion.result;
-                if let Some(message) = completion.message {
-                    snapshot.lines.push(message);
-                }
-                Ok(())
-            })
-            .await?;
-        self.publish(JobEvent::Completed {
-            summary: snapshot.summary(),
-            result: result_for_event,
-        })
-        .await?;
+    async fn persist(&self) -> ApplicationResult<JobSnapshot> {
+        let mut saved_at = self.saved_at.lock().await;
+        self.write(&mut saved_at).await
+    }
+
+    async fn write(&self, saved_at: &mut Instant) -> ApplicationResult<JobSnapshot> {
+        let snapshot = self.snapshot.lock().await.clone();
+        self.repository.update(&snapshot).await?;
+        *saved_at = Instant::now();
         Ok(snapshot)
     }
 
-    async fn finish_failed(&self, message: String) -> ApplicationResult<JobSnapshot> {
-        let snapshot = self
-            .transition(JobStatus::Failed, Some(message.clone()))
-            .await?;
-        self.publish(JobEvent::Failed { message }).await?;
-        Ok(snapshot)
+    fn envelope(&self, event: JobEvent) -> JobEventEnvelope {
+        JobEventEnvelope {
+            job_id: self.id,
+            correlation_id: self.correlation_id,
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+            emitted_utc: Utc::now(),
+            event,
+        }
     }
 
-    async fn finish_canceled(&self, message: &str) -> ApplicationResult<JobSnapshot> {
-        let snapshot = self.transition(JobStatus::Canceled, None).await?;
-        self.publish(JobEvent::Canceled {
-            message: message.to_owned(),
+    /// Tell live subscribers. Only the event that ends a job is stored: a
+    /// scan would otherwise leave rows for every file it looked at.
+    fn publish(&self, event: JobEvent) {
+        let _ = self.events.send(self.envelope(event));
+    }
+
+    /// Cancel under the snapshot lock, where the runner also decides how the
+    /// job ends, so neither can act on a status the other is about to change.
+    async fn request_cancel(&self) -> ApplicationResult<JobSnapshot> {
+        {
+            let mut snapshot = self.snapshot.lock().await;
+            if snapshot.status.is_terminal() {
+                return Ok(snapshot.clone());
+            }
+            self.cancel.cancel();
+            snapshot.status = JobStatus::Canceling;
+            snapshot.revision = snapshot.revision.saturating_add(1);
+            self.publish(JobEvent::StatusChanged {
+                status: JobStatus::Canceling,
+            });
+        }
+        self.persist().await
+    }
+
+    /// Reach a terminal state. Subscribers are told even when the repository
+    /// write fails; that error is returned so the job can stay in memory. A
+    /// refused event is not: the stored snapshot already says how it ended.
+    async fn terminate(
+        &self,
+        apply: impl FnOnce(&mut JobSnapshot) -> JobEvent,
+    ) -> ApplicationResult<()> {
+        let event = {
+            let mut snapshot = self.snapshot.lock().await;
+            let event = apply(&mut snapshot);
+            snapshot.completed_utc = Some(Utc::now());
+            snapshot.current_file.clear();
+            snapshot.current_file_percent = 0;
+            snapshot.revision = snapshot.revision.saturating_add(1);
+            event
+        };
+        let persisted = self.persist().await.map(drop);
+        let envelope = self.envelope(event);
+        let _ = self.repository.append_event(&envelope).await;
+        let _ = self.events.send(envelope);
+        persisted
+    }
+
+    async fn finish(&self, outcome: ApplicationResult<JobCompletion>) -> ApplicationResult<()> {
+        match outcome {
+            Ok(completion) => {
+                self.terminate(|snapshot| {
+                    // A cancel that arrived while the task was returning.
+                    if self.cancel.is_cancelled() {
+                        snapshot.status = JobStatus::Canceled;
+                        return JobEvent::Canceled {
+                            message: completion
+                                .message
+                                .unwrap_or_else(|| "Canceled during execution".to_owned()),
+                        };
+                    }
+                    snapshot.status = JobStatus::Completed;
+                    snapshot.result.clone_from(&completion.result);
+                    snapshot.lines.extend(completion.message);
+                    JobEvent::Completed {
+                        summary: snapshot.summary(),
+                        result: completion.result,
+                    }
+                })
+                .await
+            }
+            Err(ApplicationError::Canceled) => self.finish_canceled("Canceled").await,
+            Err(error) => self.finish_failed(error.to_string()).await,
+        }
+    }
+
+    /// The job could not move towards running: a cancel got there first, or
+    /// the repository refused the write.
+    async fn finish_unstarted(&self, error: ApplicationError) -> ApplicationResult<()> {
+        if self.cancel.is_cancelled() {
+            self.finish_canceled("Canceled before execution").await
+        } else {
+            self.finish_failed(error.to_string()).await
+        }
+    }
+
+    async fn finish_failed(&self, message: String) -> ApplicationResult<()> {
+        self.terminate(|snapshot| {
+            snapshot.status = JobStatus::Failed;
+            snapshot.error = Some(message.clone());
+            JobEvent::Failed { message }
         })
-        .await?;
-        Ok(snapshot)
+        .await
+    }
+
+    async fn finish_canceled(&self, message: &str) -> ApplicationResult<()> {
+        self.terminate(|snapshot| {
+            snapshot.status = JobStatus::Canceled;
+            JobEvent::Canceled {
+                message: message.to_owned(),
+            }
+        })
+        .await
     }
 }
 
@@ -463,6 +547,11 @@ impl JobContext {
     #[must_use]
     pub fn correlation_id(&self) -> CorrelationId {
         self.live.correlation_id
+    }
+
+    #[must_use]
+    pub fn job_id(&self) -> JobId {
+        self.live.id
     }
 
     #[must_use]
@@ -487,71 +576,63 @@ impl JobContext {
     ) -> ApplicationResult<()> {
         let current_file = current_file.into();
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.completed = completed.min(total);
                 snapshot.total = total;
                 snapshot.current_file.clone_from(&current_file);
                 snapshot.current_file_percent = current_file_percent.min(100);
-                Ok(())
-            })
-            .await?;
-        self.live
-            .publish(JobEvent::Progress {
-                completed: completed.min(total),
-                total,
-                current_file,
-                current_file_percent: current_file_percent.min(100),
+                // Under the lock, like status changes, so events keep its order.
+                self.live.publish(JobEvent::Progress {
+                    completed: snapshot.completed,
+                    total,
+                    current_file,
+                    current_file_percent: snapshot.current_file_percent,
+                });
             })
             .await
     }
 
     pub async fn record_completed(&self) -> ApplicationResult<()> {
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.completed = snapshot.completed.saturating_add(1).min(snapshot.total);
-                Ok(())
             })
             .await
-            .map(|_| ())
     }
 
     pub async fn record_failed(&self) -> ApplicationResult<()> {
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.failed = snapshot.failed.saturating_add(1);
-                Ok(())
             })
             .await
-            .map(|_| ())
     }
 
     pub async fn record_skipped(&self) -> ApplicationResult<()> {
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.skipped = snapshot.skipped.saturating_add(1);
-                Ok(())
             })
             .await
-            .map(|_| ())
     }
 
     pub async fn log(&self, level: JobLogLevel, line: impl Into<String>) -> ApplicationResult<()> {
         let line = line.into();
         let limit = self.live.retained_lines;
         self.live
-            .update(|snapshot| {
+            .record(|snapshot| {
                 snapshot.lines.push(line.clone());
                 if snapshot.lines.len() > limit {
                     snapshot.lines.drain(0..snapshot.lines.len() - limit);
                 }
-                Ok(())
+                self.live.publish(JobEvent::Log { level, line });
             })
-            .await?;
-        self.live.publish(JobEvent::Log { level, line }).await
+            .await
     }
 
     pub async fn emit(&self, event: JobEvent) -> ApplicationResult<()> {
-        self.live.publish(event).await
+        self.live.publish(event);
+        Ok(())
     }
 }
 
@@ -673,7 +754,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 
 fn normalize_resource_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
-    for component in path.components() {
+    for component in mkvo_domain::normalized_path(path).components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -745,11 +826,28 @@ impl JobRepository for InMemoryJobRepository {
         })
     }
 
-    async fn list_recent(&self, limit: usize) -> Result<Vec<JobSnapshot>, PortError> {
-        let mut jobs: Vec<_> = self.jobs.read().await.values().cloned().collect();
+    async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError> {
+        let mut jobs: Vec<_> = self
+            .jobs
+            .read()
+            .await
+            .values()
+            .map(RecentJob::from)
+            .collect();
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_utc));
         jobs.truncate(limit);
         Ok(jobs)
+    }
+
+    async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError> {
+        Ok(self
+            .jobs
+            .read()
+            .await
+            .values()
+            .filter(|job| !job.status.is_terminal())
+            .cloned()
+            .collect())
     }
 
     async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
@@ -877,6 +975,386 @@ mod tests {
         panic!("job did not reach canceled state");
     }
 
+    /// Wait for the event that ends the job and count the ones before it.
+    /// It is sent once the final state and that event have been stored.
+    async fn events_before_the_end(events: &mut broadcast::Receiver<JobEventEnvelope>) -> usize {
+        let mut seen = 0;
+        loop {
+            match events.recv().await {
+                Ok(envelope) => match envelope.event {
+                    JobEvent::Completed { .. }
+                    | JobEvent::Failed { .. }
+                    | JobEvent::Canceled { .. } => return seen,
+                    _ => seen += 1,
+                },
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    seen += usize::try_from(missed).unwrap();
+                }
+                Err(broadcast::error::RecvError::Closed) => panic!("job never ended"),
+            }
+        }
+    }
+
+    async fn wait_for_status(supervisor: &JobSupervisor, id: JobId, status: JobStatus) {
+        for _ in 0..400 {
+            if supervisor.get(id).await.unwrap().unwrap().status == status {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = supervisor.get(id).await.unwrap().unwrap();
+        panic!("job stayed {:?} instead of {status:?}", snapshot.status);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_the_runner_starts_ends_canceled() {
+        let supervisor = JobSupervisor::in_memory();
+        let accepted = supervisor
+            .start(
+                spec("early-cancel", vec![ResourceClaim::read("library/show")]),
+                |context| async move {
+                    context.cancellation_token().cancelled().await;
+                    Err(ApplicationError::Canceled)
+                },
+            )
+            .await
+            .unwrap();
+        // On one thread the runner has not been polled yet and finds the job
+        // Canceling. Any other order has to end the same way.
+        supervisor.cancel(accepted.id).await.unwrap();
+        wait_for_status(&supervisor, accepted.id, JobStatus::Canceled).await;
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_fails_the_job_and_frees_its_resources() {
+        let supervisor = JobSupervisor::in_memory();
+        let claim = vec![ResourceClaim::write("library/show")];
+        let accepted = supervisor
+            .start(spec("panic-key", claim.clone()), |_| async move {
+                panic!("probe exploded")
+            })
+            .await
+            .unwrap();
+        wait_for_status(&supervisor, accepted.id, JobStatus::Failed).await;
+        let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
+        assert!(snapshot.error.unwrap().contains("panicked"));
+
+        let next = supervisor
+            .start(spec("after-panic", claim), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        wait_for_status(&supervisor, next.id, JobStatus::Completed).await;
+    }
+
+    /// Counts snapshot writes and can refuse the terminal one or the events.
+    #[derive(Default)]
+    struct ObservedRepository {
+        inner: InMemoryJobRepository,
+        updates: AtomicUsize,
+        refuse_terminal: bool,
+        refuse_events: bool,
+        /// Holds the first write of a snapshot with one file done until released.
+        hold_first_file: Option<Arc<tokio::sync::Semaphore>>,
+        held: Notify,
+    }
+
+    #[async_trait]
+    impl JobRepository for ObservedRepository {
+        async fn insert(&self, snapshot: &JobSnapshot) -> Result<(), PortError> {
+            self.inner.insert(snapshot).await
+        }
+
+        async fn update(&self, snapshot: &JobSnapshot) -> Result<(), PortError> {
+            if self.refuse_terminal && snapshot.status.is_terminal() {
+                return Err(PortError::Other("disk full".to_owned()));
+            }
+            if let Some(gate) = &self.hold_first_file
+                && snapshot.completed == 1
+            {
+                self.held.notify_one();
+                gate.acquire().await.unwrap().forget();
+            }
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            self.inner.update(snapshot).await
+        }
+
+        async fn get(&self, id: JobId) -> Result<Option<JobSnapshot>, PortError> {
+            self.inner.get(id).await
+        }
+
+        async fn find_by_idempotency(
+            &self,
+            key: &IdempotencyKey,
+        ) -> Result<Option<JobSnapshot>, PortError> {
+            self.inner.find_by_idempotency(key).await
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<RecentJob>, PortError> {
+            self.inner.list_recent(limit).await
+        }
+
+        async fn list_unfinished(&self) -> Result<Vec<JobSnapshot>, PortError> {
+            self.inner.list_unfinished().await
+        }
+
+        async fn append_event(&self, event: &JobEventEnvelope) -> Result<(), PortError> {
+            if self.refuse_events {
+                return Err(PortError::Other("disk full".to_owned()));
+            }
+            self.inner.append_event(event).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_terminal_state_is_still_announced_and_readable() {
+        let repository = Arc::new(ObservedRepository {
+            refuse_terminal: true,
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(
+            JobSupervisor::new(repository.clone())
+                .with_completed_job_retention(Duration::from_millis(5)),
+        );
+        // The task waits, so the subscription exists before anything is sent.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let accepted = supervisor
+            .start(spec("unsaved-key", Vec::new()), |_| async move {
+                released.await.unwrap();
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+        release.send(()).unwrap();
+
+        let announced =
+            tokio::time::timeout(Duration::from_secs(1), events_before_the_end(&mut events)).await;
+        assert!(announced.is_ok(), "subscribers never saw the job finish");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::Running);
+        let snapshot = supervisor.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(snapshot.status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_saved_terminal_state_leaves_memory_even_if_its_event_was_refused() {
+        let repository = Arc::new(ObservedRepository {
+            refuse_events: true,
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(
+            JobSupervisor::new(repository.clone())
+                .with_completed_job_retention(Duration::from_millis(5)),
+        );
+        let accepted = supervisor
+            .start(spec("unlogged-key", Vec::new()), |_| async move {
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..400 {
+            if !supervisor.live.read().await.contains_key(&accepted.id) {
+                let stored = repository.get(accepted.id).await.unwrap().unwrap();
+                assert_eq!(stored.status, JobStatus::Completed);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("a durable terminal job stayed in live memory");
+    }
+
+    fn discovered(path: &str) -> JobEvent {
+        let file = mkvo_domain::MediaFile {
+            path: PathBuf::from(path),
+            original_file_name: None,
+            watch_root: None,
+            relative_path: None,
+            fingerprint: mkvo_domain::FileFingerprint {
+                path: PathBuf::from(path),
+                size_bytes: 1,
+                modified_at: Utc::now(),
+                quick_hash: None,
+            },
+            container: mkvo_domain::ContainerMetadata::default(),
+            tracks: Vec::new(),
+            attachments: Vec::new(),
+            episode: None,
+            provider_match: None,
+            status: mkvo_domain::MediaStatus::Ready,
+        };
+        JobEvent::MediaDiscovered {
+            file: mkvo_contracts::MediaFileDto::from(&file),
+        }
+    }
+
+    /// A scan reports every file. Neither the number of repository writes nor
+    /// the stored events may grow with the number of files.
+    #[tokio::test]
+    async fn per_file_progress_is_not_written_per_file() {
+        const FILES: u64 = 2_000;
+        let repository = Arc::new(ObservedRepository::default());
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        // The task waits, so the subscription exists before anything is sent.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let accepted = supervisor
+            .start(spec("many-files", Vec::new()), |context| async move {
+                released.await.unwrap();
+                for index in 1..=FILES {
+                    context.emit(discovered("library/show/a.mkv")).await?;
+                    context.progress(index, FILES, "a.mkv", 100).await?;
+                    context.record_skipped().await?;
+                    context.log(JobLogLevel::Warning, "skipped").await?;
+                }
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+        release.send(()).unwrap();
+        // Live subscribers still get the stream.
+        assert!(events_before_the_end(&mut events).await > 1);
+
+        // Running, at most a handful of timed saves, and the terminal state.
+        let updates = repository.updates.load(Ordering::SeqCst);
+        assert!(updates <= 5, "{updates} snapshot writes for {FILES} files");
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::Completed);
+        assert_eq!((stored.completed, stored.skipped), (FILES, FILES));
+
+        let stored_events = repository.inner.events.read().await;
+        let stored_events = &stored_events[&accepted.id];
+        assert_eq!(stored_events.len(), 1);
+        assert!(matches!(stored_events[0].event, JobEvent::Completed { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_is_saved_once_the_last_write_is_old_enough() {
+        let repository = Arc::new(ObservedRepository::default());
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let (step, mut steps) = tokio::sync::mpsc::channel::<()>(1);
+        let accepted = supervisor
+            .start(spec("slow-file", Vec::new()), |context| async move {
+                context.progress(1, 3, "a.mkv", 100).await?;
+                tokio::time::sleep(PROGRESS_PERSIST_INTERVAL).await;
+                context.progress(2, 3, "b.mkv", 100).await?;
+                step.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        steps.recv().await.unwrap();
+
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.completed, 2);
+        let live = supervisor.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(live.current_file, "b.mkv");
+    }
+
+    /// A save in flight must not let a later update be announced first.
+    #[tokio::test(start_paused = true)]
+    async fn progress_is_announced_in_the_order_it_changed() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let repository = Arc::new(ObservedRepository {
+            hold_first_file: Some(Arc::clone(&gate)),
+            ..ObservedRepository::default()
+        });
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let observed = Arc::clone(&repository);
+        let accepted = supervisor
+            .start(spec("ordered-key", Vec::new()), |context| async move {
+                released.await.unwrap();
+                tokio::time::sleep(PROGRESS_PERSIST_INTERVAL).await;
+                let first = context.clone();
+                let first = tokio::spawn(async move { first.progress(1, 3, "a.mkv", 100).await });
+                observed.held.notified().await;
+                context.progress(2, 3, "b.mkv", 100).await?;
+                gate.add_permits(10);
+                first.await.unwrap()?;
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        let mut events = supervisor.subscribe(accepted.id).await.unwrap();
+        release.send(()).unwrap();
+
+        let mut announced = Vec::new();
+        loop {
+            match events.recv().await.unwrap().event {
+                JobEvent::Progress { completed, .. } => announced.push(completed),
+                JobEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(announced, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn recent_jobs_show_progress_the_repository_has_not_seen_yet() {
+        let repository = Arc::new(ObservedRepository::default());
+        let supervisor = Arc::new(JobSupervisor::new(repository.clone()));
+        let (step, mut steps) = tokio::sync::mpsc::channel::<()>(1);
+        let accepted = supervisor
+            .start(spec("listed-key", Vec::new()), |context| async move {
+                context.progress(2, 3, "b.mkv", 100).await?;
+                step.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        steps.recv().await.unwrap();
+
+        let stored = repository.get(accepted.id).await.unwrap().unwrap();
+        assert_eq!(stored.completed, 0);
+        let recent = supervisor.list_recent(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!((recent[0].id, recent[0].completed), (accepted.id, 2));
+        assert_eq!(recent[0].current_file, "b.mkv");
+    }
+
+    #[tokio::test]
+    async fn data_attached_to_a_job_lasts_as_long_as_it_stays_in_memory() {
+        let supervisor = Arc::new(
+            JobSupervisor::new(Arc::new(InMemoryJobRepository::default()))
+                .with_completed_job_retention(Duration::from_millis(20)),
+        );
+        // The task waits, so the job cannot leave memory before the checks.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let accepted = supervisor
+            .start(spec("attached-key", Vec::new()), |_| async move {
+                released.await.unwrap();
+                Ok(JobCompletion::default())
+            })
+            .await
+            .unwrap();
+        supervisor
+            .attach(accepted.id, Arc::new(vec!["a.mkv".to_owned()]))
+            .await;
+        supervisor.attach(JobId::new(), Arc::new(0_u8)).await;
+
+        let files = supervisor.attachment::<Vec<String>>(accepted.id).await;
+        assert_eq!(files.as_deref(), Some(&vec!["a.mkv".to_owned()]));
+        assert!(supervisor.attachment::<u8>(accepted.id).await.is_none());
+        release.send(()).unwrap();
+
+        for _ in 0..400 {
+            if !supervisor.live.read().await.contains_key(&accepted.id) {
+                let gone = supervisor.attachment::<Vec<String>>(accepted.id).await;
+                assert!(gone.is_none());
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("terminal job was not evicted from live memory");
+    }
+
     #[tokio::test]
     async fn writer_waits_for_overlapping_reader() {
         let manager = Arc::new(ResourceLeaseManager::default());
@@ -900,6 +1378,17 @@ mod tests {
         assert!(!waiting.is_finished());
         drop(reader);
         assert!(waiting.await.unwrap().is_ok());
+    }
+
+    /// A scanned path is canonical (`\\?\C:\...`); claimed by its plain
+    /// spelling the same file has to be the same lease.
+    #[test]
+    fn both_spellings_of_a_windows_path_claim_one_resource() {
+        let claims = merge_claims(&[
+            ResourceClaim::write(r"\\?\C:\media\a.mkv"),
+            ResourceClaim::read(r"C:\media\a.mkv"),
+        ]);
+        assert_eq!(claims.len(), 1, "{claims:?}");
     }
 
     #[tokio::test]

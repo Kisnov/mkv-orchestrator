@@ -1,18 +1,16 @@
 # Generated MKVO contracts
 
-`contracts.ts` is generated from the serde-annotated Rust DTOs in `crates/mkvo-contracts`. It currently contains 77 boundary DTOs and 27 referenced domain enums. It also includes zero-dependency runtime validators.
+`contracts.ts` is generated from the serde-annotated Rust DTOs in `crates/mkvo-contracts`. It currently contains 82 boundary DTOs and 27 referenced domain enums. It also includes zero-dependency runtime validators.
 
 Generate bindings:
 
 ```powershell
-./scripts/generate-contracts.ps1
+cargo run --locked -p mkvo-contract-gen -- write
 ```
 
 Check drift without writing:
 
 ```powershell
-./scripts/generate-contracts.ps1 -Check
-# Cross-platform CI equivalent:
 cargo run --locked -p mkvo-contract-gen -- --check
 ```
 

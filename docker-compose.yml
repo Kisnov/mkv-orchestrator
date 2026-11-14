@@ -3,8 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: mkvo:local
+    image: ghcr.io/kisnov/mkv-orchestrator:latest
     container_name: mkvo
+    # Every host interface, so the LAN can reach it; the login is what protects it.
+    # Use "127.0.0.1:8886:8080" to reach it from this host only.
     ports:
       - "8886:8080"
     environment:
@@ -13,14 +15,20 @@ services:
       MKVO_SOURCE_ROOTS: "${MKVO_SOURCE_ROOTS:-downloads=/downloads}"
       MKVO_CONFIG_DIR: "/config"
       MKVO_UI_DIR: "/app/web"
-      MKVO_AUTH_MODE: "${MKVO_AUTH_MODE:-disabled}"
-      MKVO_AUTH_USERNAME: "${MKVO_AUTH_USERNAME:-}"
-      MKVO_AUTH_PASSWORD: "${MKVO_AUTH_PASSWORD:-}"
-      # Empty preserves legacy mode/credentials; set true or false to override.
-      MKVO_AUTH_ENABLED: "${MKVO_AUTH_ENABLED:-}"
+      # Sign in as MKVO_USERNAME (admin) with MKVO_PASSWORD, or, when it is blank,
+      # with the password generated in /config/admin-password.txt.
+      MKVO_AUTH_ENABLED: "${MKVO_AUTH_ENABLED:-true}"
       MKVO_USERNAME: "${MKVO_USERNAME:-}"
       MKVO_PASSWORD: "${MKVO_PASSWORD:-}"
+      # MKVO_AUTH_ENABLED=false also needs this set to true, or the server refuses to start.
+      MKVO_ALLOW_NO_LOGIN: "${MKVO_ALLOW_NO_LOGIN:-}"
+      # Legacy names, still honoured when set.
+      MKVO_AUTH_MODE: "${MKVO_AUTH_MODE:-}"
+      MKVO_AUTH_USERNAME: "${MKVO_AUTH_USERNAME:-}"
+      MKVO_AUTH_PASSWORD: "${MKVO_AUTH_PASSWORD:-}"
       MKVO_SECURE_COOKIES: "${MKVO_SECURE_COOKIES:-false}"
+      # Unset, only errors are logged and the startup hint naming the password file is hidden.
+      RUST_LOG: "${RUST_LOG:-info}"
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
       UMASK: "${UMASK:-}"
@@ -28,5 +36,17 @@ services:
       - ${MKVO_MEDIA_PATH:-./tmp/docker-media}:/media
       - ${MKVO_DOWNLOADS_PATH:-./tmp/docker-downloads}:/downloads
       - ${MKVO_CONFIG_PATH:-./tmp/docker-config}:/config
+    # Only root steps use these: the entrypoint fixing /config ownership (DAC_OVERRIDE lets it
+    # reach into folders the app user keeps private) and docker exec. The app runs as
+    # PUID/PGID with none of them. PUID=0 (run as root) also needs FOWNER.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 

@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 
-import { countCompletedRenameRows, RenamePage } from "./RenamePage";
+import { RenamePage } from "./RenamePage";
 import { MediaLibraryProvider, useMediaLibrary } from "../state/MediaLibraryContext";
 import { renderWithBackend } from "../test/render";
-import type { MediaFileRow } from "../api";
+import { createMockBackendClient } from "../backend/mockClient";
+import { setBackendClient } from "../backend/runtime";
+import type { MediaFileRow, RenameApplyResponse, RenamePreviewResponse } from "../api";
 
 function mediaFile(fileName: string): MediaFileRow {
   return {
@@ -86,23 +90,50 @@ const searchResult = (format: "movie" | "series") => ({
 });
 
 describe("rename apply progress", () => {
-  it("counts source paths that have left the live scan as completed", () => {
-    const first = mediaFile("Episode 01.mkv");
-    const second = mediaFile("Episode 02.mkv");
-    const rows = [first, second].map((file) => ({
-      selected: true,
-      sourcePath: file.path,
-      currentFileName: file.fileName,
-      detected: "",
-      episodeName: "",
-      newFileName: `Renamed ${file.fileName}`,
-      confidence: "High",
-      status: "Ready",
-      canApply: true
-    }));
+  beforeEach(() => {
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+  });
 
-    expect(countCompletedRenameRows(rows, [second])).toBe(1);
-    expect(countCompletedRenameRows(rows, [])).toBe(2);
+  /// The backend moves the working set only once every file is renamed, so
+  /// re-reading the whole list while it works can only show 0 of N.
+  it("does not re-read the file list while a rename runs, and reads it once after", async () => {
+    const file = mediaFile("Obsession (Bluray) 2026.mkv");
+    const scan = { updatedUtc: "2026-08-16T12:00:00Z", files: [file], summary: { total: 1, mkv: 1, mp4: 0, failed: 0, cached: 0 }, selectedPaths: [file.path] };
+    const getCurrentScanFiles = vi.fn(() => Promise.resolve(scan));
+    const row = { selected: true, sourcePath: file.path, currentFileName: file.fileName, detected: "", episodeName: "", newFileName: "Obsession (2026).mkv", confidence: "High", status: "Ready", canApply: true };
+    let finish: () => void = () => undefined;
+    const applyRenamePreview = vi.fn(() => new Promise<RenameApplyResponse>((resolve) => {
+      finish = () => resolve({ items: [{ ...row, status: "Renamed" }], summary: "1 renamed", status: "Renamed 1 file" });
+    }));
+    const user = userEvent.setup();
+    renderWithBackend(
+      <MediaLibraryProvider>
+        <Scan fileNames={[file.fileName]} />
+        <RenamePage />
+      </MediaLibraryProvider>,
+      {
+        getCurrentScanFiles,
+        searchRenameMetadata: () => Promise.resolve({ results: [searchResult("movie")] }),
+        loadRenameScopes: () => Promise.resolve({ scopes: [] }),
+        buildRenamePreview: () => Promise.resolve({ items: [row], summary: "1 ready", status: "Ready", planId: "plan", planFingerprint: "fp", idempotencyKey: "key" } as RenamePreviewResponse),
+        applyRenamePreview
+      }
+    );
+    await user.type((await screen.findAllByRole("textbox"))[0], "Obsession");
+    await user.click(screen.getByRole("button", { name: /^search$/i }));
+    await screen.findByText(/not applicable to a movie/i);
+    const apply = screen.getByRole("button", { name: "Apply Changes" });
+    await waitFor(() => expect(apply).toBeEnabled());
+    await user.click(apply);
+    await waitFor(() => expect(applyRenamePreview).toHaveBeenCalled());
+    const readsBefore = getCurrentScanFiles.mock.calls.length;
+
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    expect(getCurrentScanFiles).toHaveBeenCalledTimes(readsBefore);
+
+    finish();
+    await waitFor(() => expect(getCurrentScanFiles).toHaveBeenCalledTimes(readsBefore + 1));
   });
 });
 
@@ -323,5 +354,49 @@ describe("batch movie matching", () => {
     expect(searchRenameMetadata.mock.calls.map(([request]) => request.query)).toEqual(["Arrival", "Heat"]);
     expect(await screen.findByText("Arrival (2026)")).toBeInTheDocument();
     expect(screen.getByText("Heat (2026)")).toBeInTheDocument();
+  });
+});
+
+describe("Rename undo from Dashboard", () => {
+  const batch = (id: string, file: string) => ({ id, createdAt: "2026-11-14T09:00:00Z", undoneAt: null, provider: "TVDB", template: "", totalFiles: 1, entries: [], isUndone: false, displayName: file });
+
+  function LocationState() {
+    return <output aria-label="Location state">{JSON.stringify(useLocation().state)}</output>;
+  }
+
+  function renderRenameAsked(undoBatchId: string) {
+    const previewRenameBatchUndo = vi.fn((id: string) => Promise.resolve({ restorable: 1, skipped: 0, lines: [`Restore plan of ${id}`], hasSkippedFiles: false }));
+    setBackendClient(createMockBackendClient({
+      getCurrentScanFiles: () => Promise.resolve({ updatedUtc: null, files: [], summary: { total: 0, mkv: 0, mp4: 0, failed: 0, cached: 0 }, selectedPaths: [] }),
+      getRenameBatches: () => Promise.resolve({ batches: [batch("batch-1", "First batch"), batch("batch-2", "Second batch")] }),
+      previewRenameBatchUndo
+    }));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+        <MemoryRouter initialEntries={[{ pathname: "/rename", state: { undoBatchId } }]}>
+          <MediaLibraryProvider><RenamePage /></MediaLibraryProvider>
+          <LocationState />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    return previewRenameBatchUndo;
+  }
+
+  it("opens the undo dialog on the batch a link asked for, once", async () => {
+    const previewRenameBatchUndo = renderRenameAsked("batch-2");
+
+    expect(await screen.findByText("Restore plan of batch-2")).toBeInTheDocument();
+    // The first batch in the list is not what was asked for.
+    expect(previewRenameBatchUndo.mock.calls.map(([id]) => id)).not.toContain("batch-1");
+    // A refresh or Back must not open the dialog again.
+    expect(screen.getByLabelText("Location state")).toHaveTextContent("null");
+  });
+
+  it("says the batch is gone rather than opening another one", async () => {
+    const previewRenameBatchUndo = renderRenameAsked("batch-9");
+
+    expect(await screen.findByText(/that rename batch is no longer available/i)).toBeInTheDocument();
+    expect(await screen.findByText("First batch")).toBeInTheDocument();
+    expect(previewRenameBatchUndo).not.toHaveBeenCalled();
   });
 });
