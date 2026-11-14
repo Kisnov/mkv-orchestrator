@@ -787,6 +787,16 @@ export interface TrackRow {
   "forced": boolean;
 }
 
+export type WatchBackendKind = "native" | "polling";
+
+export interface WatchHealth {
+  "running": boolean;
+  "backend": WatchBackendKind;
+  "watchedRoots": number;
+  "lastEventUtc"?: string | null;
+  "error"?: string | null;
+}
+
 export interface WebMediaServer {
   "id": string;
   "name": string;
@@ -998,6 +1008,8 @@ export interface ContractTypes {
   ToolStatus: ToolStatus;
   TrackKind: TrackKind;
   TrackRow: TrackRow;
+  WatchBackendKind: WatchBackendKind;
+  WatchHealth: WatchHealth;
   WebMediaServer: WebMediaServer;
   WebMediaServerLibraryPath: WebMediaServerLibraryPath;
   WebMediaServerPathMapping: WebMediaServerPathMapping;
@@ -1128,6 +1140,8 @@ export const contractSchemas: Record<ContractName, ContractSchema> = {
   ToolStatus: { kind: "object", fields: { "name": { optional: false, schema: { kind: "string" } }, "command": { optional: false, schema: { kind: "string" } }, "resolvedPath": { optional: false, schema: { kind: "string" } }, "available": { optional: false, schema: { kind: "boolean" } }, "version": { optional: false, schema: { kind: "string" } }, "error": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },
   TrackKind: { kind: "union", variants: [{ kind: "literal", value: "video" }, { kind: "literal", value: "audio" }, { kind: "literal", value: "subtitle" }, { kind: "literal", value: "buttons" }, { kind: "literal", value: "other" }] },
   TrackRow: { kind: "object", fields: { "id": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "trackNumber": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "type": { optional: false, schema: { kind: "string" } }, "codec": { optional: false, schema: { kind: "string" } }, "language": { optional: false, schema: { kind: "string" } }, "name": { optional: false, schema: { kind: "string" } }, "channels": { optional: false, schema: { kind: "union", variants: [{ kind: "number", integer: true, unsigned: true }, { kind: "null" }] } }, "default": { optional: false, schema: { kind: "boolean" } }, "forced": { optional: false, schema: { kind: "boolean" } } }, flatten: [] },
+  WatchBackendKind: { kind: "union", variants: [{ kind: "literal", value: "native" }, { kind: "literal", value: "polling" }] },
+  WatchHealth: { kind: "object", fields: { "running": { optional: false, schema: { kind: "boolean" } }, "backend": { optional: false, schema: { kind: "ref", name: "WatchBackendKind" } }, "watchedRoots": { optional: false, schema: { kind: "number", integer: true, unsigned: true } }, "lastEventUtc": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "error": { optional: true, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } } }, flatten: [] },
   WebMediaServer: { kind: "object", fields: { "id": { optional: false, schema: { kind: "string" } }, "name": { optional: false, schema: { kind: "string" } }, "type": { optional: false, schema: { kind: "string" } }, "serverUrl": { optional: false, schema: { kind: "string" } }, "hasApiKey": { optional: false, schema: { kind: "boolean" } }, "isDefault": { optional: false, schema: { kind: "boolean" } }, "lastSyncedUtc": { optional: false, schema: { kind: "union", variants: [{ kind: "string" }, { kind: "null" }] } }, "libraries": { optional: false, schema: { kind: "array", item: { kind: "ref", name: "WebMediaServerLibraryPath" } } } }, flatten: [] },
   WebMediaServerLibraryPath: { kind: "object", fields: { "id": { optional: false, schema: { kind: "string" } }, "name": { optional: false, schema: { kind: "string" } }, "type": { optional: false, schema: { kind: "string" } }, "serverPath": { optional: false, schema: { kind: "string" } }, "containerPath": { optional: false, schema: { kind: "string" } }, "isEnabled": { optional: false, schema: { kind: "boolean" } } }, flatten: [] },
   WebMediaServerPathMapping: { kind: "object", fields: { "serverPathPrefix": { optional: false, schema: { kind: "string" } }, "containerPathPrefix": { optional: false, schema: { kind: "string" } } }, flatten: [] },

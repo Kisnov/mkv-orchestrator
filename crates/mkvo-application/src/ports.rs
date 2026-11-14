@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use mkvo_contracts::{
     JobEventEnvelope, JobSnapshot, LogQuery, OperationLogEntry, RecentJob, ToolStatus,
 };
+pub use mkvo_contracts::{WatchBackendKind, WatchHealth};
 use mkvo_domain::{
     AppSettings, EpisodeMetadata, FileFingerprint, IdempotencyKey, MediaFile, MediaServerKind,
     MediaServerLibrary, MetadataProvider, PlanId, ProviderSearchResult, RenameBatchEntry,
@@ -319,25 +320,6 @@ pub trait MediaServerClient: Send + Sync {
         item_id: &str,
         cancel: CancellationToken,
     ) -> Result<MediaServerArtwork, PortError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WatchBackendKind {
-    Native,
-    Polling,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WatchHealth {
-    pub running: bool,
-    pub backend: WatchBackendKind,
-    pub watched_roots: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_event_utc: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
