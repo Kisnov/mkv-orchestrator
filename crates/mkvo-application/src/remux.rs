@@ -415,9 +415,7 @@ fn preserved_output_for(file: &MediaFile, suffix: &str) -> PathBuf {
 fn mark_duplicate_outputs(items: &mut [RemuxPlanItem]) {
     let mut outputs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
-        // An extraction's final output is its source's folder, which its neighbours share.
-        if item.mode != RemuxMode::ExtractSubtitles && !same_path(&item.source, &item.final_output)
-        {
+        if !same_path(&item.source, &item.final_output) {
             outputs
                 .entry(path_key(&item.final_output))
                 .or_default()
@@ -544,64 +542,6 @@ mod tests {
                 .resources
                 .contains(&ResourceClaim::write("show/Episode 01.filtered.mkv"))
         );
-    }
-
-    fn extraction_request(outputs: [&str; 2]) -> RemuxPlanRequest {
-        let sources = ["show/Episode 01.mkv", "show/Episode 02.mkv"];
-        RemuxPlanRequest {
-            source_access: BTreeMap::new(),
-            mode: RemuxMode::ExtractSubtitles,
-            files: sources.map(media).to_vec(),
-            options: RemuxOptions::default(),
-            external_subtitles: BTreeMap::new(),
-            extractions: sources
-                .into_iter()
-                .zip(outputs)
-                .map(|(source, output)| {
-                    (
-                        PathBuf::from(source),
-                        vec![TrackExtraction {
-                            track_id: 2,
-                            kind: TrackKind::Subtitle,
-                            output: PathBuf::from(output),
-                        }],
-                    )
-                })
-                .collect(),
-            existing_paths: BTreeSet::new(),
-            authorized_roots: Vec::new(),
-            settings_fingerprint: "settings".to_owned(),
-            tool_fingerprints: BTreeMap::new(),
-            expires_in_seconds: 60,
-            idempotency_key: IdempotencyKey::generate(),
-        }
-    }
-
-    #[test]
-    fn extraction_from_several_files_of_one_folder_can_apply() {
-        let request =
-            extraction_request(["show/Episode 01.eng.2.srt", "show/Episode 02.eng.2.srt"]);
-
-        let plan = RemuxPlanner.build_plan(request).unwrap();
-
-        for item in &plan.payload.items {
-            assert!(item.can_apply(), "{:?}", item.conflicts);
-        }
-    }
-
-    #[test]
-    fn extractions_that_write_the_same_subtitle_are_still_blocked() {
-        let request = extraction_request(["show/subtitle.srt", "show/subtitle.srt"]);
-
-        let plan = RemuxPlanner.build_plan(request).unwrap();
-
-        for item in &plan.payload.items {
-            assert!(
-                item.conflicts
-                    .iter()
-                    .any(|conflict| conflict.kind == PlanConflictKind::DuplicateTarget)
-            );
-        }
     }
 
     #[test]
