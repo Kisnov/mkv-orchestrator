@@ -294,6 +294,27 @@ impl MkvoRuntime {
         journals: Vec<mkvo_application::JournalRecord>,
         folder_timeout: Duration,
     ) {
+        let mut remuxes = Vec::new();
+        for journal in journals {
+            // Only a remux writes these temporaries; another kind's claim says nothing about them.
+            if let Ok(Some(job)) = self
+                .inner
+                .dependencies
+                .jobs
+                .find_by_idempotency(&journal.idempotency_key)
+                .await
+                && matches!(
+                    job.kind,
+                    JobKind::Remux
+                        | JobKind::ConvertToMkv
+                        | JobKind::MuxSubtitles
+                        | JobKind::ExtractSubtitles
+                )
+            {
+                remuxes.push(journal);
+            }
+        }
+        let journals = remuxes;
         let mut folders =
             std::collections::BTreeMap::<_, (&Path, Vec<&mkvo_application::JournalRecord>)>::new();
         for journal in &journals {

@@ -3003,6 +3003,34 @@ pub(super) mod execution_tests {
         }
     }
 
+    /// The job row an interrupted job of `kind` left behind for `journal`.
+    async fn job_row(library: &Library, kind: JobKind, journal: &mkvo_application::JournalRecord) {
+        let snapshot = JobSnapshot {
+            id: mkvo_domain::JobId::new(),
+            kind,
+            status: JobStatus::Failed,
+            correlation_id: mkvo_domain::CorrelationId::new(),
+            idempotency_key: journal.idempotency_key.clone(),
+            request_fingerprint: "request".to_owned(),
+            plan_id: Some(journal.plan_id),
+            created_utc: Utc::now(),
+            started_utc: None,
+            completed_utc: None,
+            completed: 0,
+            failed: 0,
+            skipped: 0,
+            total: 0,
+            current_file: String::new(),
+            current_file_percent: 0,
+            lines: Vec::new(),
+            result: None,
+            error: None,
+            revision: 0,
+        };
+        let jobs = &library.runtime.dependencies().jobs;
+        jobs.insert(&snapshot).await.expect("job row");
+    }
+
     fn names_in(folder: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(folder)
             .expect("folder")
@@ -3035,8 +3063,10 @@ pub(super) mod execution_tests {
         let tv = root.join("tv");
         let at = |name: &str| tv.join(name);
         // Ep 01 was being remuxed; Ep 02 lost its original in the replace; Ep 03 completed;
-        // Ep 05 is in use by a job started after startup.
+        // Ep 04's journal is a property edit; Ep 05 is in use by a job started after startup.
         for name in [
+            "Ep 04.mkv",
+            ".Ep 04.mkv.mkvo-remux.tmp",
             "Ep 01.mkv",
             ".Ep 01.mkv.mkvo-remux.tmp",
             ".Ep 02.mkv.mkvo-remux.tmp",
@@ -3075,6 +3105,13 @@ pub(super) mod execution_tests {
                 (at("Ep 05.mkv"), Pending),
             ],
         );
+        job_row(&library, JobKind::Remux, &journal).await;
+        let edit = running_journal(
+            "killed-edit",
+            &[at("Ep 04.mkv")],
+            &[(at("Ep 04.mkv"), Pending)],
+        );
+        job_row(&library, JobKind::PropertyEdit, &edit).await;
         let (held, hold) = tokio::sync::oneshot::channel::<()>();
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         let jobs = library.runtime.jobs().clone();
@@ -3095,7 +3132,7 @@ pub(super) mod execution_tests {
 
         library
             .runtime
-            .clean_stale_temporaries(vec![journal], std::time::Duration::from_millis(200))
+            .clean_stale_temporaries(vec![journal, edit], std::time::Duration::from_millis(200))
             .await;
         release.send(()).expect("release");
         live_job.await.expect("job").expect("lease");
@@ -3106,11 +3143,13 @@ pub(super) mod execution_tests {
                 ".Ep 02.eng.2.srt.mkvo-extract-2.tmp",
                 ".Ep 02.mkv.mkvo-remux.tmp",
                 ".Ep 03.mkv.mkvo-remux.tmp",
+                ".Ep 04.mkv.mkvo-remux.tmp",
                 ".Ep 05.mkv.mkvo-remux.tmp",
                 ".Other.mkv.mkvo-remux.tmp",
                 "Ep 01.eng.2.srt",
                 "Ep 01.mkv",
                 "Ep 03.mkv",
+                "Ep 04.mkv",
                 "Ep 05.mkv",
             ]
         );
