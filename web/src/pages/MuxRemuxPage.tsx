@@ -54,7 +54,8 @@ export function MuxRemuxPage({ workflow = "remove" }: { workflow?: MuxWorkflow }
   const languageSuggestions = (type: string) => [...new Set(files.flatMap((file) => file.tracks.filter((track) => type === "subtitle" ? ["subtitle", "subtitles"].includes(track.type.toLowerCase()) : track.type.toLowerCase() === type).map((track) => track.language || "und")))];
   const initializedSelectionScope = useRef("");
   const run = useMuxRequest({
-    label: "MKV Operations",
+    label: { remove: "Remove Tracks", convert: "Convert / Remux", subtitles: "Subtitles" }[workflow],
+    legacyLabel: "MKV Operations",
     initialStatus: "Scan files first, then choose an action.",
     startedText: (total) => `Applying ${total} MKV operation(s)...`,
     noChangesText: "No changes are needed for the selected files.",

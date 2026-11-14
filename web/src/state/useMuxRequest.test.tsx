@@ -23,7 +23,7 @@ function job(patch: Partial<OperationJobResponse>): OperationJobResponse {
   };
 }
 
-function setup(overrides: Partial<BackendClient>, options: { reusePreview?: boolean } = {}) {
+function setup(overrides: Partial<BackendClient>, options: { reusePreview?: boolean; legacyLabel?: string } = {}) {
   setBackendClient(createMockBackendClient(overrides));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}><OperationJobProvider>{children}</OperationJobProvider></QueryClientProvider>;
@@ -113,6 +113,14 @@ describe("useMuxRequest", () => {
   it("keeps its own job while another page's newer job runs", async () => {
     sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify([{ id: "job-2", label: "Edit Tracks" }, { id: "job-1", label: "Reorder Tracks" }]));
     const { result } = setup({ getOperationJob: (id) => Promise.resolve(job({ id })) });
+
+    await waitFor(() => expect(result.current.job?.id).toBe("job-1"));
+    expect(result.current.isApplying).toBe(true);
+  });
+
+  it("adopts a job stored under the name the page used before", async () => {
+    sessionStorage.setItem("mkvo.web.activeOperationJob", JSON.stringify({ id: "job-1", label: "MKV Operations" }));
+    const { result } = setup({ getOperationJob: () => Promise.resolve(job({})) }, { legacyLabel: "MKV Operations" });
 
     await waitFor(() => expect(result.current.job?.id).toBe("job-1"));
     expect(result.current.isApplying).toBe(true);

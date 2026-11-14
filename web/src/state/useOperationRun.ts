@@ -12,6 +12,8 @@ type PlannedRequest = { planId?: string | null; planFingerprint?: string | null;
 export type OperationRunOptions<Request, Result extends Plan> = {
   /** Names the job in the sidebar and tells this page's job apart from another page's. */
   label: string;
+  /** The name this page's jobs were stored under before, so one running across an update is still its own. */
+  legacyLabel?: string;
   initialStatus: string;
   preview: (request: Request) => Promise<Result>;
   apply: (request: Request & PlannedRequest) => Promise<{ id: string; total: number }>;
@@ -56,7 +58,7 @@ export function useOperationRun<Request, Result extends Plan>(options: Operation
   });
   const cancel = useMutation({ mutationFn: cancelOperationJob });
 
-  const own = operation.operationFor(label);
+  const own = operation.operationFor(label) ?? (options.legacyLabel ? operation.operationFor(options.legacyLabel) : null);
   const job = own?.job;
   const isApplying = apply.isPending || Boolean(own?.isRunning);
 
